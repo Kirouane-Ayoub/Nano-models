@@ -1,0 +1,13 @@
+{
+  "_comment": "DeepSeek-V4 flavour: mHC hyper-connections plus multi-token prediction.",
+  "size": "nano",
+  "seed": 42,
+  "model": {
+    "linear_attn": "deltanet",
+    "hybrid_ratio": 3,
+    "residual": "mhc",
+    "mhc_streams": 4,
+    "mtp_weight": 0.3
+  },
+  "train": {"num_epochs": 40}
+}

@@ -25,9 +25,44 @@ import torch.nn.functional as F
 
 
 # ──────────────────────────────────────────────
+# Registry
+# ──────────────────────────────────────────────
+
+ATTENTION_REGISTRY = {}
+ATTENTION_DESCRIPTIONS = {}
+
+
+def register(name, description):
+    """Add an attention variant to the zoo.
+
+        @register("myattn", "My attention (Paper, 2026)")
+        class MyAttention(nn.Module):
+            def __init__(self, cfg): ...
+            def forward(self, x, use_cache=False): ...   # -> (B, T, emb_dim)
+            def reset_cache(self): ...
+
+    That is the whole contract. `cfg` is the model's config dict — read what you
+    need with cfg["emb_dim"], cfg["n_heads"], and cfg.get(...) for anything of
+    your own, so existing configs keep working.
+
+    Registering is all it takes to be picked up everywhere: `--attention myattn`
+    in gpt_nano, `--attention all` benchmarks it, and `python attention_zoo.py`
+    tests it for shape, incremental-decode equivalence and causality.
+    """
+    def wrap(cls):
+        if name in ATTENTION_REGISTRY:
+            raise ValueError(f"Attention '{name}' is already registered")
+        ATTENTION_REGISTRY[name] = cls
+        ATTENTION_DESCRIPTIONS[name] = description
+        return cls
+    return wrap
+
+
+# ──────────────────────────────────────────────
 # 1. MHA — Multi-Head Attention (standard)
 # ──────────────────────────────────────────────
 
+@register("mha", "Multi-Head Attention (GPT-2 standard)")
 class MultiHeadAttention(nn.Module):
     """Standard multi-head causal self-attention with KV cache."""
 
@@ -90,6 +125,7 @@ class MultiHeadAttention(nn.Module):
 # 2. GQA — Grouped-Query Attention
 # ──────────────────────────────────────────────
 
+@register("gqa", "Grouped-Query Attention (Llama 3, Qwen 3)")
 class GroupedQueryAttention(nn.Module):
     """Fewer K/V heads shared across Q head groups. Reduces KV cache size.
 
@@ -165,6 +201,7 @@ class GroupedQueryAttention(nn.Module):
         self.cache_pos = 0
 
 
+@register("gated", "Gated Attention — GQA + output gate, no attention sinks (Qwen3-Next, Qwen3.5)")
 class GatedAttention(GroupedQueryAttention):
     """GQA plus a sigmoid output gate (Qwen3-Next, Qwen3.5).
 
@@ -183,6 +220,7 @@ class GatedAttention(GroupedQueryAttention):
 # 3. MLA — Multi-Head Latent Attention
 # ──────────────────────────────────────────────
 
+@register("mla", "Multi-Head Latent Attention (DeepSeek)")
 class MultiHeadLatentAttention(nn.Module):
     """Compresses K/V into a low-dim latent, then expands per head.
     Caches the tiny latent instead of full K/V.
@@ -260,6 +298,7 @@ class MultiHeadLatentAttention(nn.Module):
 # 4. SWA — Sliding Window Attention
 # ──────────────────────────────────────────────
 
+@register("swa", "Sliding Window Attention (Mistral, Gemma)")
 class SlidingWindowAttention(nn.Module):
     """Only attends to a fixed window of recent tokens. O(n) memory.
 
@@ -373,6 +412,7 @@ class ShortConv(nn.Module):
         self.conv_state = None
 
 
+@register("deltanet", "Gated DeltaNet linear attention (Qwen3-Next)")
 class GatedDeltaNet(nn.Module):
     """Linear attention with gated delta rule. O(n) compute, constant memory.
     No KV cache needed — uses a fixed-size recurrent state instead.
@@ -483,6 +523,7 @@ class GatedDeltaNet(nn.Module):
 # 6. KDA — Kimi Delta Attention
 # ──────────────────────────────────────────────
 
+@register("kda", "Kimi Delta Attention — DeltaNet with per-channel decay (Kimi Linear)")
 class KimiDeltaAttention(GatedDeltaNet):
     """Gated DeltaNet whose decay gate is per *channel* instead of per head
     (Kimi Linear, 2025-26).
@@ -513,6 +554,7 @@ class KimiDeltaAttention(GatedDeltaNet):
 # 7. DSA — DeepSeek Sparse Attention
 # ──────────────────────────────────────────────
 
+@register("dsa", "DeepSeek Sparse Attention — MLA + lightning indexer top-k (DeepSeek-V3.2)")
 class DeepSeekSparseAttention(nn.Module):
     """MLA plus a lightning indexer that picks which tokens to attend to
     (DeepSeek-V3.2, extended into CSA/HCA in V4).
@@ -792,12 +834,14 @@ class CompressedAttention(nn.Module):
         self.cache_pos = 0
 
 
+@register("csa", "Compressed Sparse Attention — 4:1 compression + top-k (DeepSeek-V4)")
 class CompressedSparseAttention(CompressedAttention):
     """CSA — mild compression (m=4) plus top-k selection (DeepSeek-V4)."""
     def __init__(self, cfg):
         super().__init__(cfg, compress_rate=cfg.get("csa_rate", 4), select=True)
 
 
+@register("hca", "Heavily Compressed Attention — 128:1 compression, dense (DeepSeek-V4)")
 class HeavilyCompressedAttention(CompressedAttention):
     """HCA — heavy compression (m=128 in the real model), attended densely."""
     def __init__(self, cfg):
@@ -810,37 +854,6 @@ def collect_aux_loss(model):
     losses = [m.index_loss for m in model.modules()
               if getattr(m, "index_loss", None) is not None]
     return sum(losses) if losses else None
-
-
-# ──────────────────────────────────────────────
-# Registry
-# ──────────────────────────────────────────────
-
-ATTENTION_REGISTRY = {
-    "mha": MultiHeadAttention,
-    "gqa": GroupedQueryAttention,
-    "gated": GatedAttention,
-    "mla": MultiHeadLatentAttention,
-    "swa": SlidingWindowAttention,
-    "deltanet": GatedDeltaNet,
-    "kda": KimiDeltaAttention,
-    "dsa": DeepSeekSparseAttention,
-    "csa": CompressedSparseAttention,
-    "hca": HeavilyCompressedAttention,
-}
-
-ATTENTION_DESCRIPTIONS = {
-    "mha": "Multi-Head Attention (GPT-2 standard)",
-    "gqa": "Grouped-Query Attention (Llama 3, Qwen 3)",
-    "gated": "Gated Attention — GQA + output gate, no attention sinks (Qwen3-Next, Qwen3.5)",
-    "mla": "Multi-Head Latent Attention (DeepSeek)",
-    "swa": "Sliding Window Attention (Mistral, Gemma)",
-    "deltanet": "Gated DeltaNet linear attention (Qwen3-Next)",
-    "kda": "Kimi Delta Attention — DeltaNet with per-channel decay (Kimi Linear)",
-    "dsa": "DeepSeek Sparse Attention — MLA + lightning indexer top-k (DeepSeek-V3.2)",
-    "csa": "Compressed Sparse Attention — 4:1 compression + top-k (DeepSeek-V4)",
-    "hca": "Heavily Compressed Attention — 128:1 compression, dense (DeepSeek-V4)",
-}
 
 
 def get_attention(name, cfg):

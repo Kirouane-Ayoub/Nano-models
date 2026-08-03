@@ -26,6 +26,8 @@ import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 
+import config
+
 # DDP imports — only used when launched via torchrun
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
@@ -552,7 +554,7 @@ def run_single(attn_type, text, settings, device, args, base_cfg):
     train_loader, val_loader, tokenizer, train_sampler = create_dataloaders(text, cfg, settings["batch_size"])
     log(f"Train batches: {len(train_loader)}, Val batches: {len(val_loader)}")
 
-    torch.manual_seed(42)
+    torch.manual_seed(args.seed)
     model = GPTNano(cfg)
     model = train(model, train_loader, val_loader, tokenizer, cfg, settings, device,
                   train_sampler=train_sampler)
@@ -620,6 +622,8 @@ def main():
                         help="Model size preset (default: nano)")
     parser.add_argument("--attention", type=str, default="mha", choices=attn_choices,
                         help="Attention mechanism (default: mha)")
+    config.add_argument(parser)
+    parser.add_argument("--seed", type=int, default=42)
 
     # Training
     parser.add_argument("--file", type=str, default=None, help="Path to training text file")
@@ -661,17 +665,28 @@ def main():
     log(f"Text length: {len(text):,} characters")
 
     # Build settings
-    settings = TRAIN_SETTINGS.copy()
+    # defaults < config file < flags actually typed
+    file_cfg = config.load(args.config)
+    ov = config.overrider()
+    top = {"size": args.size, "seed": args.seed}
+    top.update({k: file_cfg[k] for k in ("size", "seed") if k in file_cfg})
+    ov(top, "size", "--size", args.size)
+    ov(top, "seed", "--seed", args.seed)
+    size, seed = top["size"], top["seed"]
+
+    settings = {**TRAIN_SETTINGS, **file_cfg.get("train", {})}
     if args.epochs:
         settings["num_epochs"] = args.epochs
     if args.batch_size:
         settings["batch_size"] = args.batch_size
-    settings["grad_accum_steps"] = args.grad_accum
-    settings["use_amp"] = not args.no_amp
-    settings["ckpt_freq"] = args.ckpt_freq
+    ov(settings, "grad_accum_steps", "--grad-accum", args.grad_accum)
+    ov(settings, "use_amp", "--no-amp", not args.no_amp)
+    ov(settings, "ckpt_freq", "--ckpt-freq", args.ckpt_freq)
 
     # Build model config from size preset
-    base_cfg = MODEL_SIZES[args.size].copy()
+    base_cfg = MODEL_SIZES[size].copy()
+    base_cfg.update(file_cfg.get("model", {}))
+    ov(base_cfg, "attention", "--attention", args.attention)
 
     # ── Resume from checkpoint ──
     resume_step = 0
@@ -692,6 +707,12 @@ def main():
                     settings[k] = v
         print(f"  Resuming: step={resume_step}, epoch={resume_epoch}, "
               f"attention={base_cfg.get('attention', 'mha')}")
+
+    if is_main_process():
+        ckpt_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "checkpoints")
+        saved = config.snapshot(ckpt_dir, {"model": base_cfg, "train": settings,
+                                           "seed": seed, "size": size}, device=device)
+        log(f"Resolved config: {saved}  (rerun with --config {saved})")
 
     # ── Benchmark all attention types ──
     if args.attention == "all":
@@ -734,7 +755,7 @@ def main():
     train_loader, val_loader, tokenizer, train_sampler = create_dataloaders(text, cfg, settings["batch_size"])
     log(f"Train batches: {len(train_loader)}, Val batches: {len(val_loader)}")
 
-    torch.manual_seed(42)
+    torch.manual_seed(seed)
     model = GPTNano(cfg)
 
     # Load model weights if resuming

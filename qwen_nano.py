@@ -31,6 +31,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 
+import config
+
 # DDP imports
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
@@ -660,6 +662,8 @@ def main():
     )
 
     parser.add_argument("--size", type=str, default="nano", choices=size_choices)
+    config.add_argument(parser)
+    parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--file", type=str, default=None, help="Training text file")
     parser.add_argument("--epochs", type=int, default=None)
     parser.add_argument("--batch-size", type=int, default=None)
@@ -691,16 +695,26 @@ def main():
     text = load_text(args.file)
     log(f"Text length: {len(text):,} characters")
 
-    settings = TRAIN_SETTINGS.copy()
+    # defaults < config file < flags actually typed
+    file_cfg = config.load(args.config)
+    ov = config.overrider()
+    top = {"size": args.size, "seed": args.seed}
+    top.update({k: file_cfg[k] for k in ("size", "seed") if k in file_cfg})
+    ov(top, "size", "--size", args.size)
+    ov(top, "seed", "--seed", args.seed)
+    size, seed = top["size"], top["seed"]
+
+    settings = {**TRAIN_SETTINGS, **file_cfg.get("train", {})}
     if args.epochs:
         settings["num_epochs"] = args.epochs
     if args.batch_size:
         settings["batch_size"] = args.batch_size
-    settings["grad_accum_steps"] = args.grad_accum
-    settings["use_amp"] = not args.no_amp
-    settings["ckpt_freq"] = args.ckpt_freq
+    ov(settings, "grad_accum_steps", "--grad-accum", args.grad_accum)
+    ov(settings, "use_amp", "--no-amp", not args.no_amp)
+    ov(settings, "ckpt_freq", "--ckpt-freq", args.ckpt_freq)
 
-    cfg = MODEL_SIZES[args.size].copy()
+    cfg = MODEL_SIZES[size].copy()
+    cfg.update(file_cfg.get("model", {}))
 
     # Resume
     resume_step = 0
@@ -717,7 +731,13 @@ def main():
     train_loader, val_loader, tokenizer, train_sampler = create_dataloaders(text, cfg, settings["batch_size"])
     log(f"Train batches: {len(train_loader)}, Val batches: {len(val_loader)}")
 
-    torch.manual_seed(42)
+    ckpt_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "checkpoints")
+    if is_main_process():
+        saved = config.snapshot(ckpt_dir, {"model": cfg, "train": settings,
+                                           "seed": seed, "size": size}, device=device)
+        log(f"Resolved config: {saved}  (rerun with --config {saved})")
+
+    torch.manual_seed(seed)
     model = QwenNano(cfg)
     if args.resume:
         model.load_state_dict(ckpt["model"])

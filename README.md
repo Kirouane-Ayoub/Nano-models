@@ -52,6 +52,41 @@ torchrun --nproc_per_node=8 qwen_nano.py --size qwen-0.6B --batch-size 32 --grad
 
 Each script accepts `--size`, `--epochs`, `--batch-size`, `--grad-accum`, `--resume`. See the docstring at the top of each file for the full list.
 
+## Reproducible runs
+
+Runs are config-driven; flags still work and take precedence over the file.
+
+```bash
+python qwen_next_nano.py --config configs/kimi_like.json
+python deepseek_nano.py  --config configs/latent_moe.json --epochs 5   # flag wins
+```
+
+Precedence is **defaults < config file < flags you actually typed** — a flag only overrides the config if it appears on the command line, so a config value is never clobbered by an argparse default it happens to differ from.
+
+Every run writes `checkpoints/config.resolved.json`: the fully merged config plus seed, git commit and torch version. That file is itself a valid `--config` input, so reproducing a result is:
+
+```bash
+python qwen_next_nano.py --config checkpoints/config.resolved.json
+```
+
+Verified round-tripping to identical loss on all four models.
+
+## Adding an attention mechanism
+
+One decorator, nothing else to edit:
+
+```python
+from attention_zoo import register
+
+@register("myattn", "My attention (Paper, 2026)")
+class MyAttention(nn.Module):
+    def __init__(self, cfg): ...
+    def forward(self, x, use_cache=False): ...   # -> (B, T, emb_dim)
+    def reset_cache(self): ...
+```
+
+Registering picks it up everywhere: `gpt_nano.py --attention myattn`, `--attention all` benchmarks it against the other ten, and `python attention_zoo.py` tests it for shape, incremental-decode equivalence and causality automatically. Read your own options off `cfg` with `cfg.get("my_option", default)` so existing configs keep working.
+
 ---
 
 ## Architecture notes

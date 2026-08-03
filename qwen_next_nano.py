@@ -62,6 +62,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.distributed as dist
 
+import config
 from attention_zoo import GatedDeltaNet, KimiDeltaAttention
 from qwen_nano import (
     RMSNorm, SwiGLUFeedForward, GroupedQueryAttention, compute_rope_params,
@@ -745,6 +746,8 @@ def main():
         )
     )
     parser.add_argument("--size", type=str, default="nano", choices=list(MODEL_SIZES))
+    config.add_argument(parser)
+    parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--linear", type=str, default="deltanet", choices=list(LINEAR_MIXERS),
                         help="Linear-attention mixer for the non-attention layers")
     parser.add_argument("--ratio", type=int, default=3,
@@ -798,23 +801,46 @@ def main():
     else:
         device = torch.device("cpu")
 
-    text = load_text(args.file)
+    # defaults < config file < flags actually typed
+    file_cfg = config.load(args.config)
+    ov = config.overrider()
+    top = {"size": args.size, "file": args.file, "seed": args.seed}
+    top.update({k: file_cfg[k] for k in ("size", "file", "seed") if k in file_cfg})
+    ov(top, "size", "--size", args.size)
+    ov(top, "file", "--file", args.file)
+    ov(top, "seed", "--seed", args.seed)
+    size, seed = top["size"], top["seed"]
+
+    text = load_text(top["file"])
     log(f"Text length: {len(text):,} characters")
 
-    settings = TRAIN_SETTINGS.copy()
+    settings = {**TRAIN_SETTINGS, **file_cfg.get("train", {})}
     if args.epochs:
         settings["num_epochs"] = args.epochs
     if args.batch_size:
         settings["batch_size"] = args.batch_size
-    settings["grad_accum_steps"] = args.grad_accum
-    settings["use_amp"] = not args.no_amp
-    settings["ckpt_freq"] = args.ckpt_freq
+    ov(settings, "grad_accum_steps", "--grad-accum", args.grad_accum)
+    ov(settings, "use_amp", "--no-amp", not args.no_amp)
+    ov(settings, "ckpt_freq", "--ckpt-freq", args.ckpt_freq)
 
-    cfg = {**MODEL_SIZES[args.size], "linear_attn": args.linear,
+    cfg = {**MODEL_SIZES[size], "linear_attn": args.linear,
            "hybrid_ratio": args.ratio, "mtp_weight": args.mtp_weight,
            "short_conv": args.short_conv, "kv_share": args.kv_share, "pos_enc": args.posenc,
            "residual": args.residual, "mhc_streams": args.mhc_streams,
            "ple_dim": args.ple_dim}
+    cfg.update(file_cfg.get("model", {}))
+    for key, flag, value in (
+        ("linear_attn", "--linear", args.linear),
+        ("hybrid_ratio", "--ratio", args.ratio),
+        ("mtp_weight", "--mtp-weight", args.mtp_weight),
+        ("short_conv", "--short-conv", args.short_conv),
+        ("kv_share", "--kv-share", args.kv_share),
+        ("pos_enc", "--posenc", args.posenc),
+        ("residual", "--residual", args.residual),
+        ("mhc_streams", "--mhc-streams", args.mhc_streams),
+        ("ple_dim", "--ple-dim", args.ple_dim),
+    ):
+        ov(cfg, key, flag, value)
 
     resume_step = resume_epoch = 0
     optimizer_state = None
@@ -829,7 +855,14 @@ def main():
         text, cfg, settings["batch_size"])
     log(f"Train batches: {len(train_loader)}, Val batches: {len(val_loader)}")
 
-    torch.manual_seed(42)
+    ckpt_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "checkpoints")
+    if is_main_process():
+        saved = config.snapshot(ckpt_dir, {"model": cfg, "train": settings,
+                                           "seed": seed, "size": size, "file": top["file"]},
+                                device=device)
+        log(f"Resolved config: {saved}  (rerun with --config {saved})")
+
+    torch.manual_seed(seed)
     model = QwenNextNano(cfg)
     if args.resume:
         model.load_state_dict(ckpt["model"])

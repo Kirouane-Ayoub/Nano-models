@@ -1,0 +1,7 @@
+{
+  "_comment": "Nemotron 3 flavour: experts in a compressed space, aggressive load balancing.",
+  "size": "nano",
+  "seed": 42,
+  "model": {"moe_latent_dim": 16, "balance_speed": 0.01},
+  "train": {"num_epochs": 30}
+}

@@ -1,0 +1,12 @@
+{
+  "_comment": "Gemma 4 flavour: per-layer embeddings and cross-layer KV sharing.",
+  "size": "nano",
+  "seed": 42,
+  "model": {
+    "hybrid_ratio": 1,
+    "kv_share": 1,
+    "ple_dim": 16,
+    "mtp_weight": 0.0
+  },
+  "train": {"num_epochs": 40}
+}

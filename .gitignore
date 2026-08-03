@@ -8,6 +8,7 @@ __pycache__/
 *.docx
 *.txt
 *.json
+!configs/*.json
 !ui/package.json
 !ui/package-lock.json
 !ui/tsconfig.json
@@ -136,3 +137,6 @@ ui/dist/
 # ~/.cache/huggingface/, so this should normally be empty.
 models/
 *.gguf
+
+# Training run artifacts
+checkpoints/
