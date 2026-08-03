@@ -1,0 +1,5 @@
+# Formatting for a repo that is read more than it is run.
+line-length = 100          # the docstrings and comments here are prose; 88 reflows them badly
+
+[format]
+docstring-code-format = false   # docstrings contain illustrative snippets, not runnable code

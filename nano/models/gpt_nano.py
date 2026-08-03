@@ -20,6 +20,7 @@ Usage:
 if __package__ in (None, ""):
     import pathlib as _pathlib
     import sys as _sys
+
     _sys.path.insert(0, str(_pathlib.Path(__file__).resolve().parents[2]))
 
 import argparse
@@ -40,13 +41,17 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data.distributed import DistributedSampler
 
 from nano.attention_zoo import (
-    get_attention, collect_aux_loss, ATTENTION_REGISTRY, ATTENTION_DESCRIPTIONS,
+    get_attention,
+    collect_aux_loss,
+    ATTENTION_REGISTRY,
+    ATTENTION_DESCRIPTIONS,
 )
 
 
 # ──────────────────────────────────────────────
 # Distributed helpers
 # ──────────────────────────────────────────────
+
 
 def is_distributed():
     return dist.is_initialized()
@@ -74,6 +79,9 @@ def log(msg):
 # Model size presets
 # ──────────────────────────────────────────────
 
+# Hand-aligned table: columns line up so sizes can be compared down the
+# page. A formatter would give every key its own line and lose that.
+# fmt: off
 MODEL_SIZES = {
     "nano": {   # ~3.4M — CPU/MPS in minutes
         "vocab_size": 50257,  "context_length": 128,
@@ -106,24 +114,26 @@ MODEL_SIZES = {
         "drop_rate": 0.1,     "qkv_bias": False,
     },
 }
+# fmt: on
 
 TRAIN_SETTINGS = {
     "learning_rate": 5e-4,
     "num_epochs": 20,
     "batch_size": 8,
     "weight_decay": 0.1,
-    "eval_freq": 25,          # Evaluate every N steps
-    "eval_iter": 5,           # Batches to average for eval loss
-    "warmup_steps": 50,       # Linear warmup steps
-    "grad_accum_steps": 1,    # Gradient accumulation steps
-    "ckpt_freq": 500,         # Save checkpoint every N steps (0 = off)
-    "use_amp": True,          # Mixed precision (bfloat16)
+    "eval_freq": 25,  # Evaluate every N steps
+    "eval_iter": 5,  # Batches to average for eval loss
+    "warmup_steps": 50,  # Linear warmup steps
+    "grad_accum_steps": 1,  # Gradient accumulation steps
+    "ckpt_freq": 500,  # Save checkpoint every N steps (0 = off)
+    "use_amp": True,  # Mixed precision (bfloat16)
 }
 
 
 # ──────────────────────────────────────────────
 # Dataset
 # ──────────────────────────────────────────────
+
 
 class TextDataset(Dataset):
     """Sliding-window dataset: each sample is (input_ids, target_ids) where
@@ -148,14 +158,20 @@ class TextDataset(Dataset):
 def create_dataloaders(text, cfg, batch_size):
     tokenizer = tiktoken.get_encoding("gpt2")
     split = int(0.9 * len(text))
-    train_ds = TextDataset(text[:split], tokenizer, cfg["context_length"], stride=cfg["context_length"])
-    val_ds = TextDataset(text[split:], tokenizer, cfg["context_length"], stride=cfg["context_length"])
+    train_ds = TextDataset(
+        text[:split], tokenizer, cfg["context_length"], stride=cfg["context_length"]
+    )
+    val_ds = TextDataset(
+        text[split:], tokenizer, cfg["context_length"], stride=cfg["context_length"]
+    )
 
     # Use DistributedSampler when running multi-GPU
     if is_distributed():
         train_sampler = DistributedSampler(train_ds, shuffle=True)
         val_sampler = DistributedSampler(val_ds, shuffle=False)
-        train_loader = DataLoader(train_ds, batch_size=batch_size, sampler=train_sampler, drop_last=True)
+        train_loader = DataLoader(
+            train_ds, batch_size=batch_size, sampler=train_sampler, drop_last=True
+        )
         val_loader = DataLoader(val_ds, batch_size=batch_size, sampler=val_sampler, drop_last=False)
     else:
         train_sampler = None
@@ -168,6 +184,7 @@ def create_dataloaders(text, cfg, batch_size):
 # ──────────────────────────────────────────────
 # Model components
 # ──────────────────────────────────────────────
+
 
 class LayerNorm(nn.Module):
     def __init__(self, emb_dim):
@@ -184,9 +201,7 @@ class LayerNorm(nn.Module):
 
 class GELU(nn.Module):
     def forward(self, x):
-        return 0.5 * x * (1 + torch.tanh(
-            math.sqrt(2.0 / math.pi) * (x + 0.044715 * x.pow(3))
-        ))
+        return 0.5 * x * (1 + torch.tanh(math.sqrt(2.0 / math.pi) * (x + 0.044715 * x.pow(3))))
 
 
 class FeedForward(nn.Module):
@@ -220,6 +235,7 @@ class TransformerBlock(nn.Module):
 # ──────────────────────────────────────────────
 # GPT Nano model
 # ──────────────────────────────────────────────
+
 
 class GPTNano(nn.Module):
     def __init__(self, cfg):
@@ -282,6 +298,7 @@ class GPTNano(nn.Module):
 # Generation
 # ──────────────────────────────────────────────
 
+
 def _sample_next_token(logits, temperature, top_k):
     """Pick the next token from logits using temperature + optional top-k."""
     if temperature == 0.0:
@@ -336,6 +353,7 @@ def generate_cached(model, idx, max_new_tokens, temperature=1.0, top_k=None):
 # Training
 # ──────────────────────────────────────────────
 
+
 def get_amp_ctx(device, use_amp):
     """Return the appropriate autocast context for mixed precision."""
     if not use_amp:
@@ -358,9 +376,7 @@ def calc_loss(loader, model, device, max_batches=None, amp_ctx=None):
                 break
             x, y = x.to(device), y.to(device)
             with amp_ctx:
-                loss = torch.nn.functional.cross_entropy(
-                    model(x).flatten(0, 1), y.flatten()
-                )
+                loss = torch.nn.functional.cross_entropy(model(x).flatten(0, 1), y.flatten())
             total += loss.item()
             count += 1
     model.train()
@@ -385,20 +401,34 @@ def save_checkpoint(model, optimizer, cfg, settings, global_step, epoch, ckpt_di
     path = os.path.join(ckpt_dir, f"ckpt_step_{global_step}.pt")
     # Unwrap DDP to save the raw model weights
     raw_model = model.module if isinstance(model, DDP) else model
-    torch.save({
-        "global_step": global_step,
-        "epoch": epoch,
-        "config": cfg,
-        "settings": settings,
-        "model": raw_model.state_dict(),
-        "optimizer": optimizer.state_dict(),
-    }, path)
+    torch.save(
+        {
+            "global_step": global_step,
+            "epoch": epoch,
+            "config": cfg,
+            "settings": settings,
+            "model": raw_model.state_dict(),
+            "optimizer": optimizer.state_dict(),
+        },
+        path,
+    )
     log(f"  >> Checkpoint saved: {path}")
     return path
 
 
-def train(model, train_loader, val_loader, tokenizer, cfg, settings, device,
-          resume_step=0, resume_epoch=0, optimizer_state=None, train_sampler=None):
+def train(
+    model,
+    train_loader,
+    val_loader,
+    tokenizer,
+    cfg,
+    settings,
+    device,
+    resume_step=0,
+    resume_epoch=0,
+    optimizer_state=None,
+    train_sampler=None,
+):
     model.to(device)
 
     # ── Wrap model in DDP if distributed ──
@@ -427,9 +457,13 @@ def train(model, train_loader, val_loader, tokenizer, cfg, settings, device,
     precision = "bfloat16" if use_amp else "float32"
 
     log(f"\nTraining GPT Nano ({raw_model.count_params():,} parameters)")
-    log(f"  {settings['num_epochs']} epochs, {len(train_loader)} batches/epoch, {max_steps} total steps")
+    log(
+        f"  {settings['num_epochs']} epochs, {len(train_loader)} batches/epoch, {max_steps} total steps"
+    )
     log(f"  Device: {device} | Precision: {precision} | GPUs: {get_world_size()}")
-    log(f"  Batch: {settings['batch_size']} x {accum_steps} accum x {get_world_size()} GPUs = {effective_batch} effective")
+    log(
+        f"  Batch: {settings['batch_size']} x {accum_steps} accum x {get_world_size()} GPUs = {effective_batch} effective"
+    )
     if ckpt_freq > 0:
         log(f"  Checkpointing every {ckpt_freq} steps → {ckpt_dir}")
     if resume_step > 0:
@@ -447,13 +481,16 @@ def train(model, train_loader, val_loader, tokenizer, cfg, settings, device,
 
         for x, y in train_loader:
             # Skip steps already done when resuming mid-epoch
-            if epoch == resume_epoch and micro_step < (resume_step - resume_epoch * len(train_loader)):
+            if epoch == resume_epoch and micro_step < (
+                resume_step - resume_epoch * len(train_loader)
+            ):
                 micro_step += 1
                 continue
 
             # Update learning rate
-            lr = get_lr(global_step, settings["warmup_steps"], max_steps,
-                        settings["learning_rate"], min_lr)
+            lr = get_lr(
+                global_step, settings["warmup_steps"], max_steps, settings["learning_rate"], min_lr
+            )
             for pg in optimizer.param_groups:
                 pg["lr"] = lr
 
@@ -486,8 +523,12 @@ def train(model, train_loader, val_loader, tokenizer, cfg, settings, device,
 
                 # Periodic evaluation (rank 0 only)
                 if global_step % settings["eval_freq"] == 0:
-                    val_loss = calc_loss(val_loader, raw_model, device, settings["eval_iter"], amp_ctx)
-                    log(f"  Step {global_step:5d} | train {lm_loss.item():.4f} | val {val_loss:.4f} | lr {lr:.2e}")
+                    val_loss = calc_loss(
+                        val_loader, raw_model, device, settings["eval_iter"], amp_ctx
+                    )
+                    log(
+                        f"  Step {global_step:5d} | train {lm_loss.item():.4f} | val {val_loss:.4f} | lr {lr:.2e}"
+                    )
 
                 # ── Checkpointing (rank 0 only) ──
                 if ckpt_freq > 0 and global_step % ckpt_freq == 0:
@@ -517,7 +558,9 @@ def train(model, train_loader, val_loader, tokenizer, cfg, settings, device,
 
     # Save final checkpoint
     if ckpt_freq > 0:
-        save_checkpoint(model, optimizer, cfg, settings, global_step, settings["num_epochs"], ckpt_dir)
+        save_checkpoint(
+            model, optimizer, cfg, settings, global_step, settings["num_epochs"], ckpt_dir
+        )
 
     return raw_model
 
@@ -525,6 +568,7 @@ def train(model, train_loader, val_loader, tokenizer, cfg, settings, device,
 # ──────────────────────────────────────────────
 # Main
 # ──────────────────────────────────────────────
+
 
 def load_text(file_path=None):
     """Load training text from file or download default sample."""
@@ -553,17 +597,27 @@ def run_single(attn_type, text, settings, device, args, base_cfg):
     cfg["attention"] = attn_type
 
     desc = ATTENTION_DESCRIPTIONS[attn_type]
-    log(f"\n{'#'*60}")
+    log(f"\n{'#' * 60}")
     log(f"  Attention: {attn_type} — {desc}")
-    log(f"{'#'*60}")
+    log(f"{'#' * 60}")
 
-    train_loader, val_loader, tokenizer, train_sampler = create_dataloaders(text, cfg, settings["batch_size"])
+    train_loader, val_loader, tokenizer, train_sampler = create_dataloaders(
+        text, cfg, settings["batch_size"]
+    )
     log(f"Train batches: {len(train_loader)}, Val batches: {len(val_loader)}")
 
     torch.manual_seed(args.seed)
     model = GPTNano(cfg)
-    model = train(model, train_loader, val_loader, tokenizer, cfg, settings, device,
-                  train_sampler=train_sampler)
+    model = train(
+        model,
+        train_loader,
+        val_loader,
+        tokenizer,
+        cfg,
+        settings,
+        device,
+        train_sampler=train_sampler,
+    )
 
     # Generation benchmark (rank 0 only)
     if not is_main_process():
@@ -576,15 +630,17 @@ def run_single(attn_type, text, settings, device, args, base_cfg):
     # Without cache
     torch.manual_seed(42)
     t0 = time.perf_counter()
-    out1 = generate(model, ids, max_new_tokens=args.max_tokens,
-                    temperature=args.temperature, top_k=args.top_k)
+    out1 = generate(
+        model, ids, max_new_tokens=args.max_tokens, temperature=args.temperature, top_k=args.top_k
+    )
     t_no_cache = time.perf_counter() - t0
 
     # With cache
     torch.manual_seed(42)
     t0 = time.perf_counter()
-    out2 = generate_cached(model, ids, max_new_tokens=args.max_tokens,
-                           temperature=args.temperature, top_k=args.top_k)
+    out2 = generate_cached(
+        model, ids, max_new_tokens=args.max_tokens, temperature=args.temperature, top_k=args.top_k
+    )
     t_cached = time.perf_counter() - t0
 
     print(f"\n[No cache] {t_no_cache:.3f}s")
@@ -615,19 +671,31 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "Model sizes:\n"
-            + "\n".join(f"  {k:8s} {v['emb_dim']}d, {v['n_heads']}h, {v['n_layers']}L, ctx={v['context_length']}"
-                        for k, v in MODEL_SIZES.items())
+            + "\n".join(
+                f"  {k:8s} {v['emb_dim']}d, {v['n_heads']}h, {v['n_layers']}L, ctx={v['context_length']}"
+                for k, v in MODEL_SIZES.items()
+            )
             + "\n\nAttention types:\n"
             + "\n".join(f"  {k:10s} {v}" for k, v in ATTENTION_DESCRIPTIONS.items())
             + "\n  all        Benchmark all variants side by side"
-        )
+        ),
     )
 
     # Model
-    parser.add_argument("--size", type=str, default="nano", choices=size_choices,
-                        help="Model size preset (default: nano)")
-    parser.add_argument("--attention", type=str, default="mha", choices=attn_choices,
-                        help="Attention mechanism (default: mha)")
+    parser.add_argument(
+        "--size",
+        type=str,
+        default="nano",
+        choices=size_choices,
+        help="Model size preset (default: nano)",
+    )
+    parser.add_argument(
+        "--attention",
+        type=str,
+        default="mha",
+        choices=attn_choices,
+        help="Attention mechanism (default: mha)",
+    )
     config.add_argument(parser)
     parser.add_argument("--seed", type=int, default=42)
 
@@ -635,14 +703,21 @@ def main():
     parser.add_argument("--file", type=str, default=None, help="Path to training text file")
     parser.add_argument("--epochs", type=int, default=None, help="Override number of epochs")
     parser.add_argument("--batch-size", type=int, default=None, help="Override batch size")
-    parser.add_argument("--grad-accum", type=int, default=1,
-                        help="Gradient accumulation steps (effective_batch = batch_size * grad_accum)")
-    parser.add_argument("--no-amp", action="store_true",
-                        help="Disable mixed precision (use float32)")
-    parser.add_argument("--ckpt-freq", type=int, default=500,
-                        help="Save checkpoint every N steps (0 = off)")
-    parser.add_argument("--resume", type=str, default=None,
-                        help="Path to checkpoint to resume training from")
+    parser.add_argument(
+        "--grad-accum",
+        type=int,
+        default=1,
+        help="Gradient accumulation steps (effective_batch = batch_size * grad_accum)",
+    )
+    parser.add_argument(
+        "--no-amp", action="store_true", help="Disable mixed precision (use float32)"
+    )
+    parser.add_argument(
+        "--ckpt-freq", type=int, default=500, help="Save checkpoint every N steps (0 = off)"
+    )
+    parser.add_argument(
+        "--resume", type=str, default=None, help="Path to checkpoint to resume training from"
+    )
 
     # Generation
     parser.add_argument("--prompt", type=str, default="Once upon a time", help="Generation prompt")
@@ -711,13 +786,18 @@ def main():
             for k, v in ckpt["settings"].items():
                 if k not in settings or settings[k] == TRAIN_SETTINGS.get(k):
                     settings[k] = v
-        print(f"  Resuming: step={resume_step}, epoch={resume_epoch}, "
-              f"attention={base_cfg.get('attention', 'mha')}")
+        print(
+            f"  Resuming: step={resume_step}, epoch={resume_epoch}, "
+            f"attention={base_cfg.get('attention', 'mha')}"
+        )
 
     if is_main_process():
         ckpt_dir = os.path.join(config.ROOT, "checkpoints")
-        saved = config.snapshot(ckpt_dir, {"model": base_cfg, "train": settings,
-                                           "seed": seed, "size": size}, device=device)
+        saved = config.snapshot(
+            ckpt_dir,
+            {"model": base_cfg, "train": settings, "seed": seed, "size": size},
+            device=device,
+        )
         log(f"Resolved config: {saved}  (rerun with --config {saved})")
 
     # ── Benchmark all attention types ──
@@ -731,13 +811,17 @@ def main():
         if is_main_process():
             # Filter out empty results from non-rank-0 processes
             results = [r for r in results if r]
-            print(f"\n{'='*85}")
-            print(f"  BENCHMARK — {args.size} model, {settings['num_epochs']} epochs, "
-                  f"{'bf16' if settings['use_amp'] else 'fp32'}, device: {device}, GPUs: {get_world_size()}")
-            print(f"{'='*85}")
-            print(f"{'Attention':<12} {'Params':>10} {'Train Loss':>12} {'Val Loss':>10} "
-                  f"{'No Cache':>10} {'Cached':>10} {'Speedup':>9}")
-            print(f"{'-'*12} {'-'*10} {'-'*12} {'-'*10} {'-'*10} {'-'*10} {'-'*9}")
+            print(f"\n{'=' * 85}")
+            print(
+                f"  BENCHMARK — {args.size} model, {settings['num_epochs']} epochs, "
+                f"{'bf16' if settings['use_amp'] else 'fp32'}, device: {device}, GPUs: {get_world_size()}"
+            )
+            print(f"{'=' * 85}")
+            print(
+                f"{'Attention':<12} {'Params':>10} {'Train Loss':>12} {'Val Loss':>10} "
+                f"{'No Cache':>10} {'Cached':>10} {'Speedup':>9}"
+            )
+            print(f"{'-' * 12} {'-' * 10} {'-' * 12} {'-' * 10} {'-' * 10} {'-' * 10} {'-' * 9}")
             for r in results:
                 print(
                     f"{r['attention']:<12} "
@@ -748,7 +832,7 @@ def main():
                     f"{r['gen_time_cached']:>9.3f}s "
                     f"{r['cache_speedup']:>8.2f}x"
                 )
-            print(f"{'='*85}")
+            print(f"{'=' * 85}")
 
         if ddp:
             dist.destroy_process_group()
@@ -758,7 +842,9 @@ def main():
     cfg = base_cfg.copy()
     cfg["attention"] = args.attention
 
-    train_loader, val_loader, tokenizer, train_sampler = create_dataloaders(text, cfg, settings["batch_size"])
+    train_loader, val_loader, tokenizer, train_sampler = create_dataloaders(
+        text, cfg, settings["batch_size"]
+    )
     log(f"Train batches: {len(train_loader)}, Val batches: {len(val_loader)}")
 
     torch.manual_seed(seed)
@@ -768,39 +854,60 @@ def main():
     if args.resume:
         model.load_state_dict(ckpt["model"])
 
-    model = train(model, train_loader, val_loader, tokenizer, cfg, settings, device,
-                  resume_step=resume_step, resume_epoch=resume_epoch,
-                  optimizer_state=optimizer_state, train_sampler=train_sampler)
+    model = train(
+        model,
+        train_loader,
+        val_loader,
+        tokenizer,
+        cfg,
+        settings,
+        device,
+        resume_step=resume_step,
+        resume_epoch=resume_epoch,
+        optimizer_state=optimizer_state,
+        train_sampler=train_sampler,
+    )
 
     # Final generation (rank 0 only)
     if is_main_process():
         import time
+
         ids = torch.tensor(tokenizer.encode(args.prompt)).unsqueeze(0).to(device)
 
-        print(f"\n{'='*60}")
+        print(f"\n{'=' * 60}")
         print(f"Prompt: {args.prompt}")
-        print(f"{'='*60}")
+        print(f"{'=' * 60}")
 
         torch.manual_seed(42)
         t0 = time.perf_counter()
-        out_no_cache = generate(model, ids, max_new_tokens=args.max_tokens,
-                                temperature=args.temperature, top_k=args.top_k)
+        out_no_cache = generate(
+            model,
+            ids,
+            max_new_tokens=args.max_tokens,
+            temperature=args.temperature,
+            top_k=args.top_k,
+        )
         t_no_cache = time.perf_counter() - t0
         print(f"\n[No KV cache] {t_no_cache:.3f}s")
         print(tokenizer.decode(out_no_cache[0].tolist()))
 
         torch.manual_seed(42)
         t0 = time.perf_counter()
-        out_cached = generate_cached(model, ids, max_new_tokens=args.max_tokens,
-                                     temperature=args.temperature, top_k=args.top_k)
+        out_cached = generate_cached(
+            model,
+            ids,
+            max_new_tokens=args.max_tokens,
+            temperature=args.temperature,
+            top_k=args.top_k,
+        )
         t_cached = time.perf_counter() - t0
         print(f"\n[With KV cache] {t_cached:.3f}s")
         print(tokenizer.decode(out_cached[0].tolist()))
 
         speedup = t_no_cache / t_cached if t_cached > 0 else float("inf")
-        print(f"\n{'='*60}")
+        print(f"\n{'=' * 60}")
         print(f"KV cache speedup: {speedup:.2f}x faster")
-        print(f"{'='*60}")
+        print(f"{'=' * 60}")
 
     # ── Cleanup DDP ──
     if ddp:

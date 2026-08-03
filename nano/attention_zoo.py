@@ -49,18 +49,21 @@ def register(name, description):
     in gpt_nano, `--attention all` benchmarks it, and `python -m nano.attention_zoo`
     tests it for shape, incremental-decode equivalence and causality.
     """
+
     def wrap(cls):
         if name in ATTENTION_REGISTRY:
             raise ValueError(f"Attention '{name}' is already registered")
         ATTENTION_REGISTRY[name] = cls
         ATTENTION_DESCRIPTIONS[name] = description
         return cls
+
     return wrap
 
 
 # ──────────────────────────────────────────────
 # 1. MHA — Multi-Head Attention (standard)
 # ──────────────────────────────────────────────
+
 
 @register("mha", "Multi-Head Attention (GPT-2 standard)")
 class MultiHeadAttention(nn.Module):
@@ -103,10 +106,10 @@ class MultiHeadAttention(nn.Module):
             k, v = k_new, v_new
 
         T_q, T_k = q.shape[2], k.shape[2]
-        attn = (q @ k.transpose(-2, -1)) / (self.head_dim ** 0.5)
+        attn = (q @ k.transpose(-2, -1)) / (self.head_dim**0.5)
 
         if use_cache:
-            mask_bool = self.mask[self.cache_pos:self.cache_pos + T_q, :T_k].bool()
+            mask_bool = self.mask[self.cache_pos : self.cache_pos + T_q, :T_k].bool()
             self.cache_pos += T_q
         else:
             mask_bool = self.mask[:T_q, :T_k].bool()
@@ -124,6 +127,7 @@ class MultiHeadAttention(nn.Module):
 # ──────────────────────────────────────────────
 # 2. GQA — Grouped-Query Attention
 # ──────────────────────────────────────────────
+
 
 @register("gqa", "Grouped-Query Attention (Llama 3, Qwen 3)")
 class GroupedQueryAttention(nn.Module):
@@ -177,7 +181,7 @@ class GroupedQueryAttention(nn.Module):
         v = v_base.repeat_interleave(self.group_size, dim=1)
 
         T_q, T_k = q.shape[2], k.shape[2]
-        attn = (q @ k.transpose(-2, -1)) / (self.head_dim ** 0.5)
+        attn = (q @ k.transpose(-2, -1)) / (self.head_dim**0.5)
 
         # Causal mask
         device = q.device
@@ -220,6 +224,7 @@ class GatedAttention(GroupedQueryAttention):
 # 3. MLA — Multi-Head Latent Attention
 # ──────────────────────────────────────────────
 
+
 @register("mla", "Multi-Head Latent Attention (DeepSeek)")
 class MultiHeadLatentAttention(nn.Module):
     """Compresses K/V into a low-dim latent, then expands per head.
@@ -237,9 +242,9 @@ class MultiHeadLatentAttention(nn.Module):
         self.latent_dim = cfg.get("latent_dim", max(16, d // 4))
 
         self.W_query = nn.Linear(d, d, bias=cfg["qkv_bias"])
-        self.W_DKV = nn.Linear(d, self.latent_dim, bias=cfg["qkv_bias"])   # Compress
-        self.W_UK = nn.Linear(self.latent_dim, d, bias=cfg["qkv_bias"])    # Expand to K
-        self.W_UV = nn.Linear(self.latent_dim, d, bias=cfg["qkv_bias"])    # Expand to V
+        self.W_DKV = nn.Linear(d, self.latent_dim, bias=cfg["qkv_bias"])  # Compress
+        self.W_UK = nn.Linear(self.latent_dim, d, bias=cfg["qkv_bias"])  # Expand to K
+        self.W_UV = nn.Linear(self.latent_dim, d, bias=cfg["qkv_bias"])  # Expand to V
 
         self.out_proj = nn.Linear(d, d)
         self.dropout = nn.Dropout(cfg["drop_rate"])
@@ -272,7 +277,7 @@ class MultiHeadLatentAttention(nn.Module):
         k = k_all.view(B, T_k, self.n_heads, self.head_dim).transpose(1, 2)
         v = v_all.view(B, T_k, self.n_heads, self.head_dim).transpose(1, 2)
 
-        attn = (q @ k.transpose(-2, -1)) / (self.head_dim ** 0.5)
+        attn = (q @ k.transpose(-2, -1)) / (self.head_dim**0.5)
 
         # Causal mask
         device = q.device
@@ -297,6 +302,7 @@ class MultiHeadLatentAttention(nn.Module):
 # ──────────────────────────────────────────────
 # 4. SWA — Sliding Window Attention
 # ──────────────────────────────────────────────
+
 
 @register("swa", "Sliding Window Attention (Mistral, Gemma)")
 class SlidingWindowAttention(nn.Module):
@@ -338,14 +344,14 @@ class SlidingWindowAttention(nn.Module):
                 self.cache_v = torch.cat([self.cache_v, v_new], dim=2)
             # Trim cache to window size
             if self.cache_k.shape[2] > self.window_size:
-                self.cache_k = self.cache_k[:, :, -self.window_size:]
-                self.cache_v = self.cache_v[:, :, -self.window_size:]
+                self.cache_k = self.cache_k[:, :, -self.window_size :]
+                self.cache_v = self.cache_v[:, :, -self.window_size :]
             k, v = self.cache_k, self.cache_v
         else:
             k, v = k_new, v_new
 
         T_q, T_k = q.shape[2], k.shape[2]
-        attn = (q @ k.transpose(-2, -1)) / (self.head_dim ** 0.5)
+        attn = (q @ k.transpose(-2, -1)) / (self.head_dim**0.5)
 
         # Causal + sliding window mask
         device = q.device
@@ -375,6 +381,7 @@ class SlidingWindowAttention(nn.Module):
 # 5. GatedDeltaNet — Linear Attention
 # ──────────────────────────────────────────────
 
+
 def _l2norm(x, dim=-1, eps=1e-6):
     return x * torch.rsqrt((x * x).sum(dim=dim, keepdim=True) + eps)
 
@@ -398,14 +405,14 @@ class ShortConv(nn.Module):
         self.register_buffer("conv_state", None, persistent=False)
 
     def forward(self, x, use_cache=False):
-        u = x.transpose(1, 2)                        # (B, dim, T)
+        u = x.transpose(1, 2)  # (B, dim, T)
         if use_cache and self.conv_state is not None:
             pad = self.conv_state
         else:
             pad = u.new_zeros(u.shape[0], u.shape[1], self.kernel - 1)
         u = torch.cat([pad, u], dim=-1)
         if use_cache:
-            self.conv_state = u[..., -(self.kernel - 1):]
+            self.conv_state = u[..., -(self.kernel - 1) :]
         return F.silu(self.conv(u)).transpose(1, 2)
 
     def reset_cache(self):
@@ -430,8 +437,8 @@ class GatedDeltaNet(nn.Module):
         self.W_value = nn.Linear(d, d, bias=cfg["qkv_bias"])
 
         # Gates
-        self.W_gate = nn.Linear(d, d, bias=False)          # Output gate (SiLU)
-        self.W_beta = nn.Linear(d, d, bias=False)           # Update gate
+        self.W_gate = nn.Linear(d, d, bias=False)  # Output gate (SiLU)
+        self.W_beta = nn.Linear(d, d, bias=False)  # Update gate
         self.W_alpha = nn.Linear(d, self.n_heads, bias=False)  # Decay gate
         self.dt_bias = nn.Parameter(torch.ones(self.n_heads))
         A_init = torch.empty(self.n_heads).uniform_(0, 16)
@@ -458,17 +465,17 @@ class GatedDeltaNet(nn.Module):
         _, _, T, _ = q.shape
         outs = []
         for t in range(T):
-            k_t = k[:, :, t]       # (B, H, D)
+            k_t = k[:, :, t]  # (B, H, D)
             q_t = q[:, :, t]
             v_t = v[:, :, t]
             b_t = beta[:, :, t]
-            a_t = alpha[:, :, t]   # (B, H, 1, 1) scalar decay, or (B, H, D, 1) per-channel
+            a_t = alpha[:, :, t]  # (B, H, 1, 1) scalar decay, or (B, H, D, 1) per-channel
 
-            S = S * a_t                                             # Decay
-            kv_mem = (S * k_t.unsqueeze(-1)).sum(dim=-2)            # Retrieve
-            delta = (v_t - kv_mem) * b_t                            # Delta update
-            S = S + k_t.unsqueeze(-1) * delta.unsqueeze(-2)         # Write
-            y_t = (S * q_t.unsqueeze(-1)).sum(dim=-2)               # Read
+            S = S * a_t  # Decay
+            kv_mem = (S * k_t.unsqueeze(-1)).sum(dim=-2)  # Retrieve
+            delta = (v_t - kv_mem) * b_t  # Delta update
+            S = S + k_t.unsqueeze(-1) * delta.unsqueeze(-2)  # Write
+            y_t = (S * q_t.unsqueeze(-1)).sum(dim=-2)  # Read
             outs.append(y_t)
 
         context = torch.stack(outs, dim=2)  # (B, H, T, D)
@@ -479,7 +486,9 @@ class GatedDeltaNet(nn.Module):
 
         q_lin, k_lin, v_lin = self.W_query(x), self.W_key(x), self.W_value(x)
         if self.convs is not None:
-            q_lin, k_lin, v_lin = (c(t, use_cache) for c, t in zip(self.convs, (q_lin, k_lin, v_lin)))
+            q_lin, k_lin, v_lin = (
+                c(t, use_cache) for c, t in zip(self.convs, (q_lin, k_lin, v_lin))
+            )
 
         q = q_lin.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
         k = k_lin.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
@@ -490,7 +499,7 @@ class GatedDeltaNet(nn.Module):
         alpha = self._decay(x)
 
         # L2-normalize Q and K
-        q = _l2norm(q, dim=-1) / (self.head_dim ** 0.5)
+        q = _l2norm(q, dim=-1) / (self.head_dim**0.5)
         k = _l2norm(k, dim=-1)
 
         # Initialize or reuse recurrent state
@@ -523,6 +532,7 @@ class GatedDeltaNet(nn.Module):
 # 6. KDA — Kimi Delta Attention
 # ──────────────────────────────────────────────
 
+
 @register("kda", "Kimi Delta Attention — DeltaNet with per-channel decay (Kimi Linear)")
 class KimiDeltaAttention(GatedDeltaNet):
     """Gated DeltaNet whose decay gate is per *channel* instead of per head
@@ -538,7 +548,7 @@ class KimiDeltaAttention(GatedDeltaNet):
     def __init__(self, cfg):
         super().__init__(cfg)
         d = self.n_heads * self.head_dim
-        self.W_alpha = nn.Linear(cfg["emb_dim"], d, bias=False)   # was → n_heads
+        self.W_alpha = nn.Linear(cfg["emb_dim"], d, bias=False)  # was → n_heads
         self.dt_bias = nn.Parameter(torch.ones(d))
         self.A_log = nn.Parameter(torch.log(torch.empty(d).uniform_(0, 16)))
 
@@ -553,6 +563,7 @@ class KimiDeltaAttention(GatedDeltaNet):
 # ──────────────────────────────────────────────
 # 7. DSA — DeepSeek Sparse Attention
 # ──────────────────────────────────────────────
+
 
 @register("dsa", "DeepSeek Sparse Attention — MLA + lightning indexer top-k (DeepSeek-V3.2)")
 class DeepSeekSparseAttention(nn.Module):
@@ -613,8 +624,11 @@ class DeepSeekSparseAttention(nn.Module):
 
         latent_new = self.W_DKV(x)
         if use_cache:
-            latent = latent_new if self.cache_latent is None \
+            latent = (
+                latent_new
+                if self.cache_latent is None
                 else torch.cat([self.cache_latent, latent_new], dim=1)
+            )
             self.cache_latent = latent
         else:
             latent = latent_new
@@ -626,19 +640,23 @@ class DeepSeekSparseAttention(nn.Module):
 
         # Lightning indexer: score = sum_h w_h * ReLU(q_h . k_index)
         iq = self.W_iq(x).view(B, T, self.index_heads, self.index_dim)
-        ik = self.W_ik(latent)                                     # (B, T_k, index_dim)
-        w = self.W_iw(x)                                           # (B, T, index_heads)
-        idx_scores = (F.relu(torch.einsum("bthd,bsd->bths", iq, ik))
-                      * w.unsqueeze(-1)).sum(dim=2)                # (B, T, T_k)
+        ik = self.W_ik(latent)  # (B, T_k, index_dim)
+        w = self.W_iw(x)  # (B, T, index_heads)
+        idx_scores = (F.relu(torch.einsum("bthd,bsd->bths", iq, ik)) * w.unsqueeze(-1)).sum(
+            dim=2
+        )  # (B, T, T_k)
 
         device = x.device
-        q_pos = torch.arange(self.cache_pos, self.cache_pos + T, device=device) if use_cache \
+        q_pos = (
+            torch.arange(self.cache_pos, self.cache_pos + T, device=device)
+            if use_cache
             else torch.arange(T, device=device)
+        )
         if use_cache:
             self.cache_pos += T
         causal = q_pos.unsqueeze(-1) < torch.arange(T_k, device=device).unsqueeze(0)
 
-        attn = (q @ k.transpose(-2, -1)) / (self.head_dim ** 0.5)
+        attn = (q @ k.transpose(-2, -1)) / (self.head_dim**0.5)
         attn = attn.masked_fill(causal, float("-inf"))
         dense = torch.softmax(attn, dim=-1)
 
@@ -653,7 +671,8 @@ class DeepSeekSparseAttention(nn.Module):
             tie_break = torch.arange(T_k, device=device) * 1e-6
             scores = (idx_scores + tie_break).masked_fill(causal, float("-inf"))
             keep = torch.zeros_like(scores, dtype=torch.bool).scatter_(
-                -1, scores.topk(self.top_k, dim=-1).indices, True)
+                -1, scores.topk(self.top_k, dim=-1).indices, True
+            )
             attn = attn.masked_fill(~keep.unsqueeze(1), float("-inf"))
 
         probs = self.dropout(torch.softmax(attn, dim=-1))
@@ -672,7 +691,7 @@ class DeepSeekSparseAttention(nn.Module):
         is exactly zero at every masked position, and F.kl_div returns NaN there.
         Masking log_p to 0 on those positions keeps the products well-defined.
         """
-        target = dense.mean(dim=1).detach()                       # average over heads
+        target = dense.mean(dim=1).detach()  # average over heads
         log_p = torch.log_softmax(idx_scores.masked_fill(causal, float("-inf")), dim=-1)
         return -(target * log_p.masked_fill(causal, 0.0)).sum(dim=-1).mean()
 
@@ -685,6 +704,7 @@ class DeepSeekSparseAttention(nn.Module):
 # ──────────────────────────────────────────────
 # 8. CSA / HCA — Compressed Attention
 # ──────────────────────────────────────────────
+
 
 class CompressedAttention(nn.Module):
     """Attention over a *compressed* sequence instead of the raw one
@@ -741,8 +761,8 @@ class CompressedAttention(nn.Module):
         self.W_query = nn.Linear(d, d, bias=cfg["qkv_bias"])
         self.W_key = nn.Linear(d, d, bias=cfg["qkv_bias"])
         self.W_value = nn.Linear(d, d, bias=cfg["qkv_bias"])
-        self.W_ck = nn.Linear(d, d, bias=False)     # per-dimension compressor, keys
-        self.W_cv = nn.Linear(d, d, bias=False)     # ... and values
+        self.W_ck = nn.Linear(d, d, bias=False)  # per-dimension compressor, keys
+        self.W_cv = nn.Linear(d, d, bias=False)  # ... and values
         self.out_proj = nn.Linear(d, d)
         self.dropout = nn.Dropout(cfg["drop_rate"])
 
@@ -763,13 +783,13 @@ class CompressedAttention(nn.Module):
         size = self.m + self.overlap
 
         def group(t, proj):
-            padded = F.pad(t[:, :trunc], (0, 0, self.overlap, 0))       # (B, pad+trunc, D)
-            win = padded.unfold(1, size, self.m).permute(0, 1, 3, 2)    # (B, G, size, D)
+            padded = F.pad(t[:, :trunc], (0, 0, self.overlap, 0))  # (B, pad+trunc, D)
+            win = padded.unfold(1, size, self.m).permute(0, 1, 3, 2)  # (B, G, size, D)
             logits = F.pad(proj(t[:, :trunc]), (0, 0, self.overlap, 0))
             logits = logits.unfold(1, size, self.m).permute(0, 1, 3, 2)
             # Softmax down the group, independently per dimension: each channel
             # picks whichever token in the group it cares about.
-            return (win * torch.softmax(logits, dim=2)).sum(dim=2)      # (B, G, D)
+            return (win * torch.softmax(logits, dim=2)).sum(dim=2)  # (B, G, D)
 
         ends = torch.arange(n_groups, device=k.device) * self.m + self.m - 1
         return group(k, self.W_ck), group(v, self.W_cv), ends
@@ -789,8 +809,11 @@ class CompressedAttention(nn.Module):
         T_k = k_flat.shape[1]
 
         device = x.device
-        q_pos = torch.arange(self.cache_pos, self.cache_pos + T, device=device) if use_cache \
+        q_pos = (
+            torch.arange(self.cache_pos, self.cache_pos + T, device=device)
+            if use_cache
             else torch.arange(T, device=device)
+        )
         if use_cache:
             self.cache_pos += T
 
@@ -807,19 +830,22 @@ class CompressedAttention(nn.Module):
         ck, cv, ends = self._compress(k_flat, v_flat)
         if ck is not None:
             comp_mask = q_pos.unsqueeze(-1) < ends.unsqueeze(0)
-            keys.append(heads(ck)); values.append(heads(cv)); mask.append(comp_mask)
+            keys.append(heads(ck))
+            values.append(heads(cv))
+            mask.append(comp_mask)
 
         k_all, v_all = torch.cat(keys, dim=2), torch.cat(values, dim=2)
-        attn = (q @ k_all.transpose(-2, -1)) / (self.head_dim ** 0.5)
+        attn = (q @ k_all.transpose(-2, -1)) / (self.head_dim**0.5)
         # (T_q, N) broadcasts against attn's (B, H, T_q, N) as-is
         attn = attn.masked_fill(torch.cat(mask, dim=-1), float("-inf"))
 
         # CSA keeps only the top-k compressed entries; the window always stays.
         if self.select and ck is not None and ck.shape[1] > self.top_k:
             n_win = T_k
-            comp = attn[..., n_win:].mean(dim=1)                   # score per entry
+            comp = attn[..., n_win:].mean(dim=1)  # score per entry
             keep = torch.zeros_like(comp, dtype=torch.bool).scatter_(
-                -1, comp.topk(self.top_k, dim=-1).indices, True)
+                -1, comp.topk(self.top_k, dim=-1).indices, True
+            )
             attn[..., n_win:] = attn[..., n_win:].masked_fill(~keep.unsqueeze(1), float("-inf"))
 
         # A query inside the first group has an empty compressed set and only the
@@ -837,6 +863,7 @@ class CompressedAttention(nn.Module):
 @register("csa", "Compressed Sparse Attention — 4:1 compression + top-k (DeepSeek-V4)")
 class CompressedSparseAttention(CompressedAttention):
     """CSA — mild compression (m=4) plus top-k selection (DeepSeek-V4)."""
+
     def __init__(self, cfg):
         super().__init__(cfg, compress_rate=cfg.get("csa_rate", 4), select=True)
 
@@ -844,6 +871,7 @@ class CompressedSparseAttention(CompressedAttention):
 @register("hca", "Heavily Compressed Attention — 128:1 compression, dense (DeepSeek-V4)")
 class HeavilyCompressedAttention(CompressedAttention):
     """HCA — heavy compression (m=128 in the real model), attended densely."""
+
     def __init__(self, cfg):
         super().__init__(cfg, compress_rate=cfg.get("hca_rate", 16), select=False)
 
@@ -851,15 +879,16 @@ class HeavilyCompressedAttention(CompressedAttention):
 def collect_aux_loss(model):
     """Sum the auxiliary losses attention modules stashed during forward (DSA's
     indexer objective). Returns None if there are none, so callers can skip."""
-    losses = [m.index_loss for m in model.modules()
-              if getattr(m, "index_loss", None) is not None]
+    losses = [m.index_loss for m in model.modules() if getattr(m, "index_loss", None) is not None]
     return sum(losses) if losses else None
 
 
 def get_attention(name, cfg):
     """Factory: build an attention module by name."""
     if name not in ATTENTION_REGISTRY:
-        raise ValueError(f"Unknown attention type '{name}'. Choose from: {list(ATTENTION_REGISTRY.keys())}")
+        raise ValueError(
+            f"Unknown attention type '{name}'. Choose from: {list(ATTENTION_REGISTRY.keys())}"
+        )
     return ATTENTION_REGISTRY[name](cfg)
 
 
@@ -867,12 +896,21 @@ def get_attention(name, cfg):
 # Self-test — python -m nano.attention_zoo
 # ──────────────────────────────────────────────
 
+
 def _self_test():
     torch.manual_seed(0)
     B, T, d, prefill = 2, 40, 64, 30
-    cfg = {"emb_dim": d, "n_heads": 4, "qkv_bias": False, "drop_rate": 0.0,
-           "context_length": 128, "window_size": 16, "top_k": 8,
-           "index_dim": 16, "index_heads": 2}
+    cfg = {
+        "emb_dim": d,
+        "n_heads": 4,
+        "qkv_bias": False,
+        "drop_rate": 0.0,
+        "context_length": 128,
+        "window_size": 16,
+        "top_k": 8,
+        "index_dim": 16,
+        "index_heads": 2,
+    }
     x = torch.randn(B, T, d)
 
     for name in ATTENTION_REGISTRY:
@@ -883,7 +921,7 @@ def _self_test():
         # state, or conv state) must reproduce the full forward exactly.
         attn.reset_cache()
         attn(x[:, :prefill], use_cache=True)
-        step = torch.cat([attn(x[:, t:t + 1], use_cache=True) for t in range(prefill, T)], dim=1)
+        step = torch.cat([attn(x[:, t : t + 1], use_cache=True) for t in range(prefill, T)], dim=1)
         torch.testing.assert_close(step, full[:, prefill:], atol=1e-4, rtol=1e-4)
 
         # Causality: changing token t must not move any output before t.
@@ -897,8 +935,10 @@ def _self_test():
         poked[:, cut] += 10.0
         torch.testing.assert_close(attn(poked)[:, :cut], full[:, :cut], atol=1e-5, rtol=1e-5)
 
-        print(f"  {name:9s} ok — {sum(p.numel() for p in attn.parameters()):>7,} params, "
-              f"incremental decode matches, no future leak")
+        print(
+            f"  {name:9s} ok — {sum(p.numel() for p in attn.parameters()):>7,} params, "
+            f"incremental decode matches, no future leak"
+        )
 
     # ShortConv is off by default; check it wires into the delta-rule layers.
     for name in ("deltanet", "kda"):
@@ -906,7 +946,7 @@ def _self_test():
         full = attn(x)
         attn.reset_cache()
         attn(x[:, :prefill], use_cache=True)
-        step = torch.cat([attn(x[:, t:t + 1], use_cache=True) for t in range(prefill, T)], dim=1)
+        step = torch.cat([attn(x[:, t : t + 1], use_cache=True) for t in range(prefill, T)], dim=1)
         torch.testing.assert_close(step, full[:, prefill:], atol=1e-4, rtol=1e-4)
     print("  shortconv ok — rolling conv state keeps incremental decode exact")
 
@@ -923,10 +963,13 @@ def _self_test():
         assert attn._compress(short, short) == (None, None, None)
         assert attn(short).shape == short.shape
         # And it must still be causal in that regime.
-        poked = short.clone(); poked[:, -1] += 10.0
+        poked = short.clone()
+        poked[:, -1] += 10.0
         torch.testing.assert_close(attn(poked)[:, :-1], attn(short)[:, :-1], atol=1e-5, rtol=0)
-        print(f"  {name:9s} ok — {T // m} entries at {m}:1, closing at {ends[:3].tolist()}..., "
-              f"short-sequence falls back to the window")
+        print(
+            f"  {name:9s} ok — {T // m} entries at {m}:1, closing at {ends[:3].tolist()}..., "
+            f"short-sequence falls back to the window"
+        )
 
     # The compressor is a softmax down each group, so its weights are a genuine
     # weighted mean per dimension — not an unnormalised sum that could blow up.
@@ -934,7 +977,11 @@ def _self_test():
     with torch.no_grad():
         t = torch.randn(B, T, d)
         size, mm = 4 + 2, 4
-        lg = F.pad(attn.W_ck(t[:, :(T // mm) * mm]), (0, 0, 2, 0)).unfold(1, size, mm).permute(0, 1, 3, 2)
+        lg = (
+            F.pad(attn.W_ck(t[:, : (T // mm) * mm]), (0, 0, 2, 0))
+            .unfold(1, size, mm)
+            .permute(0, 1, 3, 2)
+        )
         w = torch.softmax(lg, dim=2)
     torch.testing.assert_close(w.sum(dim=2), torch.ones(B, T // mm, d), atol=1e-5, rtol=0)
     print(f"  compress  ok — per-dimension weights sum to 1 down each group")
@@ -950,36 +997,50 @@ def _self_test():
             lat = attn.W_DKV(x)
             q = attn.W_query(x).view(B, T, 4, d // 4).transpose(1, 2)
             k = attn.W_UK(lat).view(B, T, 4, d // 4).transpose(1, 2)
-            dense = torch.softmax(((q @ k.transpose(-2, -1)) / ((d // 4) ** 0.5))
-                                  .masked_fill(causal, float("-inf")), -1).mean(1)
+            dense = torch.softmax(
+                ((q @ k.transpose(-2, -1)) / ((d // 4) ** 0.5)).masked_fill(causal, float("-inf")),
+                -1,
+            ).mean(1)
             iq = attn.W_iq(x).view(B, T, attn.index_heads, attn.index_dim)
-            sc = (F.relu(torch.einsum("bthd,bsd->bths", iq, attn.W_ik(lat)))
-                  * attn.W_iw(x).unsqueeze(-1)).sum(2).masked_fill(causal, float("-inf"))
+            sc = (
+                (
+                    F.relu(torch.einsum("bthd,bsd->bths", iq, attn.W_ik(lat)))
+                    * attn.W_iw(x).unsqueeze(-1)
+                )
+                .sum(2)
+                .masked_fill(causal, float("-inf"))
+            )
         return dense, sc
 
     def _recall():
         dense, sc = _dense_and_index()
-        rows = slice(attn.top_k, T)                    # rows with more candidates than k
+        rows = slice(attn.top_k, T)  # rows with more candidates than k
         true_top = dense[:, rows].topk(attn.top_k, -1).indices
         idx_top = sc[:, rows].topk(attn.top_k, -1).indices
         return (true_top.unsqueeze(-1) == idx_top.unsqueeze(-2)).any(-1).float().mean().item()
 
     dense, sc = _dense_and_index()
-    keep = torch.zeros_like(sc, dtype=torch.bool).scatter_(-1, sc.topk(attn.top_k, -1).indices, True)
+    keep = torch.zeros_like(sc, dtype=torch.bool).scatter_(
+        -1, sc.topk(attn.top_k, -1).indices, True
+    )
     used = ((dense * keep) > 0).sum(-1).max().item()
     assert used <= attn.top_k, f"attended to {used} tokens, top_k={attn.top_k}"
 
     before = _recall()
     opt = torch.optim.AdamW([attn.W_iq.weight, attn.W_ik.weight, attn.W_iw.weight], lr=1e-2)
-    for _ in range(300):                               # train ONLY the indexer
+    for _ in range(300):  # train ONLY the indexer
         attn(x)
         loss = collect_aux_loss(attn)
         assert loss is not None and torch.isfinite(loss), "indexer objective is not finite"
-        opt.zero_grad(); loss.backward(); opt.step()
+        opt.zero_grad()
+        loss.backward()
+        opt.step()
     after = _recall()
     assert after > before + 0.05, f"indexer did not learn: {before:.3f} -> {after:.3f}"
-    print(f"  dsa       ok — <={used} tokens attended, indexer recall@{attn.top_k} "
-          f"{before:.0%} -> {after:.0%}")
+    print(
+        f"  dsa       ok — <={used} tokens attended, indexer recall@{attn.top_k} "
+        f"{before:.0%} -> {after:.0%}"
+    )
 
     print("attention_zoo self-test passed")
 

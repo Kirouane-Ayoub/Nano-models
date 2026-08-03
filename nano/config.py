@@ -65,9 +65,13 @@ def overrider(argv=None):
 
 def _git_commit():
     try:
-        out = subprocess.run(["git", "rev-parse", "--short", "HEAD"],
-                             cwd=str(ROOT),
-                             capture_output=True, text=True, timeout=5)
+        out = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=str(ROOT),
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
         return out.stdout.strip() or None
     except Exception:
         return None
@@ -83,11 +87,14 @@ def snapshot(out_dir, payload, device=None):
 
     os.makedirs(out_dir, exist_ok=True)
     path = os.path.join(out_dir, "config.resolved.json")
-    payload = {**payload, "env": {
-        "git_commit": _git_commit(),
-        "torch": torch.__version__,
-        "device": str(device) if device else None,
-    }}
+    payload = {
+        **payload,
+        "env": {
+            "git_commit": _git_commit(),
+            "torch": torch.__version__,
+            "device": str(device) if device else None,
+        },
+    }
     with open(path, "w", encoding="utf-8") as f:
         json.dump(payload, f, indent=2, sort_keys=True)
         f.write("\n")
@@ -96,5 +103,10 @@ def snapshot(out_dir, payload, device=None):
 
 def add_argument(parser):
     """Add --config to a parser. Kept here so every model spells it the same."""
-    parser.add_argument("--config", type=str, default=None, metavar="PATH",
-                        help="JSON config file; typed flags still override it")
+    parser.add_argument(
+        "--config",
+        type=str,
+        default=None,
+        metavar="PATH",
+        help="JSON config file; typed flags still override it",
+    )

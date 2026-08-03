@@ -23,6 +23,7 @@ Usage:
 if __package__ in (None, ""):
     import pathlib as _pathlib
     import sys as _sys
+
     _sys.path.insert(0, str(_pathlib.Path(__file__).resolve().parents[2]))
 
 import argparse
@@ -47,17 +48,22 @@ from torch.utils.data.distributed import DistributedSampler
 # Distributed helpers
 # ──────────────────────────────────────────────
 
+
 def is_distributed():
     return dist.is_initialized()
+
 
 def get_rank():
     return dist.get_rank() if is_distributed() else 0
 
+
 def get_world_size():
     return dist.get_world_size() if is_distributed() else 1
 
+
 def is_main_process():
     return get_rank() == 0
+
 
 def log(msg):
     if is_main_process():
@@ -68,6 +74,9 @@ def log(msg):
 # Model size presets
 # ──────────────────────────────────────────────
 
+# Hand-aligned table: columns line up so sizes can be compared down the
+# page. A formatter would give every key its own line and lose that.
+# fmt: off
 MODEL_SIZES = {
     "nano": {       # ~5M — quick experiments
         "vocab_size": 50257,  "context_length": 128,
@@ -106,6 +115,7 @@ MODEL_SIZES = {
         "rope_base": 500_000.0, "drop_rate": 0.1,
     },
 }
+# fmt: on
 
 TRAIN_SETTINGS = {
     "learning_rate": 3e-4,
@@ -124,6 +134,7 @@ TRAIN_SETTINGS = {
 # ──────────────────────────────────────────────
 # Dataset
 # ──────────────────────────────────────────────
+
 
 class TextDataset(Dataset):
     def __init__(self, text, tokenizer, max_length, stride):
@@ -144,13 +155,19 @@ class TextDataset(Dataset):
 def create_dataloaders(text, cfg, batch_size):
     tokenizer = tiktoken.get_encoding("gpt2")
     split = int(0.9 * len(text))
-    train_ds = TextDataset(text[:split], tokenizer, cfg["context_length"], stride=cfg["context_length"])
-    val_ds = TextDataset(text[split:], tokenizer, cfg["context_length"], stride=cfg["context_length"])
+    train_ds = TextDataset(
+        text[:split], tokenizer, cfg["context_length"], stride=cfg["context_length"]
+    )
+    val_ds = TextDataset(
+        text[split:], tokenizer, cfg["context_length"], stride=cfg["context_length"]
+    )
 
     if is_distributed():
         train_sampler = DistributedSampler(train_ds, shuffle=True)
         val_sampler = DistributedSampler(val_ds, shuffle=False)
-        train_loader = DataLoader(train_ds, batch_size=batch_size, sampler=train_sampler, drop_last=True)
+        train_loader = DataLoader(
+            train_ds, batch_size=batch_size, sampler=train_sampler, drop_last=True
+        )
         val_loader = DataLoader(val_ds, batch_size=batch_size, sampler=val_sampler, drop_last=False)
     else:
         train_sampler = None
@@ -163,6 +180,7 @@ def create_dataloaders(text, cfg, batch_size):
 # ──────────────────────────────────────────────
 # RMSNorm
 # ──────────────────────────────────────────────
+
 
 class RMSNorm(nn.Module):
     def __init__(self, dim, eps=1e-6):
@@ -180,6 +198,7 @@ class RMSNorm(nn.Module):
 # ──────────────────────────────────────────────
 # RoPE
 # ──────────────────────────────────────────────
+
 
 def compute_rope_params(head_dim, theta_base=10_000.0, context_length=4096):
     assert head_dim % 2 == 0
@@ -214,6 +233,7 @@ def apply_rope_offset(x, cos_slice, sin_slice):
 # Multi-Head Latent Attention (MLA) — DeepSeek's key innovation
 # ──────────────────────────────────────────────
 
+
 class MultiHeadLatentAttention(nn.Module):
     """MLA: compresses K,V into a low-dim latent, caches the tiny latent.
 
@@ -231,9 +251,9 @@ class MultiHeadLatentAttention(nn.Module):
 
         d = cfg["emb_dim"]
         self.W_query = nn.Linear(d, self.d_out, bias=False)
-        self.W_DKV = nn.Linear(d, self.latent_dim, bias=False)    # Compress to latent
-        self.W_UK = nn.Linear(self.latent_dim, self.d_out, bias=False)   # Expand to K
-        self.W_UV = nn.Linear(self.latent_dim, self.d_out, bias=False)   # Expand to V
+        self.W_DKV = nn.Linear(d, self.latent_dim, bias=False)  # Compress to latent
+        self.W_UK = nn.Linear(self.latent_dim, self.d_out, bias=False)  # Expand to K
+        self.W_UV = nn.Linear(self.latent_dim, self.d_out, bias=False)  # Expand to V
         self.out_proj = nn.Linear(self.d_out, d, bias=False)
         self.dropout = nn.Dropout(cfg["drop_rate"])
 
@@ -280,8 +300,10 @@ class MultiHeadLatentAttention(nn.Module):
             self.cache_seq_len += T
 
         # Attention
-        attn = (q @ k.transpose(-2, -1)) / (self.head_dim ** 0.5)
-        mask = torch.triu(torch.ones(T, T_k, device=x.device, dtype=torch.bool), diagonal=T_k - T + 1)
+        attn = (q @ k.transpose(-2, -1)) / (self.head_dim**0.5)
+        mask = torch.triu(
+            torch.ones(T, T_k, device=x.device, dtype=torch.bool), diagonal=T_k - T + 1
+        )
         attn = attn.masked_fill(mask, float("-inf"))
         attn = self.dropout(torch.softmax(attn, dim=-1))
 
@@ -297,8 +319,10 @@ class MultiHeadLatentAttention(nn.Module):
 # Mixture of Experts (MoE) with Shared Expert
 # ──────────────────────────────────────────────
 
+
 class Expert(nn.Module):
     """Single SwiGLU expert."""
+
     def __init__(self, emb_dim, hidden_dim):
         super().__init__()
         self.gate_proj = nn.Linear(emb_dim, hidden_dim, bias=False)
@@ -393,8 +417,8 @@ class MoEFeedForward(nn.Module):
         # Route tokens to selected experts
         for expert_id_tensor in torch.unique(topk_indices_flat):
             eid = int(expert_id_tensor.item())
-            mask = topk_indices_flat == eid              # (B*T, top_k)
-            token_mask = mask.any(dim=-1)                # (B*T,)
+            mask = topk_indices_flat == eid  # (B*T, top_k)
+            token_mask = mask.any(dim=-1)  # (B*T,)
             selected_idx = token_mask.nonzero(as_tuple=False).squeeze(-1)
             if selected_idx.numel() == 0:
                 continue
@@ -414,8 +438,9 @@ class MoEFeedForward(nn.Module):
             # index_add_ refuses mismatched types. Only reachable once the input
             # to the MoE is itself bf16, which the LatentMoE down-projection made
             # the common case.
-            out_flat.index_add_(0, selected_idx,
-                                (expert_out * probs.unsqueeze(-1)).to(out_flat.dtype))
+            out_flat.index_add_(
+                0, selected_idx, (expert_out * probs.unsqueeze(-1)).to(out_flat.dtype)
+            )
 
         result = out_flat.reshape(B, T, D)
 
@@ -429,6 +454,7 @@ class MoEFeedForward(nn.Module):
 # ──────────────────────────────────────────────
 # Transformer Block
 # ──────────────────────────────────────────────
+
 
 class TransformerBlock(nn.Module):
     def __init__(self, cfg):
@@ -447,6 +473,7 @@ class TransformerBlock(nn.Module):
 # ──────────────────────────────────────────────
 # DeepSeek Nano Model
 # ──────────────────────────────────────────────
+
 
 class DeepSeekNano(nn.Module):
     def __init__(self, cfg):
@@ -505,6 +532,7 @@ class DeepSeekNano(nn.Module):
 # Generation
 # ──────────────────────────────────────────────
 
+
 def _sample_next_token(logits, temperature, top_k):
     if temperature == 0.0:
         return logits.argmax(dim=-1, keepdim=True)
@@ -542,6 +570,7 @@ def generate_cached(model, idx, max_new_tokens, temperature=1.0, top_k=None):
 # ──────────────────────────────────────────────
 # Training
 # ──────────────────────────────────────────────
+
 
 def get_amp_ctx(device, use_amp):
     if not use_amp:
@@ -586,17 +615,33 @@ def save_checkpoint(model, optimizer, cfg, settings, global_step, epoch, ckpt_di
     os.makedirs(ckpt_dir, exist_ok=True)
     path = os.path.join(ckpt_dir, f"ds_ckpt_step_{global_step}.pt")
     raw_model = model.module if isinstance(model, DDP) else model
-    torch.save({
-        "global_step": global_step, "epoch": epoch,
-        "config": cfg, "settings": settings,
-        "model": raw_model.state_dict(),
-        "optimizer": optimizer.state_dict(),
-    }, path)
+    torch.save(
+        {
+            "global_step": global_step,
+            "epoch": epoch,
+            "config": cfg,
+            "settings": settings,
+            "model": raw_model.state_dict(),
+            "optimizer": optimizer.state_dict(),
+        },
+        path,
+    )
     log(f"  >> Checkpoint saved: {path}")
 
 
-def train(model, train_loader, val_loader, tokenizer, cfg, settings, device,
-          resume_step=0, resume_epoch=0, optimizer_state=None, train_sampler=None):
+def train(
+    model,
+    train_loader,
+    val_loader,
+    tokenizer,
+    cfg,
+    settings,
+    device,
+    resume_step=0,
+    resume_epoch=0,
+    optimizer_state=None,
+    train_sampler=None,
+):
     model.to(device)
 
     if is_distributed():
@@ -604,7 +649,8 @@ def train(model, train_loader, val_loader, tokenizer, cfg, settings, device,
     raw_model = model.module if isinstance(model, DDP) else model
 
     optimizer = torch.optim.AdamW(
-        model.parameters(), lr=settings["learning_rate"], weight_decay=settings["weight_decay"])
+        model.parameters(), lr=settings["learning_rate"], weight_decay=settings["weight_decay"]
+    )
     if optimizer_state is not None:
         optimizer.load_state_dict(optimizer_state)
 
@@ -621,14 +667,22 @@ def train(model, train_loader, val_loader, tokenizer, cfg, settings, device,
 
     log(f"\nTraining DeepSeek Nano")
     log(f"  Total params: {raw_model.count_params():,}")
-    log(f"  Active params/token: {raw_model.count_active_params():,} "
-        f"({raw_model.count_active_params() / raw_model.count_params() * 100:.1f}%)")
-    log(f"  MoE: {cfg['num_experts']} experts, top-{cfg['num_experts_per_tok']} active"
-        f"{' + 1 shared' if cfg.get('shared_expert') else ''}")
+    log(
+        f"  Active params/token: {raw_model.count_active_params():,} "
+        f"({raw_model.count_active_params() / raw_model.count_params() * 100:.1f}%)"
+    )
+    log(
+        f"  MoE: {cfg['num_experts']} experts, top-{cfg['num_experts_per_tok']} active"
+        f"{' + 1 shared' if cfg.get('shared_expert') else ''}"
+    )
     log(f"  MLA latent dim: {cfg['latent_dim']} (vs full KV: {cfg['n_heads'] * cfg['head_dim']})")
-    log(f"  {settings['num_epochs']} epochs, {len(train_loader)} batches/epoch, {max_steps} total steps")
+    log(
+        f"  {settings['num_epochs']} epochs, {len(train_loader)} batches/epoch, {max_steps} total steps"
+    )
     log(f"  Device: {device} | Precision: {precision} | GPUs: {get_world_size()}")
-    log(f"  Batch: {settings['batch_size']} x {accum_steps} accum x {get_world_size()} GPUs = {effective_batch} effective")
+    log(
+        f"  Batch: {settings['batch_size']} x {accum_steps} accum x {get_world_size()} GPUs = {effective_batch} effective"
+    )
     if resume_step > 0:
         log(f"  Resuming from step {resume_step}, epoch {resume_epoch}")
     log("")
@@ -642,12 +696,15 @@ def train(model, train_loader, val_loader, tokenizer, cfg, settings, device,
             train_sampler.set_epoch(epoch)
 
         for x, y in train_loader:
-            if epoch == resume_epoch and micro_step < (resume_step - resume_epoch * len(train_loader)):
+            if epoch == resume_epoch and micro_step < (
+                resume_step - resume_epoch * len(train_loader)
+            ):
                 micro_step += 1
                 continue
 
-            lr = get_lr(global_step, settings["warmup_steps"], max_steps,
-                        settings["learning_rate"], min_lr)
+            lr = get_lr(
+                global_step, settings["warmup_steps"], max_steps, settings["learning_rate"], min_lr
+            )
             for pg in optimizer.param_groups:
                 pg["lr"] = lr
 
@@ -667,8 +724,12 @@ def train(model, train_loader, val_loader, tokenizer, cfg, settings, device,
                 global_step += 1
 
                 if global_step % settings["eval_freq"] == 0:
-                    val_loss = calc_loss(val_loader, raw_model, device, settings["eval_iter"], amp_ctx)
-                    log(f"  Step {global_step:5d} | train {loss.item() * accum_steps:.4f} | val {val_loss:.4f} | lr {lr:.2e}")
+                    val_loss = calc_loss(
+                        val_loader, raw_model, device, settings["eval_iter"], amp_ctx
+                    )
+                    log(
+                        f"  Step {global_step:5d} | train {loss.item() * accum_steps:.4f} | val {val_loss:.4f} | lr {lr:.2e}"
+                    )
 
                 if ckpt_freq > 0 and global_step % ckpt_freq == 0:
                     save_checkpoint(model, optimizer, cfg, settings, global_step, epoch, ckpt_dir)
@@ -694,7 +755,9 @@ def train(model, train_loader, val_loader, tokenizer, cfg, settings, device,
             dist.barrier()
 
     if ckpt_freq > 0:
-        save_checkpoint(model, optimizer, cfg, settings, global_step, settings["num_epochs"], ckpt_dir)
+        save_checkpoint(
+            model, optimizer, cfg, settings, global_step, settings["num_epochs"], ckpt_dir
+        )
 
     return raw_model
 
@@ -702,6 +765,7 @@ def train(model, train_loader, val_loader, tokenizer, cfg, settings, device,
 # ──────────────────────────────────────────────
 # Main
 # ──────────────────────────────────────────────
+
 
 def load_text(file_path=None):
     if file_path:
@@ -729,8 +793,13 @@ def self_check():
     """
     torch.manual_seed(0)
     B, T, V = 4, 32, 96
-    base = {**MODEL_SIZES["nano"], "vocab_size": V, "drop_rate": 0.0,
-            "num_experts": 8, "num_experts_per_tok": 2}
+    base = {
+        **MODEL_SIZES["nano"],
+        "vocab_size": V,
+        "drop_rate": 0.0,
+        "num_experts": 8,
+        "num_experts_per_tok": 2,
+    }
 
     # Shapes, and LatentMoE shrinking the experts.
     x = torch.randn(B, T, base["emb_dim"])
@@ -741,16 +810,18 @@ def self_check():
     n_full = sum(p.numel() for p in full.parameters())
     n_lat = sum(p.numel() for p in lat.parameters())
     assert n_lat < n_full, (n_lat, n_full)
-    print(f"  latent_moe ok — {base['num_experts']} experts in "
-          f"{lat.moe_latent}d instead of {base['emb_dim']}d: "
-          f"{n_full:,} -> {n_lat:,} params ({n_lat / n_full:.0%})")
+    print(
+        f"  latent_moe ok — {base['num_experts']} experts in "
+        f"{lat.moe_latent}d instead of {base['emb_dim']}d: "
+        f"{n_full:,} -> {n_lat:,} params ({n_lat / n_full:.0%})"
+    )
 
     # The balancing bias must steer selection without touching gate weights.
     moe = MoEFeedForward({**base, "balance_speed": 1e-3}).eval()
     with torch.no_grad():
         scores = moe.gate(x)
         plain = torch.topk(scores, moe.num_experts_per_tok, -1).indices
-        moe.expert_bias[7] = 1e3                       # force expert 7 in
+        moe.expert_bias[7] = 1e3  # force expert 7 in
         biased = torch.topk(scores + moe.expert_bias, moe.num_experts_per_tok, -1).indices
         assert (biased == 7).any(-1).all(), "bias did not force selection"
         assert not (plain == 7).all(), "test is vacuous — expert 7 already always picked"
@@ -770,20 +841,26 @@ def self_check():
         data = torch.randn(B, T, base["emb_dim"])
         for _ in range(steps):
             loss = m(data).pow(2).mean()
-            opt.zero_grad(); loss.backward(); opt.step()
+            opt.zero_grad()
+            loss.backward()
+            opt.step()
         with torch.no_grad():
             sel = torch.topk(m.gate(data) + m.expert_bias, m.num_experts_per_tok, -1).indices
             counts = torch.bincount(sel.flatten(), minlength=m.num_experts).float()
         return counts
 
     off, on = spread(0.0), spread(1e-2)
-    used_off = int((off > 0).sum()); used_on = int((on > 0).sum())
-    cv_off = (off.std() / off.mean()).item(); cv_on = (on.std() / on.mean()).item()
+    used_off = int((off > 0).sum())
+    used_on = int((on > 0).sum())
+    cv_off = (off.std() / off.mean()).item()
+    cv_on = (on.std() / on.mean()).item()
     assert used_on >= used_off, (used_off, used_on)
     assert cv_on < cv_off, f"balancing made the load *less* even: {cv_off:.2f} -> {cv_on:.2f}"
     n_e = base["num_experts"]
-    print(f"  load_balance ok — experts used {used_off}/{n_e} -> {used_on}/{n_e}, "
-          f"load spread {cv_off:.2f} -> {cv_on:.2f} (lower is more even)")
+    print(
+        f"  load_balance ok — experts used {used_off}/{n_e} -> {used_on}/{n_e}, "
+        f"load spread {cv_off:.2f} -> {cv_on:.2f} (lower is more even)"
+    )
 
     print("self-check passed")
 
@@ -794,22 +871,35 @@ def main():
     parser = argparse.ArgumentParser(
         description="Train DeepSeek Nano (MLA + MoE architecture) from scratch",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="Model sizes:\n" + "\n".join(
+        epilog="Model sizes:\n"
+        + "\n".join(
             f"  {k:10s} {v['emb_dim']}d, {v['n_heads']}h, {v['n_layers']}L, "
             f"{v['num_experts']}E(top{v['num_experts_per_tok']}), latent={v['latent_dim']}"
             for k, v in MODEL_SIZES.items()
-        )
+        ),
     )
 
     parser.add_argument("--size", type=str, default="nano", choices=size_choices)
     config.add_argument(parser)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--self-check", action="store_true",
-                        help="Check MoE routing, LatentMoE and load balancing, then exit")
-    parser.add_argument("--moe-latent-dim", type=int, default=0, metavar="D",
-                        help="Run experts in a compressed space of D dims (LatentMoE, 0 = off)")
-    parser.add_argument("--balance-speed", type=float, default=1e-3,
-                        help="Aux-loss-free load-balancing bias speed (DeepSeek-V3 uses 1e-3; 0 disables)")
+    parser.add_argument(
+        "--self-check",
+        action="store_true",
+        help="Check MoE routing, LatentMoE and load balancing, then exit",
+    )
+    parser.add_argument(
+        "--moe-latent-dim",
+        type=int,
+        default=0,
+        metavar="D",
+        help="Run experts in a compressed space of D dims (LatentMoE, 0 = off)",
+    )
+    parser.add_argument(
+        "--balance-speed",
+        type=float,
+        default=1e-3,
+        help="Aux-loss-free load-balancing bias speed (DeepSeek-V3 uses 1e-3; 0 disables)",
+    )
     parser.add_argument("--file", type=str, default=None, help="Training text file")
     parser.add_argument("--epochs", type=int, default=None)
     parser.add_argument("--batch-size", type=int, default=None)
@@ -880,13 +970,16 @@ def main():
         resume_epoch = ckpt["epoch"]
         optimizer_state = ckpt["optimizer"]
 
-    train_loader, val_loader, tokenizer, train_sampler = create_dataloaders(text, cfg, settings["batch_size"])
+    train_loader, val_loader, tokenizer, train_sampler = create_dataloaders(
+        text, cfg, settings["batch_size"]
+    )
     log(f"Train batches: {len(train_loader)}, Val batches: {len(val_loader)}")
 
     ckpt_dir = os.path.join(config.ROOT, "checkpoints")
     if is_main_process():
-        saved = config.snapshot(ckpt_dir, {"model": cfg, "train": settings,
-                                           "seed": seed, "size": size}, device=device)
+        saved = config.snapshot(
+            ckpt_dir, {"model": cfg, "train": settings, "seed": seed, "size": size}, device=device
+        )
         log(f"Resolved config: {saved}  (rerun with --config {saved})")
 
     torch.manual_seed(seed)
@@ -894,37 +987,58 @@ def main():
     if args.resume:
         model.load_state_dict(ckpt["model"])
 
-    model = train(model, train_loader, val_loader, tokenizer, cfg, settings, device,
-                  resume_step=resume_step, resume_epoch=resume_epoch,
-                  optimizer_state=optimizer_state, train_sampler=train_sampler)
+    model = train(
+        model,
+        train_loader,
+        val_loader,
+        tokenizer,
+        cfg,
+        settings,
+        device,
+        resume_step=resume_step,
+        resume_epoch=resume_epoch,
+        optimizer_state=optimizer_state,
+        train_sampler=train_sampler,
+    )
 
     if is_main_process():
         import time
+
         ids = torch.tensor(tokenizer.encode(args.prompt)).unsqueeze(0).to(device)
 
-        print(f"\n{'='*60}")
+        print(f"\n{'=' * 60}")
         print(f"Prompt: {args.prompt}")
-        print(f"{'='*60}")
+        print(f"{'=' * 60}")
 
         torch.manual_seed(42)
         t0 = time.perf_counter()
-        out1 = generate(model, ids, max_new_tokens=args.max_tokens,
-                        temperature=args.temperature, top_k=args.top_k)
+        out1 = generate(
+            model,
+            ids,
+            max_new_tokens=args.max_tokens,
+            temperature=args.temperature,
+            top_k=args.top_k,
+        )
         t1 = time.perf_counter() - t0
         print(f"\n[No cache] {t1:.3f}s")
         print(tokenizer.decode(out1[0].tolist()))
 
         torch.manual_seed(42)
         t0 = time.perf_counter()
-        out2 = generate_cached(model, ids, max_new_tokens=args.max_tokens,
-                               temperature=args.temperature, top_k=args.top_k)
+        out2 = generate_cached(
+            model,
+            ids,
+            max_new_tokens=args.max_tokens,
+            temperature=args.temperature,
+            top_k=args.top_k,
+        )
         t2 = time.perf_counter() - t0
         print(f"\n[Cached (MLA latent)] {t2:.3f}s")
         print(tokenizer.decode(out2[0].tolist()))
 
         speedup = t1 / t2 if t2 > 0 else float("inf")
         print(f"\nMLA cache speedup: {speedup:.2f}x faster")
-        print(f"{'='*60}")
+        print(f"{'=' * 60}")
 
     if ddp:
         dist.destroy_process_group()

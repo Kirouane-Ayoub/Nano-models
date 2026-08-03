@@ -57,6 +57,7 @@ Usage:
 if __package__ in (None, ""):
     import pathlib as _pathlib
     import sys as _sys
+
     _sys.path.insert(0, str(_pathlib.Path(__file__).resolve().parents[2]))
 
 import argparse
@@ -71,10 +72,20 @@ import torch.distributed as dist
 from nano import config
 from nano.attention_zoo import GatedDeltaNet, KimiDeltaAttention
 from nano.models.qwen_nano import (
-    RMSNorm, SwiGLUFeedForward, GroupedQueryAttention, compute_rope_params,
-    apply_rope, apply_rope_offset,
-    TRAIN_SETTINGS, create_dataloaders, load_text, train, generate, generate_cached,
-    is_main_process, log,
+    RMSNorm,
+    SwiGLUFeedForward,
+    GroupedQueryAttention,
+    compute_rope_params,
+    apply_rope,
+    apply_rope_offset,
+    TRAIN_SETTINGS,
+    create_dataloaders,
+    load_text,
+    train,
+    generate,
+    generate_cached,
+    is_main_process,
+    log,
 )
 
 
@@ -84,6 +95,9 @@ from nano.models.qwen_nano import (
 # n_layers must be divisible by (ratio + 1); head_dim must equal emb_dim //
 # n_heads because the attention_zoo linear layers derive it that way.
 
+# Hand-aligned table: columns line up so sizes can be compared down the
+# page. A formatter would give every key its own line and lose that.
+# fmt: off
 MODEL_SIZES = {
     "nano": {       # ~5M
         "vocab_size": 50257,  "context_length": 128,
@@ -114,6 +128,7 @@ MODEL_SIZES = {
         "rope_base": 500_000.0, "drop_rate": 0.1,
     },
 }
+# fmt: on
 
 LINEAR_MIXERS = {"deltanet": GatedDeltaNet, "kda": KimiDeltaAttention}
 
@@ -135,6 +150,7 @@ def build_layer_pattern(n_layers, ratio):
 # mHC — Manifold-Constrained Hyper-Connections
 # ──────────────────────────────────────────────
 
+
 def sinkhorn(logits, iters=12):
     """Project onto the doubly stochastic manifold (the Birkhoff polytope):
     non-negative, every row and every column summing to 1.
@@ -151,8 +167,8 @@ def sinkhorn(logits, iters=12):
     """
     m = logits.exp()
     for _ in range(iters):
-        m = m / m.sum(dim=0, keepdim=True)   # columns
-        m = m / m.sum(dim=1, keepdim=True)   # rows — last, so this one is exact
+        m = m / m.sum(dim=0, keepdim=True)  # columns
+        m = m / m.sum(dim=1, keepdim=True)  # rows — last, so this one is exact
     return m
 
 
@@ -199,9 +215,9 @@ class HyperConnections(nn.Module):
         super().__init__()
         self.n, self.iters = n, iters
         jitter = (lambda t: t + torch.randn_like(t) * noise) if noise else (lambda t: t)
-        self.pre = nn.Parameter(jitter(F.one_hot(torch.tensor(0), n).float()))   # read stream 0
+        self.pre = nn.Parameter(jitter(F.one_hot(torch.tensor(0), n).float()))  # read stream 0
         self.post = nn.Parameter(jitter(F.one_hot(torch.tensor(0), n).float()))  # write stream 0
-        self.res_logits = nn.Parameter(jitter(torch.eye(n) * init))              # sinkhorn → ~I
+        self.res_logits = nn.Parameter(jitter(torch.eye(n) * init))  # sinkhorn → ~I
 
     def res_matrix(self):
         return sinkhorn(self.res_logits, self.iters)
@@ -220,6 +236,7 @@ class HyperConnections(nn.Module):
 # KV sharing (cross-layer attention)
 # ──────────────────────────────────────────────
 
+
 class SharedKVAttention(GroupedQueryAttention):
     """Attention layer that reuses another layer's keys and values (Gemma 4
     E2B/E4B).
@@ -234,7 +251,7 @@ class SharedKVAttention(GroupedQueryAttention):
 
     def __init__(self, cfg, donor):
         super().__init__(cfg)
-        del self.W_key, self.W_value          # no KV projections at all
+        del self.W_key, self.W_value  # no KV projections at all
         self.donor = [donor]
 
     def forward(self, x, cos, sin, use_cache=False):
@@ -246,14 +263,17 @@ class SharedKVAttention(GroupedQueryAttention):
             # The donor's K already has its positions baked in, so Q must use the
             # same absolute offset the donor just used.
             if use_cache and self.cache_seq_len > 0:
-                q = apply_rope_offset(q, cos[self.cache_seq_len:self.cache_seq_len + T],
-                                      sin[self.cache_seq_len:self.cache_seq_len + T])
+                q = apply_rope_offset(
+                    q,
+                    cos[self.cache_seq_len : self.cache_seq_len + T],
+                    sin[self.cache_seq_len : self.cache_seq_len + T],
+                )
             else:
                 q = apply_rope(q, cos, sin)
         if use_cache:
             self.cache_seq_len += T
 
-        k, v = self.donor[0].last_kv          # donor ran earlier in this same forward
+        k, v = self.donor[0].last_kv  # donor ran earlier in this same forward
         return self._attend(q, k, v, x)
 
     def reset_cache(self):
@@ -264,6 +284,7 @@ class SharedKVAttention(GroupedQueryAttention):
 # ──────────────────────────────────────────────
 # Hybrid block — same shell, two possible mixers
 # ──────────────────────────────────────────────
+
 
 class HybridBlock(nn.Module):
     """Pre-norm block. The only thing that varies between layers is the mixer:
@@ -276,8 +297,11 @@ class HybridBlock(nn.Module):
         if self.is_attn:
             # Gated attention: qwen_nano's GQA + the output gate.
             gated = {**cfg, "attn_out_gate": True}
-            self.attn = SharedKVAttention(gated, kv_donor) if kv_donor is not None \
+            self.attn = (
+                SharedKVAttention(gated, kv_donor)
+                if kv_donor is not None
                 else GroupedQueryAttention(gated)
+            )
         else:
             # ponytail: linear layers get no positional encoding — the recurrence
             # is already order-dependent, and Qwen3-Next doesn't add one either.
@@ -295,8 +319,11 @@ class HybridBlock(nn.Module):
             self.hc_attn = self.hc_ff = None
 
     def _mix(self, h, cos, sin, use_cache):
-        return self.attn(h, cos, sin, use_cache=use_cache) if self.is_attn \
+        return (
+            self.attn(h, cos, sin, use_cache=use_cache)
+            if self.is_attn
             else self.attn(h, use_cache=use_cache)
+        )
 
     def forward(self, x, cos, sin, use_cache=False):
         if self.hc_attn is None:
@@ -310,6 +337,7 @@ class HybridBlock(nn.Module):
 # ──────────────────────────────────────────────
 # PLE — Per-Layer Embeddings
 # ──────────────────────────────────────────────
+
 
 class PerLayerEmbeddings(nn.Module):
     """A second embedding table that feeds a small per-layer signal into every
@@ -332,7 +360,7 @@ class PerLayerEmbeddings(nn.Module):
         self.n_layers = n_layers
         self.table = nn.Embedding(cfg["vocab_size"], n_layers * self.dim)
         self.proj = nn.ModuleList([nn.Linear(self.dim, d, bias=False) for _ in range(n_layers)])
-        self.scale = nn.Parameter(torch.zeros(n_layers))   # start as a no-op
+        self.scale = nn.Parameter(torch.zeros(n_layers))  # start as a no-op
 
     def lookup(self, idx):
         B, T = idx.shape
@@ -345,6 +373,7 @@ class PerLayerEmbeddings(nn.Module):
 # ──────────────────────────────────────────────
 # Multi-Token Prediction
 # ──────────────────────────────────────────────
+
 
 class MTPHead(nn.Module):
     """Predict token t+2, alongside the main model's t+1 (DeepSeek-V3, Qwen3.5,
@@ -364,9 +393,9 @@ class MTPHead(nn.Module):
     def __init__(self, cfg):
         super().__init__()
         d = cfg["emb_dim"]
-        self.norm_h = RMSNorm(d)                          # main model's hidden state
-        self.norm_e = RMSNorm(d)                          # embedding of the next token
-        self.proj = nn.Linear(2 * d, d, bias=False)       # concat → back to d
+        self.norm_h = RMSNorm(d)  # main model's hidden state
+        self.norm_e = RMSNorm(d)  # embedding of the next token
+        self.proj = nn.Linear(2 * d, d, bias=False)  # concat → back to d
         # Plain residual: the MTP head runs on the main model's reduced hidden
         # state, after any hyper-connection streams have been averaged back.
         self.block = HybridBlock({**cfg, "residual": "plain"}, "attn")
@@ -380,11 +409,13 @@ class MTPHead(nn.Module):
 # Qwen-Next Nano Model
 # ──────────────────────────────────────────────
 
+
 class QwenNextNano(nn.Module):
     def __init__(self, cfg):
         super().__init__()
-        assert cfg["head_dim"] * cfg["n_heads"] == cfg["emb_dim"], \
+        assert cfg["head_dim"] * cfg["n_heads"] == cfg["emb_dim"], (
             "linear mixers assume head_dim == emb_dim // n_heads"
+        )
         self.cfg = cfg
         self.pattern = build_layer_pattern(cfg["n_layers"], cfg["hybrid_ratio"])
         self.mhc_streams = cfg.get("mhc_streams", 4) if cfg.get("residual") == "mhc" else 0
@@ -395,11 +426,16 @@ class QwenNextNano(nn.Module):
         # KV sharing: the last `kv_share` attention layers reuse K/V from the most
         # recent earlier attention layer that computes its own (Gemma 4).
         attn_positions = [i for i, k in enumerate(self.pattern) if k == "attn"]
-        share_from = set(attn_positions[len(attn_positions) - cfg.get("kv_share", 0):]) \
-            if cfg.get("kv_share", 0) else set()
+        share_from = (
+            set(attn_positions[len(attn_positions) - cfg.get("kv_share", 0) :])
+            if cfg.get("kv_share", 0)
+            else set()
+        )
         if share_from and len(share_from) >= len(attn_positions):
-            raise ValueError(f"kv_share={cfg['kv_share']} leaves no donor layer "
-                             f"({len(attn_positions)} attention layers exist)")
+            raise ValueError(
+                f"kv_share={cfg['kv_share']} leaves no donor layer "
+                f"({len(attn_positions)} attention layers exist)"
+            )
 
         self.blocks = nn.ModuleList()
         donor = None
@@ -445,8 +481,11 @@ class QwenNextNano(nn.Module):
                 sig = self.ple.layer_signal(ple, i)
                 # With hyper-connections the signal goes into stream 0, the one
                 # the blocks actually read from at init.
-                x = x + (F.pad(sig.unsqueeze(2), (0, 0, 0, self.mhc_streams - 1))
-                         if self.mhc_streams else sig)
+                x = x + (
+                    F.pad(sig.unsqueeze(2), (0, 0, 0, self.mhc_streams - 1))
+                    if self.mhc_streams
+                    else sig
+                )
         if self.mhc_streams:
             x = x.sum(dim=2)
         logits = self.head(self.norm(x))
@@ -478,7 +517,9 @@ class QwenNextNano(nn.Module):
 
     def own_kv_layers(self):
         """Attention layers that compute their own K/V — the rest borrow (KV sharing)."""
-        return sum(1 for b in self.blocks if b.is_attn and not isinstance(b.attn, SharedKVAttention))
+        return sum(
+            1 for b in self.blocks if b.is_attn and not isinstance(b.attn, SharedKVAttention)
+        )
 
     def mtp_params(self):
         """MTP params are training-only here — subtract them for an inference count.
@@ -494,6 +535,7 @@ class QwenNextNano(nn.Module):
 # Self-check
 # ──────────────────────────────────────────────
 
+
 def self_check():
     """Asserts the hybrid wiring is right: shapes, layer pattern, and — the part
     that actually breaks — that the incremental path (KV cache in the attention
@@ -504,8 +546,15 @@ def self_check():
     assert build_layer_pattern(4, 1) == ["linear", "attn", "linear", "attn"]
 
     def build(**over):
-        cfg = {**MODEL_SIZES["nano"], "vocab_size": 128, "drop_rate": 0.0,
-               "linear_attn": "deltanet", "hybrid_ratio": 3, "mtp_weight": 0.0, **over}
+        cfg = {
+            **MODEL_SIZES["nano"],
+            "vocab_size": 128,
+            "drop_rate": 0.0,
+            "linear_attn": "deltanet",
+            "hybrid_ratio": 3,
+            "mtp_weight": 0.0,
+            **over,
+        }
         torch.manual_seed(0)
         return cfg, QwenNextNano(cfg).eval()
 
@@ -517,7 +566,9 @@ def self_check():
         assert full.shape == (2, T, vocab), full.shape
         model.reset_kv_cache()
         model(idx[:, :prefill], use_cache=True)
-        stepwise = torch.cat([model(idx[:, t:t + 1], use_cache=True) for t in range(prefill, T)], dim=1)
+        stepwise = torch.cat(
+            [model(idx[:, t : t + 1], use_cache=True) for t in range(prefill, T)], dim=1
+        )
         torch.testing.assert_close(stepwise, full[:, prefill:], atol=1e-4, rtol=1e-4)
         return full
 
@@ -525,8 +576,10 @@ def self_check():
         cfg, model = build(linear_attn=linear)
         assert model.kv_layers() == 1, "3:1 on 4 layers → exactly one KV-cached layer"
         check_incremental(model, cfg["vocab_size"])
-        print(f"  {linear:9s} ok — {model.count_params():,} params, "
-              f"{model.kv_layers()}/{cfg['n_layers']} layers cache KV")
+        print(
+            f"  {linear:9s} ok — {model.count_params():,} params, "
+            f"{model.kv_layers()}/{cfg['n_layers']} layers cache KV"
+        )
 
     # ShortConv: must change the output, and its rolling state must keep
     # incremental decoding exact.
@@ -540,7 +593,7 @@ def self_check():
     print(f"  shortconv ok — k=4 on Q/K/V, +{conv.count_params() - plain.count_params():,} params")
 
     # KV sharing: sharer owns no K/V projections and borrows the donor's.
-    cfg_kv, shared = build(hybrid_ratio=1, kv_share=1)          # L A L A → 2 attn layers
+    cfg_kv, shared = build(hybrid_ratio=1, kv_share=1)  # L A L A → 2 attn layers
     assert shared.kv_layers() == 2 and shared.own_kv_layers() == 1
     sharers = [b.attn for b in shared.blocks if isinstance(b.attn, SharedKVAttention)]
     assert len(sharers) == 1 and not hasattr(sharers[0], "W_key")
@@ -548,16 +601,18 @@ def self_check():
     assert shared.count_params() < unshared.count_params()
     check_incremental(shared, cfg_kv["vocab_size"])
     try:
-        build(hybrid_ratio=1, kv_share=2)                        # no donor left
+        build(hybrid_ratio=1, kv_share=2)  # no donor left
         raise AssertionError("kv_share with no donor should fail")
     except ValueError:
         pass
-    print(f"  kv_share  ok — {shared.own_kv_layers()}/{shared.kv_layers()} attention layers own K/V, "
-          f"-{unshared.count_params() - shared.count_params():,} params")
+    print(
+        f"  kv_share  ok — {shared.own_kv_layers()}/{shared.kv_layers()} attention layers own K/V, "
+        f"-{unshared.count_params() - shared.count_params():,} params"
+    )
 
     # NoPE: no rotation applied, everything else identical.
     cfg_np, nope = build(pos_enc="nope")
-    _, rope = build(pos_enc="rope")                    # same seed → identical weights
+    _, rope = build(pos_enc="rope")  # same seed → identical weights
     assert nope.count_params() == rope.count_params(), "NoPE should not change param count"
     probe = torch.randint(0, cfg_np["vocab_size"], (2, 12))
     assert not torch.allclose(nope(probe), rope(probe)), "NoPE is a no-op"
@@ -578,7 +633,7 @@ def self_check():
     _, plain_res = build(residual="plain")
     probe = torch.randint(0, cfg_hc["vocab_size"], (2, 12))
     ref = plain_res(probe)
-    _, one = build(residual="mhc", mhc_streams=1, mhc_noise=0.0)     # n=1: sinkhorn is exactly [[1]]
+    _, one = build(residual="mhc", mhc_streams=1, mhc_noise=0.0)  # n=1: sinkhorn is exactly [[1]]
     torch.testing.assert_close(one(probe), ref, atol=1e-5, rtol=1e-5)
 
     # For n>1 the init is only approximately the plain network: Sinkhorn on a
@@ -598,10 +653,12 @@ def self_check():
         hc.pre.add_(torch.randn(4))
     assert not torch.allclose(mhc(probe), ref, atol=1e-2), "mHC is a no-op"
     res = hc.res_matrix()
-    torch.testing.assert_close(res.sum(1), torch.ones(4), atol=1e-6, rtol=0)   # still on-manifold
-    print(f"  mhc       ok — {hc.n} streams, doubly stochastic, identity init to "
-          f"{dev[8.0]:.1e} (scale 8) / {dev[16.0]:.1e} (scale 16), "
-          f"+{mhc.count_params() - plain_res.count_params():,} params")
+    torch.testing.assert_close(res.sum(1), torch.ones(4), atol=1e-6, rtol=0)  # still on-manifold
+    print(
+        f"  mhc       ok — {hc.n} streams, doubly stochastic, identity init to "
+        f"{dev[8.0]:.1e} (scale 8) / {dev[16.0]:.1e} (scale 16), "
+        f"+{mhc.count_params() - plain_res.count_params():,} params"
+    )
 
     # PLE: a zero-init scale means it starts as a no-op, and it must add
     # parameters without changing the active hidden size.
@@ -613,35 +670,51 @@ def self_check():
     mod, ple.ple = ple.ple, None
     off = ple(probe)
     ple.ple = mod
-    torch.testing.assert_close(on, off, atol=1e-6, rtol=1e-6)     # zero-init: exact no-op
+    torch.testing.assert_close(on, off, atol=1e-6, rtol=1e-6)  # zero-init: exact no-op
     with torch.no_grad():
         ple.ple.scale.add_(0.5)
     assert not torch.allclose(ple(probe), off), "PLE never becomes active"
     check_incremental(ple, cfg_ple["vocab_size"])
     stored = sum(p.numel() for p in ple.ple.parameters())
-    print(f"  ple       ok — {stored:,} stored params, {ple.ple.dim}d per layer, "
-          f"zero-init so it starts as a no-op")
+    print(
+        f"  ple       ok — {stored:,} stored params, {ple.ple.dim}d per layer, "
+        f"zero-init so it starts as a no-op"
+    )
 
     # MTP: same logits with or without it, an extra finite loss, and gradients
     # that actually reach the MTP block.
-    mtp_cfg = {**MODEL_SIZES["nano"], "vocab_size": 128, "drop_rate": 0.0,
-               "linear_attn": "deltanet", "hybrid_ratio": 3, "mtp_weight": 0.3}
+    mtp_cfg = {
+        **MODEL_SIZES["nano"],
+        "vocab_size": 128,
+        "drop_rate": 0.0,
+        "linear_attn": "deltanet",
+        "hybrid_ratio": 3,
+        "mtp_weight": 0.3,
+    }
     model = QwenNextNano(mtp_cfg).eval()
     assert model.needs_targets and model.mtp_params() > 0
     idx = torch.randint(0, mtp_cfg["vocab_size"], (2, 12))
     targets = torch.randint(0, mtp_cfg["vocab_size"], (2, 12))
     logits, mtp_loss = model(idx, targets)
-    torch.testing.assert_close(logits, model(idx))          # MTP must not touch the main path
+    torch.testing.assert_close(logits, model(idx))  # MTP must not touch the main path
     assert torch.isfinite(mtp_loss) and mtp_loss > 0, mtp_loss
     mtp_loss.backward()
     assert model.mtp.proj.weight.grad.abs().sum() > 0, "no gradient into the MTP head"
-    print(f"  mtp ok — loss {mtp_loss.item():.3f}, "
-          f"{model.mtp_params():,} training-only params "
-          f"({model.mtp_params() / model.count_params():.0%} of total)")
+    print(
+        f"  mtp ok — loss {mtp_loss.item():.3f}, "
+        f"{model.mtp_params():,} training-only params "
+        f"({model.mtp_params() / model.count_params():.0%} of total)"
+    )
 
     # The gate must exist on attention layers and actually change the output.
-    cfg = {**MODEL_SIZES["nano"], "vocab_size": 128, "drop_rate": 0.0,
-           "linear_attn": "deltanet", "hybrid_ratio": 1, "mtp_weight": 0.0}
+    cfg = {
+        **MODEL_SIZES["nano"],
+        "vocab_size": 128,
+        "drop_rate": 0.0,
+        "linear_attn": "deltanet",
+        "hybrid_ratio": 1,
+        "mtp_weight": 0.0,
+    }
     model = QwenNextNano(cfg).eval()
     attn = next(b.attn for b in model.blocks if b.is_attn)
     assert attn.out_gate is not None
@@ -676,16 +749,25 @@ def train_check():
             loss = F.cross_entropy(logits.flatten(0, 1), y.flatten())
             if aux is not None:
                 loss = loss + aux
-            opt.zero_grad(); loss.backward(); opt.step()
+            opt.zero_grad()
+            loss.backward()
+            opt.step()
             if step == 0:
-                yield model, x, y            # hand back for gradient inspection
+                yield model, x, y  # hand back for gradient inspection
         yield model, x, y
 
     # MTP: after overfitting, the main head must predict t+1 and the MTP head
     # t+2. An off-by-one in the shift trains just as happily and is invisible
     # in the loss curve.
-    cfg = {**MODEL_SIZES["nano"], "vocab_size": V, "drop_rate": 0.0, "linear_attn": "deltanet",
-           "hybrid_ratio": 3, "mtp_weight": 1.0, "mhc_streams": 0}
+    cfg = {
+        **MODEL_SIZES["nano"],
+        "vocab_size": V,
+        "drop_rate": 0.0,
+        "linear_attn": "deltanet",
+        "hybrid_ratio": 3,
+        "mtp_weight": 1.0,
+        "mhc_streams": 0,
+    }
     gen = overfit(cfg, steps=400)
     next(gen)
     model, x, y = next(gen)
@@ -694,21 +776,32 @@ def train_check():
         h = model.drop(model.tok_emb(x))
         for b in model.blocks:
             h = b(h, model.cos, model.sin)
-        mtp_pred = model.head(model.norm(
-            model.mtp(h[:, :-1], model.tok_emb(y[:, :-1]), model.cos, model.sin))).argmax(-1)
+        mtp_pred = model.head(
+            model.norm(model.mtp(h[:, :-1], model.tok_emb(y[:, :-1]), model.cos, model.sin))
+        ).argmax(-1)
         main_acc = (model(x).argmax(-1) == y).float().mean().item()
     acc_t2 = (mtp_pred == y[:, 1:]).float().mean().item()
     acc_t1 = (mtp_pred == y[:, :-1]).float().mean().item()
     assert main_acc > 0.9, f"main head did not overfit: {main_acc}"
     assert acc_t2 > 0.9, f"MTP head did not learn t+2: {acc_t2}"
     assert acc_t2 > acc_t1 + 0.5, f"MTP head is predicting t+1 — shift is wrong ({acc_t1})"
-    print(f"  mtp ok — main→t+1 {main_acc:.0%}, mtp→t+2 {acc_t2:.0%}, mtp→t+1 {acc_t1:.0%} (chance)")
+    print(
+        f"  mtp ok — main→t+1 {main_acc:.0%}, mtp→t+2 {acc_t2:.0%}, mtp→t+1 {acc_t1:.0%} (chance)"
+    )
 
     # mHC: gradients must reach every hyper-connection parameter, the residual
     # matrices must stay on-manifold after training, and all n streams must end
     # up distinct — equal streams mean n=4 is secretly n=2.
-    cfg = {**MODEL_SIZES["nano"], "vocab_size": V, "drop_rate": 0.0, "linear_attn": "kda",
-           "hybrid_ratio": 3, "mtp_weight": 0.0, "residual": "mhc", "mhc_streams": 4}
+    cfg = {
+        **MODEL_SIZES["nano"],
+        "vocab_size": V,
+        "drop_rate": 0.0,
+        "linear_attn": "kda",
+        "hybrid_ratio": 3,
+        "mtp_weight": 0.0,
+        "residual": "mhc",
+        "mhc_streams": 4,
+    }
     gen = overfit(cfg)
     model, _, _ = next(gen)
     hcs = [hc for b in model.blocks for hc in (b.hc_attn, b.hc_ff)]
@@ -731,8 +824,10 @@ def train_check():
     norms = h.norm(dim=-1).mean(dim=(0, 1))
     assert (norms > 1e-3).all(), f"dead stream: {norms.tolist()}"
     assert norms.std() / norms.mean() > 0.01, f"streams never differentiated: {norms.tolist()}"
-    print(f"  mhc ok — on-manifold after training, stream norms "
-          f"{[round(v, 2) for v in norms.tolist()]}")
+    print(
+        f"  mhc ok — on-manifold after training, stream norms "
+        f"{[round(v, 2) for v in norms.tolist()]}"
+    )
 
     print("train-check passed")
 
@@ -741,40 +836,88 @@ def train_check():
 # Entry point
 # ──────────────────────────────────────────────
 
+
 def main():
     parser = argparse.ArgumentParser(
         description="Train Qwen-Next Nano (hybrid linear/full attention) from scratch",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="Model sizes:\n" + "\n".join(
+        epilog="Model sizes:\n"
+        + "\n".join(
             f"  {k:8s} {v['emb_dim']}d, {v['n_heads']}h({v['n_kv_groups']}kv), "
             f"{v['n_layers']}L, ctx={v['context_length']}"
             for k, v in MODEL_SIZES.items()
-        )
+        ),
     )
     parser.add_argument("--size", type=str, default="nano", choices=list(MODEL_SIZES))
     config.add_argument(parser)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--linear", type=str, default="deltanet", choices=list(LINEAR_MIXERS),
-                        help="Linear-attention mixer for the non-attention layers")
-    parser.add_argument("--ratio", type=int, default=3,
-                        help="Linear layers per attention layer (3 = Qwen3-Next/Kimi Linear)")
-    parser.add_argument("--mtp-weight", type=float, default=0.3,
-                        help="Multi-token-prediction loss weight (DeepSeek-V3 uses 0.3; 0 disables)")
-    parser.add_argument("--short-conv", type=int, default=0, metavar="K",
-                        help="ShortConv kernel on the linear layers' Q/K/V (Kimi Linear uses 4; 0 disables)")
-    parser.add_argument("--kv-share", type=int, default=0, metavar="N",
-                        help="Last N attention layers reuse an earlier layer's K/V (Gemma 4)")
-    parser.add_argument("--posenc", type=str, default="rope", choices=["rope", "nope"],
-                        help="Positional encoding on the attention layers")
-    parser.add_argument("--residual", type=str, default="plain", choices=["plain", "mhc"],
-                        help="Residual style: single stream, or manifold-constrained hyper-connections")
-    parser.add_argument("--mhc-streams", type=int, default=4, metavar="N",
-                        help="Parallel residual streams for --residual mhc (DeepSeek V4 uses 4)")
-    parser.add_argument("--ple-dim", type=int, default=0, metavar="D",
-                        help="Per-layer embedding width (Gemma 4; 0 = off)")
+    parser.add_argument(
+        "--linear",
+        type=str,
+        default="deltanet",
+        choices=list(LINEAR_MIXERS),
+        help="Linear-attention mixer for the non-attention layers",
+    )
+    parser.add_argument(
+        "--ratio",
+        type=int,
+        default=3,
+        help="Linear layers per attention layer (3 = Qwen3-Next/Kimi Linear)",
+    )
+    parser.add_argument(
+        "--mtp-weight",
+        type=float,
+        default=0.3,
+        help="Multi-token-prediction loss weight (DeepSeek-V3 uses 0.3; 0 disables)",
+    )
+    parser.add_argument(
+        "--short-conv",
+        type=int,
+        default=0,
+        metavar="K",
+        help="ShortConv kernel on the linear layers' Q/K/V (Kimi Linear uses 4; 0 disables)",
+    )
+    parser.add_argument(
+        "--kv-share",
+        type=int,
+        default=0,
+        metavar="N",
+        help="Last N attention layers reuse an earlier layer's K/V (Gemma 4)",
+    )
+    parser.add_argument(
+        "--posenc",
+        type=str,
+        default="rope",
+        choices=["rope", "nope"],
+        help="Positional encoding on the attention layers",
+    )
+    parser.add_argument(
+        "--residual",
+        type=str,
+        default="plain",
+        choices=["plain", "mhc"],
+        help="Residual style: single stream, or manifold-constrained hyper-connections",
+    )
+    parser.add_argument(
+        "--mhc-streams",
+        type=int,
+        default=4,
+        metavar="N",
+        help="Parallel residual streams for --residual mhc (DeepSeek V4 uses 4)",
+    )
+    parser.add_argument(
+        "--ple-dim",
+        type=int,
+        default=0,
+        metavar="D",
+        help="Per-layer embedding width (Gemma 4; 0 = off)",
+    )
     parser.add_argument("--self-check", action="store_true", help="Run assertions and exit")
-    parser.add_argument("--train-check", action="store_true",
-                        help="Overfit tiny models to assert MTP and mHC actually learn (~30s)")
+    parser.add_argument(
+        "--train-check",
+        action="store_true",
+        help="Overfit tiny models to assert MTP and mHC actually learn (~30s)",
+    )
     parser.add_argument("--file", type=str, default=None, help="Training text file")
     parser.add_argument("--epochs", type=int, default=None)
     parser.add_argument("--batch-size", type=int, default=None)
@@ -829,11 +972,18 @@ def main():
     ov(settings, "use_amp", "--no-amp", not args.no_amp)
     ov(settings, "ckpt_freq", "--ckpt-freq", args.ckpt_freq)
 
-    cfg = {**MODEL_SIZES[size], "linear_attn": args.linear,
-           "hybrid_ratio": args.ratio, "mtp_weight": args.mtp_weight,
-           "short_conv": args.short_conv, "kv_share": args.kv_share, "pos_enc": args.posenc,
-           "residual": args.residual, "mhc_streams": args.mhc_streams,
-           "ple_dim": args.ple_dim}
+    cfg = {
+        **MODEL_SIZES[size],
+        "linear_attn": args.linear,
+        "hybrid_ratio": args.ratio,
+        "mtp_weight": args.mtp_weight,
+        "short_conv": args.short_conv,
+        "kv_share": args.kv_share,
+        "pos_enc": args.posenc,
+        "residual": args.residual,
+        "mhc_streams": args.mhc_streams,
+        "ple_dim": args.ple_dim,
+    }
     cfg.update(file_cfg.get("model", {}))
     for key, flag, value in (
         ("linear_attn", "--linear", args.linear),
@@ -858,14 +1008,17 @@ def main():
         optimizer_state = ckpt["optimizer"]
 
     train_loader, val_loader, tokenizer, train_sampler = create_dataloaders(
-        text, cfg, settings["batch_size"])
+        text, cfg, settings["batch_size"]
+    )
     log(f"Train batches: {len(train_loader)}, Val batches: {len(val_loader)}")
 
     ckpt_dir = os.path.join(config.ROOT, "checkpoints")
     if is_main_process():
-        saved = config.snapshot(ckpt_dir, {"model": cfg, "train": settings,
-                                           "seed": seed, "size": size, "file": top["file"]},
-                                device=device)
+        saved = config.snapshot(
+            ckpt_dir,
+            {"model": cfg, "train": settings, "seed": seed, "size": size, "file": top["file"]},
+            device=device,
+        )
         log(f"Resolved config: {saved}  (rerun with --config {saved})")
 
     torch.manual_seed(seed)
@@ -873,42 +1026,72 @@ def main():
     if args.resume:
         model.load_state_dict(ckpt["model"])
 
-    log(f"\nLayout: {' '.join('A' if k == 'attn' else 'L' for k in model.pattern)}"
-        f"  (L = {cfg['linear_attn']}, A = gated attention)")
-    log(f"KV-cached layers: {model.own_kv_layers()}/{cfg['n_layers']} "
-        f"→ ~{cfg['n_layers'] / max(1, model.own_kv_layers()):.1f}x smaller KV cache than all-attention")
+    log(
+        f"\nLayout: {' '.join('A' if k == 'attn' else 'L' for k in model.pattern)}"
+        f"  (L = {cfg['linear_attn']}, A = gated attention)"
+    )
+    log(
+        f"KV-cached layers: {model.own_kv_layers()}/{cfg['n_layers']} "
+        f"→ ~{cfg['n_layers'] / max(1, model.own_kv_layers()):.1f}x smaller KV cache than all-attention"
+    )
     if model.mtp is not None:
         log(f"MTP: weight {cfg['mtp_weight']}, {model.mtp_params():,} training-only params")
-    log(f"Components: posenc={cfg['pos_enc']}, short_conv={cfg['short_conv'] or 'off'}, "
+    log(
+        f"Components: posenc={cfg['pos_enc']}, short_conv={cfg['short_conv'] or 'off'}, "
         f"kv_share={cfg['kv_share'] or 'off'} ({model.own_kv_layers()} layers own their KV), "
-        f"residual={cfg['residual']}" + (f" x{model.mhc_streams} streams" if model.mhc_streams else "")
-        + (f", ple={cfg['ple_dim']}d" if model.ple is not None else ""))
+        f"residual={cfg['residual']}"
+        + (f" x{model.mhc_streams} streams" if model.mhc_streams else "")
+        + (f", ple={cfg['ple_dim']}d" if model.ple is not None else "")
+    )
 
-    model = train(model, train_loader, val_loader, tokenizer, cfg, settings, device,
-                  resume_step=resume_step, resume_epoch=resume_epoch,
-                  optimizer_state=optimizer_state, train_sampler=train_sampler)
+    model = train(
+        model,
+        train_loader,
+        val_loader,
+        tokenizer,
+        cfg,
+        settings,
+        device,
+        resume_step=resume_step,
+        resume_epoch=resume_epoch,
+        optimizer_state=optimizer_state,
+        train_sampler=train_sampler,
+    )
 
     if is_main_process():
         import time
+
         ids = torch.tensor(tokenizer.encode(args.prompt)).unsqueeze(0).to(device)
-        print(f"\n{'='*60}\nPrompt: {args.prompt}\n{'='*60}")
+        print(f"\n{'=' * 60}\nPrompt: {args.prompt}\n{'=' * 60}")
 
         torch.manual_seed(42)
         t0 = time.perf_counter()
-        out1 = generate(model, ids, max_new_tokens=args.max_tokens,
-                        temperature=args.temperature, top_k=args.top_k)
+        out1 = generate(
+            model,
+            ids,
+            max_new_tokens=args.max_tokens,
+            temperature=args.temperature,
+            top_k=args.top_k,
+        )
         t1 = time.perf_counter() - t0
         print(f"\n[No cache] {t1:.3f}s")
         print(tokenizer.decode(out1[0].tolist()))
 
         torch.manual_seed(42)
         t0 = time.perf_counter()
-        out2 = generate_cached(model, ids, max_new_tokens=args.max_tokens,
-                               temperature=args.temperature, top_k=args.top_k)
+        out2 = generate_cached(
+            model,
+            ids,
+            max_new_tokens=args.max_tokens,
+            temperature=args.temperature,
+            top_k=args.top_k,
+        )
         t2 = time.perf_counter() - t0
         print(f"\n[Cached] {t2:.3f}s")
         print(tokenizer.decode(out2[0].tolist()))
-        print(f"\nCache/state speedup: {t1 / t2 if t2 > 0 else float('inf'):.2f}x faster\n{'='*60}")
+        print(
+            f"\nCache/state speedup: {t1 / t2 if t2 > 0 else float('inf'):.2f}x faster\n{'=' * 60}"
+        )
 
     if ddp:
         dist.destroy_process_group()

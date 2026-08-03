@@ -24,6 +24,7 @@ Usage:
 if __package__ in (None, ""):
     import pathlib as _pathlib
     import sys as _sys
+
     _sys.path.insert(0, str(_pathlib.Path(__file__).resolve().parents[2]))
 
 import argparse
@@ -49,17 +50,22 @@ from torch.utils.data.distributed import DistributedSampler
 # Distributed helpers
 # ──────────────────────────────────────────────
 
+
 def is_distributed():
     return dist.is_initialized()
+
 
 def get_rank():
     return dist.get_rank() if is_distributed() else 0
 
+
 def get_world_size():
     return dist.get_world_size() if is_distributed() else 1
 
+
 def is_main_process():
     return get_rank() == 0
+
 
 def log(msg):
     if is_main_process():
@@ -70,6 +76,9 @@ def log(msg):
 # Model size presets
 # ──────────────────────────────────────────────
 
+# Hand-aligned table: columns line up so sizes can be compared down the
+# page. A formatter would give every key its own line and lose that.
+# fmt: off
 MODEL_SIZES = {
     "nano": {       # ~5M — quick experiments
         "vocab_size": 50257,  "context_length": 128,
@@ -107,6 +116,7 @@ MODEL_SIZES = {
         "rope_base": 1_000_000.0, "drop_rate": 0.1,
     },
 }
+# fmt: on
 
 TRAIN_SETTINGS = {
     "learning_rate": 3e-4,
@@ -125,6 +135,7 @@ TRAIN_SETTINGS = {
 # ──────────────────────────────────────────────
 # Dataset (same as GPT Nano)
 # ──────────────────────────────────────────────
+
 
 class TextDataset(Dataset):
     def __init__(self, text, tokenizer, max_length, stride):
@@ -145,13 +156,19 @@ class TextDataset(Dataset):
 def create_dataloaders(text, cfg, batch_size):
     tokenizer = tiktoken.get_encoding("gpt2")
     split = int(0.9 * len(text))
-    train_ds = TextDataset(text[:split], tokenizer, cfg["context_length"], stride=cfg["context_length"])
-    val_ds = TextDataset(text[split:], tokenizer, cfg["context_length"], stride=cfg["context_length"])
+    train_ds = TextDataset(
+        text[:split], tokenizer, cfg["context_length"], stride=cfg["context_length"]
+    )
+    val_ds = TextDataset(
+        text[split:], tokenizer, cfg["context_length"], stride=cfg["context_length"]
+    )
 
     if is_distributed():
         train_sampler = DistributedSampler(train_ds, shuffle=True)
         val_sampler = DistributedSampler(val_ds, shuffle=False)
-        train_loader = DataLoader(train_ds, batch_size=batch_size, sampler=train_sampler, drop_last=True)
+        train_loader = DataLoader(
+            train_ds, batch_size=batch_size, sampler=train_sampler, drop_last=True
+        )
         val_loader = DataLoader(val_ds, batch_size=batch_size, sampler=val_sampler, drop_last=False)
     else:
         train_sampler = None
@@ -164,6 +181,7 @@ def create_dataloaders(text, cfg, batch_size):
 # ──────────────────────────────────────────────
 # RMSNorm (replaces LayerNorm)
 # ──────────────────────────────────────────────
+
 
 class RMSNorm(nn.Module):
     """Root Mean Square Normalization — no mean subtraction, no bias.
@@ -186,13 +204,14 @@ class RMSNorm(nn.Module):
 # RoPE (Rotary Position Embeddings)
 # ──────────────────────────────────────────────
 
+
 def compute_rope_params(head_dim, theta_base=10_000.0, context_length=4096):
     """Precompute cos and sin tables for RoPE."""
     assert head_dim % 2 == 0
     inv_freq = 1.0 / (theta_base ** (torch.arange(0, head_dim, 2).float() / head_dim))
     positions = torch.arange(context_length).float()
     angles = positions.unsqueeze(1) * inv_freq.unsqueeze(0)  # (ctx, head_dim//2)
-    angles = torch.cat([angles, angles], dim=1)               # (ctx, head_dim)
+    angles = torch.cat([angles, angles], dim=1)  # (ctx, head_dim)
     return torch.cos(angles), torch.sin(angles)
 
 
@@ -213,6 +232,7 @@ def apply_rope(x, cos, sin):
 # SwiGLU Feed-Forward (replaces GELU FFN)
 # ──────────────────────────────────────────────
 
+
 class SwiGLUFeedForward(nn.Module):
     """SwiGLU: gate_proj and up_proj both project to hidden_dim,
     then SiLU(gate) * up is projected back down. No bias anywhere."""
@@ -230,6 +250,7 @@ class SwiGLUFeedForward(nn.Module):
 # ──────────────────────────────────────────────
 # Grouped-Query Attention with QK Norm + RoPE
 # ──────────────────────────────────────────────
+
 
 class GroupedQueryAttention(nn.Module):
     """GQA: fewer KV heads shared across Q groups.
@@ -261,7 +282,7 @@ class GroupedQueryAttention(nn.Module):
         # Optional sigmoid output gate (Qwen3-Next / Qwen3.5 "gated attention").
         # Off by default — Qwen3 proper doesn't have it. See qwen_next_nano.py.
         self.out_gate = nn.Linear(d, self.d_out, bias=False) if cfg.get("attn_out_gate") else None
-        self.pos_enc = cfg.get("pos_enc", "rope")   # "rope" | "nope"
+        self.pos_enc = cfg.get("pos_enc", "rope")  # "rope" | "nope"
         self.last_kv = None
 
         # KV cache
@@ -324,11 +345,13 @@ class GroupedQueryAttention(nn.Module):
 
         # Scaled dot-product attention
         T_k = k.shape[2]
-        attn = (q @ k.transpose(-2, -1)) / (self.head_dim ** 0.5)
+        attn = (q @ k.transpose(-2, -1)) / (self.head_dim**0.5)
 
         # Causal mask — the diagonal offset makes this correct for cached decode
         # too, where the query block sits at the end of the key block.
-        mask = torch.triu(torch.ones(T_q, T_k, device=x.device, dtype=torch.bool), diagonal=T_k - T_q + 1)
+        mask = torch.triu(
+            torch.ones(T_q, T_k, device=x.device, dtype=torch.bool), diagonal=T_k - T_q + 1
+        )
         attn = attn.masked_fill(mask, float("-inf"))
         attn = self.dropout(torch.softmax(attn, dim=-1))
 
@@ -357,6 +380,7 @@ def apply_rope_offset(x, cos_slice, sin_slice):
 # Transformer Block
 # ──────────────────────────────────────────────
 
+
 class TransformerBlock(nn.Module):
     def __init__(self, cfg):
         super().__init__()
@@ -374,6 +398,7 @@ class TransformerBlock(nn.Module):
 # ──────────────────────────────────────────────
 # Qwen Nano Model
 # ──────────────────────────────────────────────
+
 
 class QwenNano(nn.Module):
     def __init__(self, cfg):
@@ -425,6 +450,7 @@ class QwenNano(nn.Module):
 # Generation
 # ──────────────────────────────────────────────
 
+
 def _sample_next_token(logits, temperature, top_k):
     if temperature == 0.0:
         return logits.argmax(dim=-1, keepdim=True)
@@ -467,6 +493,7 @@ def generate_cached(model, idx, max_new_tokens, temperature=1.0, top_k=None):
 # ──────────────────────────────────────────────
 # Training
 # ──────────────────────────────────────────────
+
 
 def get_amp_ctx(device, use_amp):
     if not use_amp:
@@ -513,17 +540,33 @@ def save_checkpoint(model, optimizer, cfg, settings, global_step, epoch, ckpt_di
     os.makedirs(ckpt_dir, exist_ok=True)
     path = os.path.join(ckpt_dir, f"qwen_ckpt_step_{global_step}.pt")
     raw_model = model.module if isinstance(model, DDP) else model
-    torch.save({
-        "global_step": global_step, "epoch": epoch,
-        "config": cfg, "settings": settings,
-        "model": raw_model.state_dict(),
-        "optimizer": optimizer.state_dict(),
-    }, path)
+    torch.save(
+        {
+            "global_step": global_step,
+            "epoch": epoch,
+            "config": cfg,
+            "settings": settings,
+            "model": raw_model.state_dict(),
+            "optimizer": optimizer.state_dict(),
+        },
+        path,
+    )
     log(f"  >> Checkpoint saved: {path}")
 
 
-def train(model, train_loader, val_loader, tokenizer, cfg, settings, device,
-          resume_step=0, resume_epoch=0, optimizer_state=None, train_sampler=None):
+def train(
+    model,
+    train_loader,
+    val_loader,
+    tokenizer,
+    cfg,
+    settings,
+    device,
+    resume_step=0,
+    resume_epoch=0,
+    optimizer_state=None,
+    train_sampler=None,
+):
     model.to(device)
 
     if is_distributed():
@@ -531,7 +574,8 @@ def train(model, train_loader, val_loader, tokenizer, cfg, settings, device,
     raw_model = model.module if isinstance(model, DDP) else model
 
     optimizer = torch.optim.AdamW(
-        model.parameters(), lr=settings["learning_rate"], weight_decay=settings["weight_decay"])
+        model.parameters(), lr=settings["learning_rate"], weight_decay=settings["weight_decay"]
+    )
     if optimizer_state is not None:
         optimizer.load_state_dict(optimizer_state)
 
@@ -548,9 +592,13 @@ def train(model, train_loader, val_loader, tokenizer, cfg, settings, device,
     precision = "bfloat16" if settings.get("use_amp") else "float32"
 
     log(f"\nTraining Qwen Nano ({raw_model.count_params():,} parameters)")
-    log(f"  {settings['num_epochs']} epochs, {len(train_loader)} batches/epoch, {max_steps} total steps")
+    log(
+        f"  {settings['num_epochs']} epochs, {len(train_loader)} batches/epoch, {max_steps} total steps"
+    )
     log(f"  Device: {device} | Precision: {precision} | GPUs: {get_world_size()}")
-    log(f"  Batch: {settings['batch_size']} x {accum_steps} accum x {get_world_size()} GPUs = {effective_batch} effective")
+    log(
+        f"  Batch: {settings['batch_size']} x {accum_steps} accum x {get_world_size()} GPUs = {effective_batch} effective"
+    )
     if ckpt_freq > 0:
         log(f"  Checkpointing every {ckpt_freq} steps")
     if resume_step > 0:
@@ -566,12 +614,15 @@ def train(model, train_loader, val_loader, tokenizer, cfg, settings, device,
             train_sampler.set_epoch(epoch)
 
         for x, y in train_loader:
-            if epoch == resume_epoch and micro_step < (resume_step - resume_epoch * len(train_loader)):
+            if epoch == resume_epoch and micro_step < (
+                resume_step - resume_epoch * len(train_loader)
+            ):
                 micro_step += 1
                 continue
 
-            lr = get_lr(global_step, settings["warmup_steps"], max_steps,
-                        settings["learning_rate"], min_lr)
+            lr = get_lr(
+                global_step, settings["warmup_steps"], max_steps, settings["learning_rate"], min_lr
+            )
             for pg in optimizer.param_groups:
                 pg["lr"] = lr
 
@@ -591,7 +642,7 @@ def train(model, train_loader, val_loader, tokenizer, cfg, settings, device,
                 loss = loss / accum_steps
 
             loss.backward()
-            epoch_loss += lm_loss.item()   # LM loss only, not the aux term
+            epoch_loss += lm_loss.item()  # LM loss only, not the aux term
             micro_step += 1
 
             if micro_step % accum_steps == 0:
@@ -601,8 +652,12 @@ def train(model, train_loader, val_loader, tokenizer, cfg, settings, device,
                 global_step += 1
 
                 if global_step % settings["eval_freq"] == 0:
-                    val_loss = calc_loss(val_loader, raw_model, device, settings["eval_iter"], amp_ctx)
-                    log(f"  Step {global_step:5d} | train {lm_loss.item():.4f} | val {val_loss:.4f} | lr {lr:.2e}")
+                    val_loss = calc_loss(
+                        val_loader, raw_model, device, settings["eval_iter"], amp_ctx
+                    )
+                    log(
+                        f"  Step {global_step:5d} | train {lm_loss.item():.4f} | val {val_loss:.4f} | lr {lr:.2e}"
+                    )
 
                 if ckpt_freq > 0 and global_step % ckpt_freq == 0:
                     save_checkpoint(model, optimizer, cfg, settings, global_step, epoch, ckpt_dir)
@@ -628,7 +683,9 @@ def train(model, train_loader, val_loader, tokenizer, cfg, settings, device,
             dist.barrier()
 
     if ckpt_freq > 0:
-        save_checkpoint(model, optimizer, cfg, settings, global_step, settings["num_epochs"], ckpt_dir)
+        save_checkpoint(
+            model, optimizer, cfg, settings, global_step, settings["num_epochs"], ckpt_dir
+        )
 
     return raw_model
 
@@ -636,6 +693,7 @@ def train(model, train_loader, val_loader, tokenizer, cfg, settings, device,
 # ──────────────────────────────────────────────
 # Main
 # ──────────────────────────────────────────────
+
 
 def load_text(file_path=None):
     if file_path:
@@ -660,11 +718,12 @@ def main():
     parser = argparse.ArgumentParser(
         description="Train Qwen Nano (Qwen3 architecture) from scratch",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="Model sizes:\n" + "\n".join(
+        epilog="Model sizes:\n"
+        + "\n".join(
             f"  {k:12s} {v['emb_dim']}d, {v['n_heads']}h({v['n_kv_groups']}kv), "
             f"{v['n_layers']}L, ctx={v['context_length']}"
             for k, v in MODEL_SIZES.items()
-        )
+        ),
     )
 
     parser.add_argument("--size", type=str, default="nano", choices=size_choices)
@@ -734,13 +793,16 @@ def main():
         resume_epoch = ckpt["epoch"]
         optimizer_state = ckpt["optimizer"]
 
-    train_loader, val_loader, tokenizer, train_sampler = create_dataloaders(text, cfg, settings["batch_size"])
+    train_loader, val_loader, tokenizer, train_sampler = create_dataloaders(
+        text, cfg, settings["batch_size"]
+    )
     log(f"Train batches: {len(train_loader)}, Val batches: {len(val_loader)}")
 
     ckpt_dir = os.path.join(config.ROOT, "checkpoints")
     if is_main_process():
-        saved = config.snapshot(ckpt_dir, {"model": cfg, "train": settings,
-                                           "seed": seed, "size": size}, device=device)
+        saved = config.snapshot(
+            ckpt_dir, {"model": cfg, "train": settings, "seed": seed, "size": size}, device=device
+        )
         log(f"Resolved config: {saved}  (rerun with --config {saved})")
 
     torch.manual_seed(seed)
@@ -748,38 +810,59 @@ def main():
     if args.resume:
         model.load_state_dict(ckpt["model"])
 
-    model = train(model, train_loader, val_loader, tokenizer, cfg, settings, device,
-                  resume_step=resume_step, resume_epoch=resume_epoch,
-                  optimizer_state=optimizer_state, train_sampler=train_sampler)
+    model = train(
+        model,
+        train_loader,
+        val_loader,
+        tokenizer,
+        cfg,
+        settings,
+        device,
+        resume_step=resume_step,
+        resume_epoch=resume_epoch,
+        optimizer_state=optimizer_state,
+        train_sampler=train_sampler,
+    )
 
     # Final generation
     if is_main_process():
         import time
+
         ids = torch.tensor(tokenizer.encode(args.prompt)).unsqueeze(0).to(device)
 
-        print(f"\n{'='*60}")
+        print(f"\n{'=' * 60}")
         print(f"Prompt: {args.prompt}")
-        print(f"{'='*60}")
+        print(f"{'=' * 60}")
 
         torch.manual_seed(42)
         t0 = time.perf_counter()
-        out1 = generate(model, ids, max_new_tokens=args.max_tokens,
-                        temperature=args.temperature, top_k=args.top_k)
+        out1 = generate(
+            model,
+            ids,
+            max_new_tokens=args.max_tokens,
+            temperature=args.temperature,
+            top_k=args.top_k,
+        )
         t1 = time.perf_counter() - t0
         print(f"\n[No cache] {t1:.3f}s")
         print(tokenizer.decode(out1[0].tolist()))
 
         torch.manual_seed(42)
         t0 = time.perf_counter()
-        out2 = generate_cached(model, ids, max_new_tokens=args.max_tokens,
-                               temperature=args.temperature, top_k=args.top_k)
+        out2 = generate_cached(
+            model,
+            ids,
+            max_new_tokens=args.max_tokens,
+            temperature=args.temperature,
+            top_k=args.top_k,
+        )
         t2 = time.perf_counter() - t0
         print(f"\n[Cached] {t2:.3f}s")
         print(tokenizer.decode(out2[0].tolist()))
 
         speedup = t1 / t2 if t2 > 0 else float("inf")
         print(f"\nKV cache speedup: {speedup:.2f}x faster")
-        print(f"{'='*60}")
+        print(f"{'=' * 60}")
 
     if ddp:
         dist.destroy_process_group()
