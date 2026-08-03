@@ -1,24 +1,29 @@
 """
-Qwen Nano — Qwen3 architecture built from scratch.
+DeepSeek Nano — DeepSeek V3 architecture built from scratch.
 
-Key differences from GPT Nano:
-  - RMSNorm instead of LayerNorm
-  - SwiGLU feed-forward instead of GELU
-  - RoPE (Rotary Position Embeddings) instead of learned positional embeddings
-  - Grouped-Query Attention (GQA) with QK normalization
-  - No bias in any linear layer
+Key features (vs GPT / Qwen):
+  - Multi-Head Latent Attention (MLA): compresses K,V into tiny latent space
+  - Mixture of Experts (MoE): sparse feed-forward with top-k expert routing
+  - Shared Expert: one always-active expert + top-k routed experts
+  - RMSNorm + SwiGLU + RoPE (same as Qwen)
+  - No bias anywhere
 
-Sizes: nano (5M) → small (40M) → medium (130M) → qwen-0.6B (620M)
+Sizes: nano (5M) → small (50M) → medium (180M) → large (500M)
 
 Usage:
-    # Local
-    python qwen_nano.py                                     # Train nano
-    python qwen_nano.py --size small --epochs 10            # 40M model
-    python qwen_nano.py --resume checkpoints/ckpt_step_500.pt
+    python -m nano.models.deepseek_nano                                 # Train nano
+    python -m nano.models.deepseek_nano --size small --epochs 10        # 50M, MoE + MLA
+    python -m nano.models.deepseek_nano --resume checkpoints/ds_ckpt_step_500.pt
 
     # Multi-GPU
-    torchrun --nproc_per_node=8 qwen_nano.py --size qwen-0.6B --batch-size 32 --grad-accum 4
+    torchrun --nproc_per_node=8 -m nano.models.deepseek_nano --size large --batch-size 32 --grad-accum 4
 """
+
+# Runnable either way: `python -m nano.models.deepseek_nano` or `python nano/models/deepseek_nano.py`.
+if __package__ in (None, ""):
+    import pathlib as _pathlib
+    import sys as _sys
+    _sys.path.insert(0, str(_pathlib.Path(__file__).resolve().parents[2]))
 
 import argparse
 import math
@@ -31,9 +36,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 
-import config
+from nano import config
 
-# DDP imports
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data.distributed import DistributedSampler
@@ -68,37 +72,38 @@ MODEL_SIZES = {
     "nano": {       # ~5M — quick experiments
         "vocab_size": 50257,  "context_length": 128,
         "emb_dim": 64,        "n_heads": 4,      "n_layers": 4,
-        "hidden_dim": 192,    "head_dim": 16,
-        "n_kv_groups": 2,     "qk_norm": True,
+        "head_dim": 16,       "latent_dim": 16,
+        "num_experts": 4,     "num_experts_per_tok": 2,
+        "expert_hidden_dim": 128,
+        "shared_expert": True,
         "rope_base": 10_000.0, "drop_rate": 0.1,
     },
-    "small": {      # ~40M — single GPU
+    "small": {      # ~50M — single GPU
         "vocab_size": 50257,  "context_length": 256,
         "emb_dim": 256,       "n_heads": 8,      "n_layers": 8,
-        "hidden_dim": 768,    "head_dim": 32,
-        "n_kv_groups": 4,     "qk_norm": True,
+        "head_dim": 32,       "latent_dim": 64,
+        "num_experts": 8,     "num_experts_per_tok": 2,
+        "expert_hidden_dim": 512,
+        "shared_expert": True,
         "rope_base": 10_000.0, "drop_rate": 0.1,
     },
-    "medium": {     # ~130M — single GPU
+    "medium": {     # ~180M — single GPU
         "vocab_size": 50257,  "context_length": 512,
         "emb_dim": 512,       "n_heads": 8,      "n_layers": 12,
-        "hidden_dim": 1536,   "head_dim": 64,
-        "n_kv_groups": 4,     "qk_norm": True,
+        "head_dim": 64,       "latent_dim": 128,
+        "num_experts": 16,    "num_experts_per_tok": 2,
+        "expert_hidden_dim": 1024,
+        "shared_expert": True,
         "rope_base": 100_000.0, "drop_rate": 0.1,
     },
-    "large": {      # ~350M — multi-GPU recommended
+    "large": {      # ~500M — multi-GPU recommended
         "vocab_size": 50257,  "context_length": 1024,
         "emb_dim": 1024,      "n_heads": 16,     "n_layers": 24,
-        "hidden_dim": 3072,   "head_dim": 64,
-        "n_kv_groups": 8,     "qk_norm": True,
+        "head_dim": 64,       "latent_dim": 128,
+        "num_experts": 32,    "num_experts_per_tok": 4,
+        "expert_hidden_dim": 2048,
+        "shared_expert": True,
         "rope_base": 500_000.0, "drop_rate": 0.1,
-    },
-    "qwen-0.6B": {  # ~620M — matches Qwen3-0.6B architecture
-        "vocab_size": 50257,  "context_length": 2048,
-        "emb_dim": 1024,      "n_heads": 16,     "n_layers": 28,
-        "hidden_dim": 3072,   "head_dim": 128,
-        "n_kv_groups": 8,     "qk_norm": True,
-        "rope_base": 1_000_000.0, "drop_rate": 0.1,
     },
 }
 
@@ -117,7 +122,7 @@ TRAIN_SETTINGS = {
 
 
 # ──────────────────────────────────────────────
-# Dataset (same as GPT Nano)
+# Dataset
 # ──────────────────────────────────────────────
 
 class TextDataset(Dataset):
@@ -156,20 +161,16 @@ def create_dataloaders(text, cfg, batch_size):
 
 
 # ──────────────────────────────────────────────
-# RMSNorm (replaces LayerNorm)
+# RMSNorm
 # ──────────────────────────────────────────────
 
 class RMSNorm(nn.Module):
-    """Root Mean Square Normalization — no mean subtraction, no bias.
-    Cheaper than LayerNorm and works better for modern LLMs."""
-
     def __init__(self, dim, eps=1e-6):
         super().__init__()
         self.eps = eps
         self.scale = nn.Parameter(torch.ones(dim))
 
     def forward(self, x):
-        # Upcast to float32 for numerical stability (what Qwen3 does)
         dtype = x.dtype
         x = x.float()
         rms = torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + self.eps)
@@ -177,167 +178,29 @@ class RMSNorm(nn.Module):
 
 
 # ──────────────────────────────────────────────
-# RoPE (Rotary Position Embeddings)
+# RoPE
 # ──────────────────────────────────────────────
 
 def compute_rope_params(head_dim, theta_base=10_000.0, context_length=4096):
-    """Precompute cos and sin tables for RoPE."""
     assert head_dim % 2 == 0
     inv_freq = 1.0 / (theta_base ** (torch.arange(0, head_dim, 2).float() / head_dim))
     positions = torch.arange(context_length).float()
-    angles = positions.unsqueeze(1) * inv_freq.unsqueeze(0)  # (ctx, head_dim//2)
-    angles = torch.cat([angles, angles], dim=1)               # (ctx, head_dim)
+    angles = positions.unsqueeze(1) * inv_freq.unsqueeze(0)
+    angles = torch.cat([angles, angles], dim=1)
     return torch.cos(angles), torch.sin(angles)
 
 
 def apply_rope(x, cos, sin):
-    """Apply rotary embeddings to Q or K tensor.
-    x: (batch, heads, seq_len, head_dim)
-    """
     _, _, seq_len, head_dim = x.shape
     x1 = x[..., : head_dim // 2]
     x2 = x[..., head_dim // 2 :]
-    cos = cos[:seq_len].unsqueeze(0).unsqueeze(0)  # (1, 1, seq, head_dim)
+    cos = cos[:seq_len].unsqueeze(0).unsqueeze(0)
     sin = sin[:seq_len].unsqueeze(0).unsqueeze(0)
     rotated = torch.cat((-x2, x1), dim=-1)
     return ((x * cos) + (rotated * sin)).to(x.dtype)
 
 
-# ──────────────────────────────────────────────
-# SwiGLU Feed-Forward (replaces GELU FFN)
-# ──────────────────────────────────────────────
-
-class SwiGLUFeedForward(nn.Module):
-    """SwiGLU: gate_proj and up_proj both project to hidden_dim,
-    then SiLU(gate) * up is projected back down. No bias anywhere."""
-
-    def __init__(self, cfg):
-        super().__init__()
-        self.gate_proj = nn.Linear(cfg["emb_dim"], cfg["hidden_dim"], bias=False)
-        self.up_proj = nn.Linear(cfg["emb_dim"], cfg["hidden_dim"], bias=False)
-        self.down_proj = nn.Linear(cfg["hidden_dim"], cfg["emb_dim"], bias=False)
-
-    def forward(self, x):
-        return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
-
-
-# ──────────────────────────────────────────────
-# Grouped-Query Attention with QK Norm + RoPE
-# ──────────────────────────────────────────────
-
-class GroupedQueryAttention(nn.Module):
-    """GQA: fewer KV heads shared across Q groups.
-    Includes QK normalization and RoPE. No bias. KV cache support."""
-
-    def __init__(self, cfg):
-        super().__init__()
-        self.n_heads = cfg["n_heads"]
-        self.head_dim = cfg["head_dim"]
-        self.n_kv_groups = cfg["n_kv_groups"]
-        self.group_size = self.n_heads // self.n_kv_groups
-        self.d_out = self.n_heads * self.head_dim
-
-        d = cfg["emb_dim"]
-        self.W_query = nn.Linear(d, self.d_out, bias=False)
-        self.W_key = nn.Linear(d, self.n_kv_groups * self.head_dim, bias=False)
-        self.W_value = nn.Linear(d, self.n_kv_groups * self.head_dim, bias=False)
-        self.out_proj = nn.Linear(self.d_out, d, bias=False)
-
-        # QK normalization (Qwen3 feature — stabilizes training at scale)
-        if cfg.get("qk_norm", False):
-            self.q_norm = RMSNorm(self.head_dim)
-            self.k_norm = RMSNorm(self.head_dim)
-        else:
-            self.q_norm = self.k_norm = None
-
-        self.dropout = nn.Dropout(cfg["drop_rate"])
-
-        # Optional sigmoid output gate (Qwen3-Next / Qwen3.5 "gated attention").
-        # Off by default — Qwen3 proper doesn't have it. See qwen_next_nano.py.
-        self.out_gate = nn.Linear(d, self.d_out, bias=False) if cfg.get("attn_out_gate") else None
-        self.pos_enc = cfg.get("pos_enc", "rope")   # "rope" | "nope"
-        self.last_kv = None
-
-        # KV cache
-        self.register_buffer("cache_k", None, persistent=False)
-        self.register_buffer("cache_v", None, persistent=False)
-        self.cache_seq_len = 0
-
-    def forward(self, x, cos, sin, use_cache=False):
-        B, T, _ = x.shape
-
-        q = self.W_query(x).view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
-        k_new = self.W_key(x).view(B, T, self.n_kv_groups, self.head_dim).transpose(1, 2)
-        v_new = self.W_value(x).view(B, T, self.n_kv_groups, self.head_dim).transpose(1, 2)
-
-        # QK normalization
-        if self.q_norm:
-            q = self.q_norm(q)
-            k_new = self.k_norm(k_new)
-
-        # Apply RoPE — must apply BEFORE caching (positions are baked in).
-        # pos_enc="nope" skips it entirely: with a causal mask the model can still
-        # infer position, and long-context extrapolation often improves.
-        if self.pos_enc == "nope":
-            pass
-        elif use_cache and self.cache_seq_len > 0:
-            # Offset cos/sin for cached positions
-            q_cos = cos[self.cache_seq_len : self.cache_seq_len + T]
-            q_sin = sin[self.cache_seq_len : self.cache_seq_len + T]
-            q = apply_rope_offset(q, q_cos, q_sin)
-            k_new = apply_rope_offset(k_new, q_cos, q_sin)
-        else:
-            q = apply_rope(q, cos, sin)
-            k_new = apply_rope(k_new, cos, sin)
-
-        # KV cache
-        if use_cache:
-            if self.cache_k is None:
-                self.cache_k, self.cache_v = k_new, v_new
-            else:
-                self.cache_k = torch.cat([self.cache_k, k_new], dim=2)
-                self.cache_v = torch.cat([self.cache_v, v_new], dim=2)
-            k, v = self.cache_k, self.cache_v
-            self.cache_seq_len += T
-        else:
-            k, v = k_new, v_new
-
-        # Kept so a later layer can reuse them — see SharedKVAttention in
-        # qwen_next_nano.py. Unused unless something reads it.
-        self.last_kv = (k, v)
-        return self._attend(q, k, v, x)
-
-    def _attend(self, q, k, v, x):
-        """Everything after K/V are decided: group expansion, causal softmax,
-        optional output gate, projection."""
-        B, T_q = q.shape[0], q.shape[2]
-
-        # Expand KV groups to match Q heads
-        k = k.repeat_interleave(self.group_size, dim=1)
-        v = v.repeat_interleave(self.group_size, dim=1)
-
-        # Scaled dot-product attention
-        T_k = k.shape[2]
-        attn = (q @ k.transpose(-2, -1)) / (self.head_dim ** 0.5)
-
-        # Causal mask — the diagonal offset makes this correct for cached decode
-        # too, where the query block sits at the end of the key block.
-        mask = torch.triu(torch.ones(T_q, T_k, device=x.device, dtype=torch.bool), diagonal=T_k - T_q + 1)
-        attn = attn.masked_fill(mask, float("-inf"))
-        attn = self.dropout(torch.softmax(attn, dim=-1))
-
-        out = (attn @ v).transpose(1, 2).contiguous().view(B, T_q, self.d_out)
-        if self.out_gate is not None:
-            out = out * torch.sigmoid(self.out_gate(x))
-        return self.out_proj(out)
-
-    def reset_cache(self):
-        self.cache_k = self.cache_v = None
-        self.cache_seq_len = 0
-
-
 def apply_rope_offset(x, cos_slice, sin_slice):
-    """Apply RoPE with pre-sliced cos/sin (for cached generation)."""
     _, _, _, head_dim = x.shape
     x1 = x[..., : head_dim // 2]
     x2 = x[..., head_dim // 2 :]
@@ -348,6 +211,222 @@ def apply_rope_offset(x, cos_slice, sin_slice):
 
 
 # ──────────────────────────────────────────────
+# Multi-Head Latent Attention (MLA) — DeepSeek's key innovation
+# ──────────────────────────────────────────────
+
+class MultiHeadLatentAttention(nn.Module):
+    """MLA: compresses K,V into a low-dim latent, caches the tiny latent.
+
+    Instead of caching full K,V (n_heads * head_dim per layer per token),
+    we cache only the latent vector (latent_dim per layer per token).
+    Then expand to K,V on the fly. ~75% KV cache savings.
+    """
+
+    def __init__(self, cfg):
+        super().__init__()
+        self.n_heads = cfg["n_heads"]
+        self.head_dim = cfg["head_dim"]
+        self.d_out = self.n_heads * self.head_dim
+        self.latent_dim = cfg["latent_dim"]
+
+        d = cfg["emb_dim"]
+        self.W_query = nn.Linear(d, self.d_out, bias=False)
+        self.W_DKV = nn.Linear(d, self.latent_dim, bias=False)    # Compress to latent
+        self.W_UK = nn.Linear(self.latent_dim, self.d_out, bias=False)   # Expand to K
+        self.W_UV = nn.Linear(self.latent_dim, self.d_out, bias=False)   # Expand to V
+        self.out_proj = nn.Linear(self.d_out, d, bias=False)
+        self.dropout = nn.Dropout(cfg["drop_rate"])
+
+        # Cache the tiny latent, not full K,V
+        self.register_buffer("cache_latent", None, persistent=False)
+        self.cache_seq_len = 0
+
+    def forward(self, x, cos, sin, use_cache=False):
+        B, T, _ = x.shape
+
+        q_all = self.W_query(x)
+        latent_new = self.W_DKV(x)  # (B, T, latent_dim) — tiny!
+
+        if use_cache:
+            if self.cache_latent is None:
+                latent = latent_new
+            else:
+                latent = torch.cat([self.cache_latent, latent_new], dim=1)
+            self.cache_latent = latent
+        else:
+            latent = latent_new
+
+        # Expand latent to full K,V
+        k_all = self.W_UK(latent)
+        v_all = self.W_UV(latent)
+
+        T_k = k_all.shape[1]
+        q = q_all.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
+        k = k_all.view(B, T_k, self.n_heads, self.head_dim).transpose(1, 2)
+        v = v_all.view(B, T_k, self.n_heads, self.head_dim).transpose(1, 2)
+
+        # Apply RoPE
+        if use_cache and self.cache_seq_len > 0:
+            q_cos = cos[self.cache_seq_len : self.cache_seq_len + T]
+            q_sin = sin[self.cache_seq_len : self.cache_seq_len + T]
+            q = apply_rope_offset(q, q_cos, q_sin)
+            # K gets RoPE for ALL positions (since we re-expand from latent each time)
+            k = apply_rope(k, cos, sin)
+        else:
+            q = apply_rope(q, cos, sin)
+            k = apply_rope(k, cos, sin)
+
+        if use_cache:
+            self.cache_seq_len += T
+
+        # Attention
+        attn = (q @ k.transpose(-2, -1)) / (self.head_dim ** 0.5)
+        mask = torch.triu(torch.ones(T, T_k, device=x.device, dtype=torch.bool), diagonal=T_k - T + 1)
+        attn = attn.masked_fill(mask, float("-inf"))
+        attn = self.dropout(torch.softmax(attn, dim=-1))
+
+        out = (attn @ v).transpose(1, 2).contiguous().view(B, T, self.d_out)
+        return self.out_proj(out)
+
+    def reset_cache(self):
+        self.cache_latent = None
+        self.cache_seq_len = 0
+
+
+# ──────────────────────────────────────────────
+# Mixture of Experts (MoE) with Shared Expert
+# ──────────────────────────────────────────────
+
+class Expert(nn.Module):
+    """Single SwiGLU expert."""
+    def __init__(self, emb_dim, hidden_dim):
+        super().__init__()
+        self.gate_proj = nn.Linear(emb_dim, hidden_dim, bias=False)
+        self.up_proj = nn.Linear(emb_dim, hidden_dim, bias=False)
+        self.down_proj = nn.Linear(hidden_dim, emb_dim, bias=False)
+
+    def forward(self, x):
+        return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
+
+
+class MoEFeedForward(nn.Module):
+    """Sparse MoE: router selects top-k experts per token.
+
+    Options, all off unless configured:
+      - shared_expert     one expert always active (DeepSeek V2/V3)
+      - balance_speed     aux-loss-free load balancing (DeepSeek-V3)
+      - moe_latent_dim    LatentMoE — experts run in a compressed space
+                          (Nemotron 3 Super, 2026)
+
+    **Aux-loss-free load balancing.** Routers collapse: a few experts win early,
+    get all the gradient, and win harder. The usual fix is an auxiliary
+    load-balancing loss, which works but fights the language-modelling loss for
+    the same parameters. DeepSeek-V3 drops the extra loss and instead keeps a
+    per-expert bias that is added to the router scores *for selection only*,
+    nudged after every step toward whichever experts are under-used. The bias
+    decides who runs; it never touches how much their output counts, so no
+    gradient signal is distorted. It is updated by rule, not by backprop.
+
+    **LatentMoE.** Project the token down to a smaller dimension, route and run
+    the experts entirely in there, project the result back up. Each expert costs
+    a fraction of a full-width one, so the same parameter budget buys many more
+    of them — better accuracy per FLOP than a regular MoE.
+    """
+
+    def __init__(self, cfg):
+        super().__init__()
+        self.num_experts = cfg["num_experts"]
+        self.num_experts_per_tok = cfg["num_experts_per_tok"]
+        self.emb_dim = cfg["emb_dim"]
+        hidden = cfg["expert_hidden_dim"]
+
+        # LatentMoE: everything below runs in `d`, not emb_dim
+        self.moe_latent = cfg.get("moe_latent_dim", 0)
+        d = self.moe_latent or cfg["emb_dim"]
+        self.down = nn.Linear(cfg["emb_dim"], d, bias=False) if self.moe_latent else None
+        self.up = nn.Linear(d, cfg["emb_dim"], bias=False) if self.moe_latent else None
+
+        # Router: scores each expert for each token
+        self.gate = nn.Linear(d, self.num_experts, bias=False)
+
+        # Routed experts
+        self.experts = nn.ModuleList([Expert(d, hidden) for _ in range(self.num_experts)])
+
+        # Shared expert (always active, DeepSeek V2/V3 feature)
+        self.shared_expert = Expert(d, hidden) if cfg.get("shared_expert", False) else None
+
+        # Aux-loss-free load balancing (DeepSeek-V3 uses gamma = 1e-3)
+        self.balance_speed = cfg.get("balance_speed", 1e-3)
+        self.register_buffer("expert_bias", torch.zeros(self.num_experts))
+        self.register_buffer("expert_load", torch.zeros(self.num_experts))
+
+    @torch.no_grad()
+    def _update_bias(self, topk_indices):
+        """Raise the bias of under-loaded experts, lower it for overloaded ones.
+        Sign-only, so the step size never depends on how skewed the batch was."""
+        counts = torch.bincount(topk_indices.flatten(), minlength=self.num_experts).float()
+        self.expert_load = counts
+        self.expert_bias += self.balance_speed * torch.sign(counts.mean() - counts)
+
+    def forward(self, x):
+        if self.down is not None:
+            x = self.down(x)
+        B, T, D = x.shape
+
+        # Router scores
+        scores = self.gate(x)  # (B, T, num_experts)
+        # The balancing bias steers *selection* only. Gating weights come from
+        # the raw scores, so a bias can never inflate an expert's contribution.
+        sel_scores = scores + self.expert_bias if self.balance_speed else scores
+        topk_indices = torch.topk(sel_scores, self.num_experts_per_tok, dim=-1).indices
+        topk_probs = torch.softmax(torch.gather(scores, -1, topk_indices), dim=-1)
+
+        if self.training and self.balance_speed:
+            self._update_bias(topk_indices)
+
+        # Flatten for expert routing
+        x_flat = x.reshape(B * T, D)
+        out_flat = torch.zeros_like(x_flat)
+        topk_indices_flat = topk_indices.reshape(-1, self.num_experts_per_tok)
+        topk_probs_flat = topk_probs.reshape(-1, self.num_experts_per_tok)
+
+        # Route tokens to selected experts
+        for expert_id_tensor in torch.unique(topk_indices_flat):
+            eid = int(expert_id_tensor.item())
+            mask = topk_indices_flat == eid              # (B*T, top_k)
+            token_mask = mask.any(dim=-1)                # (B*T,)
+            selected_idx = token_mask.nonzero(as_tuple=False).squeeze(-1)
+            if selected_idx.numel() == 0:
+                continue
+
+            expert_input = x_flat.index_select(0, selected_idx)
+            expert_out = self.experts[eid](expert_input)
+
+            # Get the routing probability for this expert
+            mask_selected = mask[selected_idx]
+            slot_indices = mask_selected.int().argmax(dim=-1, keepdim=True)
+            probs = torch.gather(
+                topk_probs_flat.index_select(0, selected_idx), dim=-1, index=slot_indices
+            ).squeeze(-1)
+
+            # Cast to the accumulator's dtype: under autocast the expert output
+            # is bf16 while softmax keeps its probabilities in fp32, and
+            # index_add_ refuses mismatched types. Only reachable once the input
+            # to the MoE is itself bf16, which the LatentMoE down-projection made
+            # the common case.
+            out_flat.index_add_(0, selected_idx,
+                                (expert_out * probs.unsqueeze(-1)).to(out_flat.dtype))
+
+        result = out_flat.reshape(B, T, D)
+
+        # Add shared expert output (always active for every token)
+        if self.shared_expert is not None:
+            result = result + self.shared_expert(x)
+
+        return self.up(result) if self.up is not None else result
+
+
+# ──────────────────────────────────────────────
 # Transformer Block
 # ──────────────────────────────────────────────
 
@@ -355,9 +434,9 @@ class TransformerBlock(nn.Module):
     def __init__(self, cfg):
         super().__init__()
         self.norm1 = RMSNorm(cfg["emb_dim"])
-        self.attn = GroupedQueryAttention(cfg)
+        self.attn = MultiHeadLatentAttention(cfg)
         self.norm2 = RMSNorm(cfg["emb_dim"])
-        self.ff = SwiGLUFeedForward(cfg)
+        self.ff = MoEFeedForward(cfg)
 
     def forward(self, x, cos, sin, use_cache=False):
         x = x + self.attn(self.norm1(x), cos, sin, use_cache=use_cache)
@@ -366,26 +445,21 @@ class TransformerBlock(nn.Module):
 
 
 # ──────────────────────────────────────────────
-# Qwen Nano Model
+# DeepSeek Nano Model
 # ──────────────────────────────────────────────
 
-class QwenNano(nn.Module):
+class DeepSeekNano(nn.Module):
     def __init__(self, cfg):
         super().__init__()
         self.cfg = cfg
         self.tok_emb = nn.Embedding(cfg["vocab_size"], cfg["emb_dim"])
-        # No positional embedding — RoPE is applied inside attention
         self.drop = nn.Dropout(cfg["drop_rate"])
         self.blocks = nn.ModuleList([TransformerBlock(cfg) for _ in range(cfg["n_layers"])])
         self.norm = RMSNorm(cfg["emb_dim"])
         self.head = nn.Linear(cfg["emb_dim"], cfg["vocab_size"], bias=False)
-
-        # Weight tying
         self.head.weight = self.tok_emb.weight
 
-        # Precompute RoPE cos/sin tables
-        head_dim = cfg["head_dim"]
-        cos, sin = compute_rope_params(head_dim, cfg["rope_base"], cfg["context_length"])
+        cos, sin = compute_rope_params(cfg["head_dim"], cfg["rope_base"], cfg["context_length"])
         self.register_buffer("cos", cos, persistent=False)
         self.register_buffer("sin", sin, persistent=False)
 
@@ -414,6 +488,18 @@ class QwenNano(nn.Module):
     def count_params(self):
         return sum(p.numel() for p in self.parameters())
 
+    def count_active_params(self):
+        """Count params active per token (excludes inactive experts)."""
+        total = 0
+        for name, p in self.named_parameters():
+            if "experts." in name:
+                # Only count top-k out of num_experts
+                ratio = self.cfg["num_experts_per_tok"] / self.cfg["num_experts"]
+                total += int(p.numel() * ratio)
+            else:
+                total += p.numel()
+        return total
+
 
 # ──────────────────────────────────────────────
 # Generation
@@ -434,10 +520,8 @@ def generate(model, idx, max_new_tokens, temperature=1.0, top_k=None):
     model.eval()
     ctx_len = model.cfg["context_length"]
     for _ in range(max_new_tokens):
-        idx_crop = idx[:, -ctx_len:]
-        logits = model(idx_crop)[:, -1, :]
-        idx_next = _sample_next_token(logits, temperature, top_k)
-        idx = torch.cat([idx, idx_next], dim=1)
+        logits = model(idx[:, -ctx_len:])[:, -1, :]
+        idx = torch.cat([idx, _sample_next_token(logits, temperature, top_k)], dim=1)
     return idx
 
 
@@ -447,14 +531,11 @@ def generate_cached(model, idx, max_new_tokens, temperature=1.0, top_k=None):
     ctx_len = model.cfg["context_length"]
     model.reset_kv_cache()
 
-    prompt = idx[:, -ctx_len:]
-    logits = model(prompt, use_cache=True)[:, -1, :]
-
+    logits = model(idx[:, -ctx_len:], use_cache=True)[:, -1, :]
     for _ in range(max_new_tokens):
         idx_next = _sample_next_token(logits, temperature, top_k)
         idx = torch.cat([idx, idx_next], dim=1)
         logits = model(idx_next, use_cache=True)[:, -1, :]
-
     return idx
 
 
@@ -483,9 +564,7 @@ def calc_loss(loader, model, device, max_batches=None, amp_ctx=None):
                 break
             x, y = x.to(device), y.to(device)
             with amp_ctx:
-                out = model(x, y) if getattr(model, "needs_targets", False) else model(x)
-                logits = out[0] if isinstance(out, tuple) else out
-                loss = F.cross_entropy(logits.flatten(0, 1), y.flatten())
+                loss = F.cross_entropy(model(x).flatten(0, 1), y.flatten())
             total += loss.item()
             count += 1
     model.train()
@@ -505,7 +584,7 @@ def save_checkpoint(model, optimizer, cfg, settings, global_step, epoch, ckpt_di
     if not is_main_process():
         return
     os.makedirs(ckpt_dir, exist_ok=True)
-    path = os.path.join(ckpt_dir, f"qwen_ckpt_step_{global_step}.pt")
+    path = os.path.join(ckpt_dir, f"ds_ckpt_step_{global_step}.pt")
     raw_model = model.module if isinstance(model, DDP) else model
     torch.save({
         "global_step": global_step, "epoch": epoch,
@@ -529,24 +608,27 @@ def train(model, train_loader, val_loader, tokenizer, cfg, settings, device,
     if optimizer_state is not None:
         optimizer.load_state_dict(optimizer_state)
 
-    needs_targets = getattr(raw_model, "needs_targets", False)
     max_steps = settings["num_epochs"] * len(train_loader)
     min_lr = settings["learning_rate"] * 0.1
     global_step = resume_step
     accum_steps = settings.get("grad_accum_steps", 1)
     ckpt_freq = settings.get("ckpt_freq", 0)
     amp_ctx = get_amp_ctx(device, settings.get("use_amp", False))
-    ckpt_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "checkpoints")
+    ckpt_dir = os.path.join(config.ROOT, "checkpoints")
 
     effective_batch = settings["batch_size"] * accum_steps * get_world_size()
     precision = "bfloat16" if settings.get("use_amp") else "float32"
 
-    log(f"\nTraining Qwen Nano ({raw_model.count_params():,} parameters)")
+    log(f"\nTraining DeepSeek Nano")
+    log(f"  Total params: {raw_model.count_params():,}")
+    log(f"  Active params/token: {raw_model.count_active_params():,} "
+        f"({raw_model.count_active_params() / raw_model.count_params() * 100:.1f}%)")
+    log(f"  MoE: {cfg['num_experts']} experts, top-{cfg['num_experts_per_tok']} active"
+        f"{' + 1 shared' if cfg.get('shared_expert') else ''}")
+    log(f"  MLA latent dim: {cfg['latent_dim']} (vs full KV: {cfg['n_heads'] * cfg['head_dim']})")
     log(f"  {settings['num_epochs']} epochs, {len(train_loader)} batches/epoch, {max_steps} total steps")
     log(f"  Device: {device} | Precision: {precision} | GPUs: {get_world_size()}")
     log(f"  Batch: {settings['batch_size']} x {accum_steps} accum x {get_world_size()} GPUs = {effective_batch} effective")
-    if ckpt_freq > 0:
-        log(f"  Checkpointing every {ckpt_freq} steps")
     if resume_step > 0:
         log(f"  Resuming from step {resume_step}, epoch {resume_epoch}")
     log("")
@@ -570,22 +652,12 @@ def train(model, train_loader, val_loader, tokenizer, cfg, settings, device,
                 pg["lr"] = lr
 
             x, y = x.to(device), y.to(device)
-
             with amp_ctx:
-                # Models with an auxiliary loss (e.g. MTP in qwen_next_nano) take the
-                # targets and return it alongside the logits — it has to be computed
-                # inside the DDP-wrapped forward or its grads never get synced.
-                out = model(x, y) if needs_targets else model(x)
-                logits, aux = out if isinstance(out, tuple) else (out, None)
-                # Auxiliary losses (MTP) go into the gradient only — reported
-                # losses stay pure LM loss so runs with and without them are
-                # directly comparable.
-                lm_loss = F.cross_entropy(logits.flatten(0, 1), y.flatten())
-                loss = lm_loss if aux is None else lm_loss + aux
-                loss = loss / accum_steps
+                logits = model(x)
+                loss = F.cross_entropy(logits.flatten(0, 1), y.flatten()) / accum_steps
 
             loss.backward()
-            epoch_loss += lm_loss.item()   # LM loss only, not the aux term
+            epoch_loss += loss.item() * accum_steps
             micro_step += 1
 
             if micro_step % accum_steps == 0:
@@ -596,7 +668,7 @@ def train(model, train_loader, val_loader, tokenizer, cfg, settings, device,
 
                 if global_step % settings["eval_freq"] == 0:
                     val_loss = calc_loss(val_loader, raw_model, device, settings["eval_iter"], amp_ctx)
-                    log(f"  Step {global_step:5d} | train {lm_loss.item():.4f} | val {val_loss:.4f} | lr {lr:.2e}")
+                    log(f"  Step {global_step:5d} | train {loss.item() * accum_steps:.4f} | val {val_loss:.4f} | lr {lr:.2e}")
 
                 if ckpt_freq > 0 and global_step % ckpt_freq == 0:
                     save_checkpoint(model, optimizer, cfg, settings, global_step, epoch, ckpt_dir)
@@ -635,7 +707,7 @@ def load_text(file_path=None):
     if file_path:
         with open(file_path, "r", encoding="utf-8") as f:
             return f.read()
-    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "the-verdict.txt")
+    path = os.path.join(config.ROOT, "the-verdict.txt")
     url = "https://raw.githubusercontent.com/rasbt/LLMs-from-scratch/main/ch02/01_main-chapter-code/the-verdict.txt"
     if not os.path.exists(path):
         log("Downloading sample text...")
@@ -648,15 +720,83 @@ def load_text(file_path=None):
         return f.read()
 
 
+def self_check():
+    """MoE routing invariants, plus the one property that only shows up after
+    training: aux-loss-free balancing actually spreading the load.
+
+    Router collapse is silent — the loss curve of a model using 2 of its 8
+    experts looks perfectly healthy.
+    """
+    torch.manual_seed(0)
+    B, T, V = 4, 32, 96
+    base = {**MODEL_SIZES["nano"], "vocab_size": V, "drop_rate": 0.0,
+            "num_experts": 8, "num_experts_per_tok": 2}
+
+    # Shapes, and LatentMoE shrinking the experts.
+    x = torch.randn(B, T, base["emb_dim"])
+    full = MoEFeedForward({**base, "balance_speed": 0.0})
+    lat = MoEFeedForward({**base, "balance_speed": 0.0, "moe_latent_dim": base["emb_dim"] // 4})
+    for m in (full, lat):
+        assert m(x).shape == x.shape, m(x).shape
+    n_full = sum(p.numel() for p in full.parameters())
+    n_lat = sum(p.numel() for p in lat.parameters())
+    assert n_lat < n_full, (n_lat, n_full)
+    print(f"  latent_moe ok — {base['num_experts']} experts in "
+          f"{lat.moe_latent}d instead of {base['emb_dim']}d: "
+          f"{n_full:,} -> {n_lat:,} params ({n_lat / n_full:.0%})")
+
+    # The balancing bias must steer selection without touching gate weights.
+    moe = MoEFeedForward({**base, "balance_speed": 1e-3}).eval()
+    with torch.no_grad():
+        scores = moe.gate(x)
+        plain = torch.topk(scores, moe.num_experts_per_tok, -1).indices
+        moe.expert_bias[7] = 1e3                       # force expert 7 in
+        biased = torch.topk(scores + moe.expert_bias, moe.num_experts_per_tok, -1).indices
+        assert (biased == 7).any(-1).all(), "bias did not force selection"
+        assert not (plain == 7).all(), "test is vacuous — expert 7 already always picked"
+        # Gate weights come from raw scores, so the huge bias must not appear
+        # in the probabilities at all.
+        probs = torch.softmax(torch.gather(scores, -1, biased), -1)
+        assert probs.max() < 1.0 - 1e-6, "bias leaked into the gating weights"
+        moe.expert_bias.zero_()
+    print("  balance_bias ok — steers selection, absent from gating weights")
+
+    # Load balancing, measured. Train an MoE on skewed inputs and compare how
+    # unevenly the experts are used with the bias on vs off.
+    def spread(balance_speed, steps=200):
+        torch.manual_seed(0)
+        m = MoEFeedForward({**base, "balance_speed": balance_speed}).train()
+        opt = torch.optim.AdamW(m.parameters(), lr=1e-2)
+        data = torch.randn(B, T, base["emb_dim"])
+        for _ in range(steps):
+            loss = m(data).pow(2).mean()
+            opt.zero_grad(); loss.backward(); opt.step()
+        with torch.no_grad():
+            sel = torch.topk(m.gate(data) + m.expert_bias, m.num_experts_per_tok, -1).indices
+            counts = torch.bincount(sel.flatten(), minlength=m.num_experts).float()
+        return counts
+
+    off, on = spread(0.0), spread(1e-2)
+    used_off = int((off > 0).sum()); used_on = int((on > 0).sum())
+    cv_off = (off.std() / off.mean()).item(); cv_on = (on.std() / on.mean()).item()
+    assert used_on >= used_off, (used_off, used_on)
+    assert cv_on < cv_off, f"balancing made the load *less* even: {cv_off:.2f} -> {cv_on:.2f}"
+    n_e = base["num_experts"]
+    print(f"  load_balance ok — experts used {used_off}/{n_e} -> {used_on}/{n_e}, "
+          f"load spread {cv_off:.2f} -> {cv_on:.2f} (lower is more even)")
+
+    print("self-check passed")
+
+
 def main():
     size_choices = list(MODEL_SIZES.keys())
 
     parser = argparse.ArgumentParser(
-        description="Train Qwen Nano (Qwen3 architecture) from scratch",
+        description="Train DeepSeek Nano (MLA + MoE architecture) from scratch",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="Model sizes:\n" + "\n".join(
-            f"  {k:12s} {v['emb_dim']}d, {v['n_heads']}h({v['n_kv_groups']}kv), "
-            f"{v['n_layers']}L, ctx={v['context_length']}"
+            f"  {k:10s} {v['emb_dim']}d, {v['n_heads']}h, {v['n_layers']}L, "
+            f"{v['num_experts']}E(top{v['num_experts_per_tok']}), latent={v['latent_dim']}"
             for k, v in MODEL_SIZES.items()
         )
     )
@@ -664,13 +804,19 @@ def main():
     parser.add_argument("--size", type=str, default="nano", choices=size_choices)
     config.add_argument(parser)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--self-check", action="store_true",
+                        help="Check MoE routing, LatentMoE and load balancing, then exit")
+    parser.add_argument("--moe-latent-dim", type=int, default=0, metavar="D",
+                        help="Run experts in a compressed space of D dims (LatentMoE, 0 = off)")
+    parser.add_argument("--balance-speed", type=float, default=1e-3,
+                        help="Aux-loss-free load-balancing bias speed (DeepSeek-V3 uses 1e-3; 0 disables)")
     parser.add_argument("--file", type=str, default=None, help="Training text file")
     parser.add_argument("--epochs", type=int, default=None)
     parser.add_argument("--batch-size", type=int, default=None)
     parser.add_argument("--grad-accum", type=int, default=1)
-    parser.add_argument("--no-amp", action="store_true", help="Disable mixed precision")
+    parser.add_argument("--no-amp", action="store_true")
     parser.add_argument("--ckpt-freq", type=int, default=500)
-    parser.add_argument("--resume", type=str, default=None, help="Checkpoint to resume from")
+    parser.add_argument("--resume", type=str, default=None)
     parser.add_argument("--prompt", type=str, default="Once upon a time")
     parser.add_argument("--max-tokens", type=int, default=100)
     parser.add_argument("--temperature", type=float, default=0.8)
@@ -678,7 +824,10 @@ def main():
 
     args = parser.parse_args()
 
-    # DDP init
+    if args.self_check:
+        self_check()
+        return
+
     ddp = "RANK" in os.environ and "WORLD_SIZE" in os.environ
     if ddp:
         dist.init_process_group(backend="nccl")
@@ -714,9 +863,12 @@ def main():
     ov(settings, "ckpt_freq", "--ckpt-freq", args.ckpt_freq)
 
     cfg = MODEL_SIZES[size].copy()
+    cfg["moe_latent_dim"] = args.moe_latent_dim
+    cfg["balance_speed"] = args.balance_speed
     cfg.update(file_cfg.get("model", {}))
+    ov(cfg, "moe_latent_dim", "--moe-latent-dim", args.moe_latent_dim)
+    ov(cfg, "balance_speed", "--balance-speed", args.balance_speed)
 
-    # Resume
     resume_step = 0
     resume_epoch = 0
     optimizer_state = None
@@ -731,14 +883,14 @@ def main():
     train_loader, val_loader, tokenizer, train_sampler = create_dataloaders(text, cfg, settings["batch_size"])
     log(f"Train batches: {len(train_loader)}, Val batches: {len(val_loader)}")
 
-    ckpt_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "checkpoints")
+    ckpt_dir = os.path.join(config.ROOT, "checkpoints")
     if is_main_process():
         saved = config.snapshot(ckpt_dir, {"model": cfg, "train": settings,
                                            "seed": seed, "size": size}, device=device)
         log(f"Resolved config: {saved}  (rerun with --config {saved})")
 
     torch.manual_seed(seed)
-    model = QwenNano(cfg)
+    model = DeepSeekNano(cfg)
     if args.resume:
         model.load_state_dict(ckpt["model"])
 
@@ -746,7 +898,6 @@ def main():
                   resume_step=resume_step, resume_epoch=resume_epoch,
                   optimizer_state=optimizer_state, train_sampler=train_sampler)
 
-    # Final generation
     if is_main_process():
         import time
         ids = torch.tensor(tokenizer.encode(args.prompt)).unsqueeze(0).to(device)
@@ -768,11 +919,11 @@ def main():
         out2 = generate_cached(model, ids, max_new_tokens=args.max_tokens,
                                temperature=args.temperature, top_k=args.top_k)
         t2 = time.perf_counter() - t0
-        print(f"\n[Cached] {t2:.3f}s")
+        print(f"\n[Cached (MLA latent)] {t2:.3f}s")
         print(tokenizer.decode(out2[0].tolist()))
 
         speedup = t1 / t2 if t2 > 0 else float("inf")
-        print(f"\nKV cache speedup: {speedup:.2f}x faster")
+        print(f"\nMLA cache speedup: {speedup:.2f}x faster")
         print(f"{'='*60}")
 
     if ddp:

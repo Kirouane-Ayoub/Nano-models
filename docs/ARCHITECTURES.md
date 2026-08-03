@@ -15,19 +15,19 @@ independent — read the ones you need.
 
 | Component | Flag | File |
 |---|---|---|
-| MHA, GQA, gated, MLA, SWA | `--attention <name>` | `attention_zoo.py` |
-| Gated DeltaNet, KDA | `--attention deltanet\|kda`, `--linear` | `attention_zoo.py` |
-| DSA, CSA, HCA | `--attention dsa\|csa\|hca` | `attention_zoo.py` |
-| Hybrid linear:full ratio | `--ratio N` | `qwen_next_nano.py` |
-| ShortConv | `--short-conv 4` | `attention_zoo.py` |
-| KV sharing | `--kv-share N` | `qwen_next_nano.py` |
-| NoPE | `--posenc nope` | `qwen_nano.py` |
-| mHC hyper-connections | `--residual mhc` | `qwen_next_nano.py` |
-| Per-layer embeddings | `--ple-dim 16` | `qwen_next_nano.py` |
-| Multi-token prediction | `--mtp-weight 0.3` | `qwen_next_nano.py` |
-| MoE + shared expert | `num_experts` in config | `deepseek_nano.py` |
-| Aux-loss-free balancing | `--balance-speed 1e-3` | `deepseek_nano.py` |
-| LatentMoE | `--moe-latent-dim D` | `deepseek_nano.py` |
+| MHA, GQA, gated, MLA, SWA | `--attention <name>` | `nano/attention_zoo.py` |
+| Gated DeltaNet, KDA | `--attention deltanet\|kda`, `--linear` | `nano/attention_zoo.py` |
+| DSA, CSA, HCA | `--attention dsa\|csa\|hca` | `nano/attention_zoo.py` |
+| Hybrid linear:full ratio | `--ratio N` | `nano/models/qwen_next_nano.py` |
+| ShortConv | `--short-conv 4` | `nano/attention_zoo.py` |
+| KV sharing | `--kv-share N` | `nano/models/qwen_next_nano.py` |
+| NoPE | `--posenc nope` | `nano/models/qwen_nano.py` |
+| mHC hyper-connections | `--residual mhc` | `nano/models/qwen_next_nano.py` |
+| Per-layer embeddings | `--ple-dim 16` | `nano/models/qwen_next_nano.py` |
+| Multi-token prediction | `--mtp-weight 0.3` | `nano/models/qwen_next_nano.py` |
+| MoE + shared expert | `num_experts` in config | `nano/models/deepseek_nano.py` |
+| Aux-loss-free balancing | `--balance-speed 1e-3` | `nano/models/deepseek_nano.py` |
+| LatentMoE | `--moe-latent-dim D` | `nano/models/deepseek_nano.py` |
 
 ---
 

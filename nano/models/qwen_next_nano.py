@@ -37,21 +37,27 @@ imported from qwen_nano.py rather than copied.
 Sizes: nano (5M) → small (40M) → medium (130M) → large (350M)
 
 Usage:
-    python qwen_next_nano.py                                  # 3:1 DeltaNet:attention
-    python qwen_next_nano.py --linear kda                     # Kimi Linear's gate
-    python qwen_next_nano.py --ratio 1                        # 1:1, more attention
-    python qwen_next_nano.py --size small --epochs 10
-    python qwen_next_nano.py --mtp-weight 0                   # disable multi-token prediction
-    python qwen_next_nano.py --short-conv 4                   # ShortConv on Q/K/V (Kimi Linear)
-    python qwen_next_nano.py --ratio 1 --kv-share 1           # last attn layer reuses K/V (Gemma 4)
-    python qwen_next_nano.py --posenc nope                    # drop RoPE
-    python qwen_next_nano.py --residual mhc                   # 4 hyper-connected residual streams
-    python qwen_next_nano.py --ple-dim 16                     # per-layer embeddings (Gemma 4)
-    python qwen_next_nano.py --self-check                     # no training, just asserts
-    python qwen_next_nano.py --train-check                    # overfit to assert MTP/mHC learn
+    python -m nano.models.qwen_next_nano                                  # 3:1 DeltaNet:attention
+    python -m nano.models.qwen_next_nano --linear kda                     # Kimi Linear's gate
+    python -m nano.models.qwen_next_nano --ratio 1                        # 1:1, more attention
+    python -m nano.models.qwen_next_nano --size small --epochs 10
+    python -m nano.models.qwen_next_nano --mtp-weight 0                   # disable multi-token prediction
+    python -m nano.models.qwen_next_nano --short-conv 4                   # ShortConv on Q/K/V (Kimi Linear)
+    python -m nano.models.qwen_next_nano --ratio 1 --kv-share 1           # last attn layer reuses K/V (Gemma 4)
+    python -m nano.models.qwen_next_nano --posenc nope                    # drop RoPE
+    python -m nano.models.qwen_next_nano --residual mhc                   # 4 hyper-connected residual streams
+    python -m nano.models.qwen_next_nano --ple-dim 16                     # per-layer embeddings (Gemma 4)
+    python -m nano.models.qwen_next_nano --self-check                     # no training, just asserts
+    python -m nano.models.qwen_next_nano --train-check                    # overfit to assert MTP/mHC learn
 
-    torchrun --nproc_per_node=8 qwen_next_nano.py --size large --batch-size 32
+    torchrun --nproc_per_node=8 -m nano.models.qwen_next_nano --size large --batch-size 32
 """
+
+# Runnable either way: `python -m nano.models.qwen_next_nano` or `python nano/models/qwen_next_nano.py`.
+if __package__ in (None, ""):
+    import pathlib as _pathlib
+    import sys as _sys
+    _sys.path.insert(0, str(_pathlib.Path(__file__).resolve().parents[2]))
 
 import argparse
 import math
@@ -62,9 +68,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.distributed as dist
 
-import config
-from attention_zoo import GatedDeltaNet, KimiDeltaAttention
-from qwen_nano import (
+from nano import config
+from nano.attention_zoo import GatedDeltaNet, KimiDeltaAttention
+from nano.models.qwen_nano import (
     RMSNorm, SwiGLUFeedForward, GroupedQueryAttention, compute_rope_params,
     apply_rope, apply_rope_offset,
     TRAIN_SETTINGS, create_dataloaders, load_text, train, generate, generate_cached,
@@ -855,7 +861,7 @@ def main():
         text, cfg, settings["batch_size"])
     log(f"Train batches: {len(train_loader)}, Val batches: {len(val_loader)}")
 
-    ckpt_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "checkpoints")
+    ckpt_dir = os.path.join(config.ROOT, "checkpoints")
     if is_main_process():
         saved = config.snapshot(ckpt_dir, {"model": cfg, "train": settings,
                                            "seed": seed, "size": size, "file": top["file"]},

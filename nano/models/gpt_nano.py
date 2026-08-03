@@ -6,15 +6,21 @@ Sizes:       nano (3M) → small (30M) → medium (100M) → gpt2 (124M) → lar
 
 Usage:
     # Local (single GPU / MPS)
-    python gpt_nano.py                                  # Train nano with MHA
-    python gpt_nano.py --size small --attention gqa     # 30M with Grouped-Query
-    python gpt_nano.py --attention all --epochs 5       # Benchmark all attention types
-    python gpt_nano.py --resume checkpoints/ckpt_step_500.pt  # Resume
+    python -m nano.models.gpt_nano                                  # Train nano with MHA
+    python -m nano.models.gpt_nano --size small --attention gqa     # 30M with Grouped-Query
+    python -m nano.models.gpt_nano --attention all --epochs 5       # Benchmark all attention types
+    python -m nano.models.gpt_nano --resume checkpoints/ckpt_step_500.pt  # Resume
 
     # Multi-GPU (8xB200 cluster)
-    torchrun --nproc_per_node=8 gpt_nano.py --size large --batch-size 32 --grad-accum 4
-    torchrun --nproc_per_node=8 gpt_nano.py --size xl --attention gqa --epochs 20
+    torchrun --nproc_per_node=8 -m nano.models.gpt_nano --size large --batch-size 32 --grad-accum 4
+    torchrun --nproc_per_node=8 -m nano.models.gpt_nano --size xl --attention gqa --epochs 20
 """
+
+# Runnable either way: `python -m nano.models.gpt_nano` or `python nano/models/gpt_nano.py`.
+if __package__ in (None, ""):
+    import pathlib as _pathlib
+    import sys as _sys
+    _sys.path.insert(0, str(_pathlib.Path(__file__).resolve().parents[2]))
 
 import argparse
 import math
@@ -26,14 +32,14 @@ import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 
-import config
+from nano import config
 
 # DDP imports — only used when launched via torchrun
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data.distributed import DistributedSampler
 
-from attention_zoo import (
+from nano.attention_zoo import (
     get_attention, collect_aux_loss, ATTENTION_REGISTRY, ATTENTION_DESCRIPTIONS,
 )
 
@@ -415,7 +421,7 @@ def train(model, train_loader, val_loader, tokenizer, cfg, settings, device,
     ckpt_freq = settings.get("ckpt_freq", 0)
     use_amp = settings.get("use_amp", False)
     amp_ctx = get_amp_ctx(device, use_amp)
-    ckpt_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "checkpoints")
+    ckpt_dir = os.path.join(config.ROOT, "checkpoints")
 
     effective_batch = settings["batch_size"] * accum_steps * get_world_size()
     precision = "bfloat16" if use_amp else "float32"
@@ -526,7 +532,7 @@ def load_text(file_path=None):
         with open(file_path, "r", encoding="utf-8") as f:
             return f.read()
 
-    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "the-verdict.txt")
+    path = os.path.join(config.ROOT, "the-verdict.txt")
     url = "https://raw.githubusercontent.com/rasbt/LLMs-from-scratch/main/ch02/01_main-chapter-code/the-verdict.txt"
     if not os.path.exists(path):
         print("Downloading sample text...")
@@ -709,7 +715,7 @@ def main():
               f"attention={base_cfg.get('attention', 'mha')}")
 
     if is_main_process():
-        ckpt_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "checkpoints")
+        ckpt_dir = os.path.join(config.ROOT, "checkpoints")
         saved = config.snapshot(ckpt_dir, {"model": base_cfg, "train": settings,
                                            "seed": seed, "size": size}, device=device)
         log(f"Resolved config: {saved}  (rerun with --config {saved})")

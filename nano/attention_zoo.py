@@ -1,5 +1,5 @@
 """
-Attention mechanism variants for GPT Nano.
+Attention mechanism variants, shared by every model in nano/models/.
 
 All classes share the same interface:
     __init__(cfg)
@@ -46,7 +46,7 @@ def register(name, description):
     your own, so existing configs keep working.
 
     Registering is all it takes to be picked up everywhere: `--attention myattn`
-    in gpt_nano, `--attention all` benchmarks it, and `python attention_zoo.py`
+    in gpt_nano, `--attention all` benchmarks it, and `python -m nano.attention_zoo`
     tests it for shape, incremental-decode equivalence and causality.
     """
     def wrap(cls):
@@ -864,7 +864,7 @@ def get_attention(name, cfg):
 
 
 # ──────────────────────────────────────────────
-# Self-test — python attention_zoo.py
+# Self-test — python -m nano.attention_zoo
 # ──────────────────────────────────────────────
 
 def _self_test():

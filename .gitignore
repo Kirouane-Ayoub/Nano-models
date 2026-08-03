@@ -134,8 +134,9 @@ ui/dist/
 *.tsbuildinfo
 
 # Safety net for any local model weights — mlx-audio caches under
-# ~/.cache/huggingface/, so this should normally be empty.
-models/
+# ~/.cache/huggingface/, so this should normally be empty. Root-scoped so it
+# does not swallow the nano/models/ source package.
+/models/
 *.gguf
 
 # Training run artifacts

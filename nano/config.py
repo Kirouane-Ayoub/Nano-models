@@ -3,7 +3,7 @@
 A run is reproducible when every input to it is written down: architecture,
 training settings, seed, and the data file. That's what this module carries.
 
-    python qwen_next_nano.py --config configs/kimi_like.json
+    python -m nano.models.qwen_next_nano --config configs/kimi_like.json
 
 Precedence is defaults < config file < flags you actually typed. The last part
 matters: a flag only overrides the config if it appears in argv, so a config
@@ -15,13 +15,18 @@ merged config plus the git commit, torch version and device. Feed that file
 straight back in with --config to rerun the same thing. JSON both directions is
 the reason: no dependency, and the dump is itself a valid input.
 
-    python qwen_next_nano.py --config checkpoints/config.resolved.json
+    python -m nano.models.qwen_next_nano --config checkpoints/config.resolved.json
 """
 
 import json
 import os
+import pathlib
 import subprocess
 import sys
+
+#: Repo root — checkpoints and the training corpus live here, not inside the
+#: package. Two parents up: nano/config.py -> nano/ -> repo root.
+ROOT = pathlib.Path(__file__).resolve().parents[1]
 
 
 def load(path):
@@ -61,7 +66,7 @@ def overrider(argv=None):
 def _git_commit():
     try:
         out = subprocess.run(["git", "rev-parse", "--short", "HEAD"],
-                             cwd=os.path.dirname(os.path.abspath(__file__)),
+                             cwd=str(ROOT),
                              capture_output=True, text=True, timeout=5)
         return out.stdout.strip() or None
     except Exception:
