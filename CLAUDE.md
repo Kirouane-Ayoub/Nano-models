@@ -154,6 +154,8 @@ reason — no dependency, and the dump round-trips.
   as results.
 - `docs/ARCHITECTURES.md` documents every component, its paper, and the
   implementation gotchas. Update it when adding one.
+- `docs/ROADMAP.md` lists open work, what blocks each item, and what would
+  count as done. Check it before proposing what to build next.
 
 ## Hard rules
 
