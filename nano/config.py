@@ -33,13 +33,13 @@ def load(path):
     """Read a config file. Returns {} when no path is given.
 
     Layout (every key optional):
-        {"model": {...}, "train": {...}, "seed": 42, "size": "nano", "file": "..."}
+        {"model": {...}, "train": {...}, "data": {...}, "seed": 42, "size": "nano"}
     """
     if not path:
         return {}
     with open(path, "r", encoding="utf-8") as f:
         cfg = json.load(f)
-    unknown = set(cfg) - {"model", "train", "seed", "size", "file", "env", "_comment"}
+    unknown = set(cfg) - {"model", "train", "data", "seed", "size", "file", "env", "_comment"}
     if unknown:
         raise ValueError(f"Unknown top-level keys in {path}: {sorted(unknown)}")
     return cfg

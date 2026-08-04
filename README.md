@@ -52,6 +52,23 @@ torchrun --nproc_per_node=8 -m nano.models.qwen_nano --size qwen-0.6B --batch-si
 
 Each script accepts `--size`, `--epochs`, `--batch-size`, `--grad-accum`, `--resume`. See the docstring at the top of each file for the full list.
 
+## Training data
+
+Every model and the TRL example take the same flags — a local file, the bundled sample, or any Hugging Face dataset with a text column:
+
+```bash
+python -m nano.models.qwen_next_nano                                   # bundled the-verdict.txt
+python -m nano.models.qwen_next_nano --file mycorpus.txt
+python -m nano.models.qwen_next_nano --dataset roneneldan/TinyStories --dataset-limit 5000
+python -m nano.models.qwen_next_nano --dataset Salesforce/wikitext \
+    --dataset-config wikitext-2-raw-v1 --split "train[:2000]"
+python examples/sft_trl.py --dataset Salesforce/wikitext --dataset-config wikitext-2-raw-v1
+```
+
+`--text-field` picks the column if it isn't called `text`; a wrong name lists the columns that do exist. The same settings work as a `data` block in a config file (see [configs/wikitext.json](./configs/wikitext.json)), and the resolved data source is recorded in `config.resolved.json`, so a run reproduces its corpus as well as its architecture.
+
+`datasets` is imported lazily — it's only needed if you actually pass `--dataset`. Note the corpus is joined into a single string, which is what the native `TextDataset` consumes; that's fine at this scale and wrong for a real pre-training corpus.
+
 ## Reproducible runs
 
 Runs are config-driven; flags still work and take precedence over the file.

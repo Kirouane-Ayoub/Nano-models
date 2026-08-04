@@ -39,8 +39,15 @@ python -m venv .venv && .venv/bin/pip install torch tiktoken
 ```
 
 `.venv/` is gitignored. Everything runs on CPU, Apple MPS or CUDA; multi-GPU is
-`torchrun` with DDP. Training data is `the-verdict.txt`, downloaded on first run
-(also gitignored — `.gitignore` excludes `*.txt`).
+`torchrun` with DDP. Training data defaults to `the-verdict.txt`, downloaded on
+first run (also gitignored — `.gitignore` excludes `*.txt`); `--file` or
+`--dataset` take a local corpus or any Hugging Face dataset instead, resolved by
+`nano/data.py`.
+
+Optional extras, imported lazily and never at module import time: `datasets`
+(only for `--dataset`), `transformers` and `trl` (only for `nano/hf.py` and
+`examples/`). Keep it that way — the core must run with torch and tiktoken
+alone.
 
 ## Running the checks
 

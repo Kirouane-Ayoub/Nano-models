@@ -33,7 +33,7 @@ import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 
-from nano import config
+from nano import config, data
 
 # DDP imports — only used when launched via torchrun
 import torch.distributed as dist
@@ -570,23 +570,7 @@ def train(
 # ──────────────────────────────────────────────
 
 
-def load_text(file_path=None):
-    """Load training text from file or download default sample."""
-    if file_path:
-        with open(file_path, "r", encoding="utf-8") as f:
-            return f.read()
-
-    path = os.path.join(config.ROOT, "the-verdict.txt")
-    url = "https://raw.githubusercontent.com/rasbt/LLMs-from-scratch/main/ch02/01_main-chapter-code/the-verdict.txt"
-    if not os.path.exists(path):
-        print("Downloading sample text...")
-        with urllib.request.urlopen(url, timeout=30) as resp:
-            text = resp.read().decode("utf-8")
-        with open(path, "w", encoding="utf-8") as f:
-            f.write(text)
-        return text
-    with open(path, "r", encoding="utf-8") as f:
-        return f.read()
+load_text = data.load_corpus  # kept for backwards compatibility
 
 
 def run_single(attn_type, text, settings, device, args, base_cfg):
@@ -700,7 +684,7 @@ def main():
     parser.add_argument("--seed", type=int, default=42)
 
     # Training
-    parser.add_argument("--file", type=str, default=None, help="Path to training text file")
+    data.add_arguments(parser)
     parser.add_argument("--epochs", type=int, default=None, help="Override number of epochs")
     parser.add_argument("--batch-size", type=int, default=None, help="Override batch size")
     parser.add_argument(
@@ -742,9 +726,6 @@ def main():
         device = torch.device("cpu")
 
     # Load text
-    text = load_text(args.file)
-    log(f"Text length: {len(text):,} characters")
-
     # Build settings
     # defaults < config file < flags actually typed
     file_cfg = config.load(args.config)
@@ -754,6 +735,10 @@ def main():
     ov(top, "size", "--size", args.size)
     ov(top, "seed", "--seed", args.seed)
     size, seed = top["size"], top["seed"]
+
+    text, data_cfg = data.from_args(args, file_cfg.get("data"), ov, log=log)
+    log(f"Text length: {len(text):,} characters")
+
 
     settings = {**TRAIN_SETTINGS, **file_cfg.get("train", {})}
     if args.epochs:
@@ -795,7 +780,7 @@ def main():
         ckpt_dir = os.path.join(config.ROOT, "checkpoints")
         saved = config.snapshot(
             ckpt_dir,
-            {"model": base_cfg, "train": settings, "seed": seed, "size": size},
+            {"model": base_cfg, "train": settings, "data": data_cfg, "seed": seed, "size": size},
             device=device,
         )
         log(f"Resolved config: {saved}  (rerun with --config {saved})")

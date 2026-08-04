@@ -1,0 +1,14 @@
+{
+  "_comment": "Pre-train on WikiText-2 from the Hub instead of the bundled sample.",
+  "size": "nano",
+  "seed": 42,
+  "data": {
+    "dataset": "Salesforce/wikitext",
+    "dataset_config": "wikitext-2-raw-v1",
+    "text_field": "text",
+    "split": "train",
+    "dataset_limit": 2000
+  },
+  "model": {"linear_attn": "kda", "hybrid_ratio": 3, "mtp_weight": 0.0},
+  "train": {"num_epochs": 1}
+}

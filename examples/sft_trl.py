@@ -2,6 +2,11 @@
 
     python examples/sft_trl.py --arch qwen_next --steps 20
 
+Works with any Hugging Face dataset that has a text column:
+
+    python examples/sft_trl.py --dataset roneneldan/TinyStories --dataset-limit 2000
+    python examples/sft_trl.py --file mycorpus.txt
+
 The dataset is pre-tokenized into blocks of exactly `context_length` tokens.
 That is not a detail — it is what makes this correct. None of the attention
 variants take an attention mask, so a padded batch would let real tokens attend
@@ -25,28 +30,17 @@ import sys
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
-from datasets import Dataset
 from transformers import AutoTokenizer
 from trl import SFTConfig, SFTTrainer
 
-from nano import config
+from nano import config, data
 from nano.hf import ARCHITECTURES, NanoConfig, NanoForCausalLM, build_nano_cfg
-
-
-def load_corpus(tokenizer, block):
-    """Blocks of exactly `block` tokens, so every sample is the same length and
-    no padding is ever needed. Same thing TextDataset does when pretraining."""
-    path = pathlib.Path(config.ROOT) / "the-verdict.txt"
-    if not path.exists():
-        raise SystemExit(f"{path} not found — run any model once to download it.")
-    ids = tokenizer(path.read_text(encoding="utf-8"))["input_ids"]
-    blocks = [ids[i : i + block] for i in range(0, len(ids) - block, block)]
-    return Dataset.from_dict({"input_ids": blocks})
 
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--arch", default="qwen_next", choices=list(ARCHITECTURES))
+    data.add_arguments(ap)
     ap.add_argument("--size", default="nano")
     ap.add_argument("--steps", type=int, default=20)
     ap.add_argument("--batch-size", type=int, default=4)
@@ -55,6 +49,12 @@ def main():
 
     tokenizer = AutoTokenizer.from_pretrained("gpt2")
     tokenizer.pad_token = tokenizer.eos_token
+
+    text, source = data.from_args(args)
+    print(
+        f"corpus: {len(text):,} characters from "
+        f"{source['dataset'] or source['file'] or 'the bundled sample'}"
+    )
 
     nano_cfg = build_nano_cfg(args.arch, args.size)
     model = NanoForCausalLM(NanoConfig(arch=args.arch, size=args.size, nano=nano_cfg))
@@ -83,7 +83,7 @@ def main():
             loss_type="nll",
             max_length=nano_cfg["context_length"],
         ),
-        train_dataset=load_corpus(tokenizer, nano_cfg["context_length"]),
+        train_dataset=data.token_blocks(text, tokenizer, nano_cfg["context_length"]),
         processing_class=tokenizer,
     )
     trainer.train()

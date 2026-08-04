@@ -69,7 +69,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.distributed as dist
 
-from nano import config
+from nano import config, data
 from nano.attention_zoo import GatedDeltaNet, KimiDeltaAttention
 from nano.models.qwen_nano import (
     RMSNorm,
@@ -918,7 +918,7 @@ def main():
         action="store_true",
         help="Overfit tiny models to assert MTP and mHC actually learn (~30s)",
     )
-    parser.add_argument("--file", type=str, default=None, help="Training text file")
+    data.add_arguments(parser)
     parser.add_argument("--epochs", type=int, default=None)
     parser.add_argument("--batch-size", type=int, default=None)
     parser.add_argument("--grad-accum", type=int, default=1)
@@ -953,14 +953,13 @@ def main():
     # defaults < config file < flags actually typed
     file_cfg = config.load(args.config)
     ov = config.overrider()
-    top = {"size": args.size, "file": args.file, "seed": args.seed}
-    top.update({k: file_cfg[k] for k in ("size", "file", "seed") if k in file_cfg})
+    top = {"size": args.size, "seed": args.seed}
+    top.update({k: file_cfg[k] for k in ("size", "seed") if k in file_cfg})
     ov(top, "size", "--size", args.size)
-    ov(top, "file", "--file", args.file)
     ov(top, "seed", "--seed", args.seed)
     size, seed = top["size"], top["seed"]
 
-    text = load_text(top["file"])
+    text, data_cfg = data.from_args(args, file_cfg.get("data"), ov, log=log)
     log(f"Text length: {len(text):,} characters")
 
     settings = {**TRAIN_SETTINGS, **file_cfg.get("train", {})}
@@ -1016,7 +1015,7 @@ def main():
     if is_main_process():
         saved = config.snapshot(
             ckpt_dir,
-            {"model": cfg, "train": settings, "seed": seed, "size": size, "file": top["file"]},
+            {"model": cfg, "train": settings, "data": data_cfg, "seed": seed, "size": size},
             device=device,
         )
         log(f"Resolved config: {saved}  (rerun with --config {saved})")
