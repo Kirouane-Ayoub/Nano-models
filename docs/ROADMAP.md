@@ -51,8 +51,14 @@ never executed.** It is either correct or quietly wrong, and one two-GPU run
 settles it.
 
 ```bash
-torchrun --nproc_per_node=2 -m nano.models.qwen_next_nano --size small --mtp-weight 0.3
+accelerate launch --num_processes 2 -m nano.models.qwen_next_nano --size small --mtp-weight 0.3
 ```
+
+Accelerate now owns this path, which removes the hand-rolled DDP code but does
+not remove the doubt — the sync itself is still unproven. Note that it cannot be
+checked on an Apple machine: `accelerate launch --cpu --num_processes 2` reports
+`world=1, DistributedType.NO` rather than forming a group, and `torchrun` on CPU
+hangs in gloo rendezvous. This needs real GPUs.
 
 **Done when:** a two-rank run matches a single-rank run's loss curve at the same
 effective batch size, with MTP on.

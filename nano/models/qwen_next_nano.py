@@ -67,10 +67,10 @@ import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import torch.distributed as dist
 
 from nano import config, data
 from nano.attention_zoo import GatedDeltaNet, KimiDeltaAttention
+from nano.accel import accelerator, is_main_process, log
 from nano.models.qwen_nano import (
     RMSNorm,
     SwiGLUFeedForward,
@@ -938,17 +938,9 @@ def main():
         train_check()
         return
 
-    ddp = "RANK" in os.environ and "WORLD_SIZE" in os.environ
-    if ddp:
-        dist.init_process_group(backend="nccl")
-        device = torch.device(f"cuda:{dist.get_rank()}")
-        torch.cuda.set_device(device)
-    elif torch.cuda.is_available():
-        device = torch.device("cuda")
-    elif torch.backends.mps.is_available():
-        device = torch.device("mps")
-    else:
-        device = torch.device("cpu")
+    # Accelerate picks the device and sets up the process group, whether this
+    # was launched with `python`, `accelerate launch` or `torchrun`.
+    device = accelerator().device
 
     # defaults < config file < flags actually typed
     file_cfg = config.load(args.config)
@@ -1091,9 +1083,6 @@ def main():
         print(
             f"\nCache/state speedup: {t1 / t2 if t2 > 0 else float('inf'):.2f}x faster\n{'=' * 60}"
         )
-
-    if ddp:
-        dist.destroy_process_group()
 
 
 if __name__ == "__main__":

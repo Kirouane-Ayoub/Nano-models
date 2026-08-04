@@ -54,9 +54,12 @@ python -m nano.models.qwen_next_nano --config configs/kimi_like.json
 # Resume from a checkpoint
 python -m nano.models.gpt_nano --resume checkpoints/ckpt_step_500.pt
 
-# Multi-GPU
-torchrun --nproc_per_node=8 -m nano.models.qwen_nano --size qwen-0.6B --batch-size 32 --grad-accum 4
+# Multi-GPU — Accelerate handles device, process group and mixed precision
+accelerate launch -m nano.models.qwen_nano --size qwen-0.6B --batch-size 32 --grad-accum 4
+torchrun --nproc_per_node=8 -m nano.models.qwen_nano --size qwen-0.6B    # still works
 ```
+
+Launching with `python`, `accelerate launch` or `torchrun` all go through the same code path — `nano/accel.py` wraps Accelerate, so the training loops carry no `init_process_group`, DDP wrapper, `DistributedSampler` or autocast context. `accelerate config` unlocks FSDP and DeepSpeed for the larger sizes.
 
 Each script accepts `--size`, `--epochs`, `--batch-size`, `--grad-accum`, `--resume`, `--config`, `--seed` and the dataset flags. See the docstring at the top of each file for the full list.
 

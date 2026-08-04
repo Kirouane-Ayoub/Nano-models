@@ -44,10 +44,19 @@ first run (also gitignored — `.gitignore` excludes `*.txt`); `--file` or
 `--dataset` take a local corpus or any Hugging Face dataset instead, resolved by
 `nano/data.py`.
 
-Optional extras, imported lazily and never at module import time: `datasets`
+`accelerate` is a training dependency: `nano/accel.py` owns device selection,
+the process group and mixed precision, so `python`, `accelerate launch` and
+`torchrun` share one path. It is imported lazily, so the architectures and every
+self-check still run on torch alone.
+
+Other optional extras, also lazy and never at module import time: `datasets`
 (only for `--dataset`), `transformers` and `trl` (only for `nano/hf.py` and
-`examples/`). Keep it that way — the core must run with torch and tiktoken
-alone.
+`examples/`).
+
+Two things to know before touching the loops. `accelerator()` is a singleton
+because Accelerate keeps global state — a second one with different settings
+silently ignores them. And do not add a `DistributedSampler`: `prepare()` shards
+the dataloaders already, and doing both gives each rank a slice of a slice.
 
 ## Running the checks
 

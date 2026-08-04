@@ -40,36 +40,17 @@ from torch.utils.data import Dataset, DataLoader
 
 from nano import config, data
 
-# DDP imports
-import torch.distributed as dist
-from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.utils.data.distributed import DistributedSampler
-
-
-# ──────────────────────────────────────────────
-# Distributed helpers
-# ──────────────────────────────────────────────
-
-
-def is_distributed():
-    return dist.is_initialized()
-
-
-def get_rank():
-    return dist.get_rank() if is_distributed() else 0
-
-
-def get_world_size():
-    return dist.get_world_size() if is_distributed() else 1
-
-
-def is_main_process():
-    return get_rank() == 0
-
-
-def log(msg):
-    if is_main_process():
-        print(msg)
+from nano.accel import (
+    accelerator,
+    get_rank,
+    get_world_size,
+    is_distributed,
+    is_main_process,
+    log,
+    precision_for,
+    unwrap,
+    wait,
+)
 
 
 # ──────────────────────────────────────────────
@@ -163,19 +144,11 @@ def create_dataloaders(text, cfg, batch_size):
         text[split:], tokenizer, cfg["context_length"], stride=cfg["context_length"]
     )
 
-    if is_distributed():
-        train_sampler = DistributedSampler(train_ds, shuffle=True)
-        val_sampler = DistributedSampler(val_ds, shuffle=False)
-        train_loader = DataLoader(
-            train_ds, batch_size=batch_size, sampler=train_sampler, drop_last=True
-        )
-        val_loader = DataLoader(val_ds, batch_size=batch_size, sampler=val_sampler, drop_last=False)
-    else:
-        train_sampler = None
-        train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, drop_last=True)
-        val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, drop_last=False)
-
-    return train_loader, val_loader, tokenizer, train_sampler
+    # No DistributedSampler: accelerator.prepare() shards the loaders itself,
+    # and doing both would give every rank a slice of a slice.
+    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, drop_last=True)
+    val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, drop_last=False)
+    return train_loader, val_loader, tokenizer, None
 
 
 # ──────────────────────────────────────────────
@@ -495,30 +468,17 @@ def generate_cached(model, idx, max_new_tokens, temperature=1.0, top_k=None):
 # ──────────────────────────────────────────────
 
 
-def get_amp_ctx(device, use_amp):
-    if not use_amp:
-        return torch.amp.autocast(device_type="cpu", enabled=False)
-    if device.type == "cuda":
-        return torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16)
-    if device.type == "mps":
-        return torch.amp.autocast(device_type="mps", dtype=torch.bfloat16)
-    return torch.amp.autocast(device_type="cpu", enabled=False)
-
-
-def calc_loss(loader, model, device, max_batches=None, amp_ctx=None):
+def calc_loss(loader, model, device, max_batches=None):
     model.eval()
     total, count = 0.0, 0
-    if amp_ctx is None:
-        amp_ctx = get_amp_ctx(device, False)
     with torch.no_grad():
         for i, (x, y) in enumerate(loader):
             if max_batches and i >= max_batches:
                 break
             x, y = x.to(device), y.to(device)
-            with amp_ctx:
-                out = model(x, y) if getattr(model, "needs_targets", False) else model(x)
-                logits = out[0] if isinstance(out, tuple) else out
-                loss = F.cross_entropy(logits.flatten(0, 1), y.flatten())
+            out = model(x, y) if getattr(model, "needs_targets", False) else model(x)
+            logits = out[0] if isinstance(out, tuple) else out
+            loss = F.cross_entropy(logits.flatten(0, 1), y.flatten())
             total += loss.item()
             count += 1
     model.train()
@@ -539,7 +499,7 @@ def save_checkpoint(model, optimizer, cfg, settings, global_step, epoch, ckpt_di
         return
     os.makedirs(ckpt_dir, exist_ok=True)
     path = os.path.join(ckpt_dir, f"qwen_ckpt_step_{global_step}.pt")
-    raw_model = model.module if isinstance(model, DDP) else model
+    raw_model = unwrap(model)
     torch.save(
         {
             "global_step": global_step,
@@ -567,17 +527,21 @@ def train(
     optimizer_state=None,
     train_sampler=None,
 ):
-    model.to(device)
-
-    if is_distributed():
-        model = DDP(model, device_ids=[get_rank()])
-    raw_model = model.module if isinstance(model, DDP) else model
-
+    acc = accelerator(
+        mixed_precision=precision_for(settings.get("use_amp", False), device.type),
+        gradient_accumulation_steps=settings.get("grad_accum_steps", 1),
+    )
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=settings["learning_rate"], weight_decay=settings["weight_decay"]
     )
     if optimizer_state is not None:
         optimizer.load_state_dict(optimizer_state)
+
+    model, optimizer, train_loader, val_loader = acc.prepare(
+        model, optimizer, train_loader, val_loader
+    )
+    raw_model = unwrap(model)
+    device = acc.device
 
     needs_targets = getattr(raw_model, "needs_targets", False)
     max_steps = settings["num_epochs"] * len(train_loader)
@@ -585,11 +549,10 @@ def train(
     global_step = resume_step
     accum_steps = settings.get("grad_accum_steps", 1)
     ckpt_freq = settings.get("ckpt_freq", 0)
-    amp_ctx = get_amp_ctx(device, settings.get("use_amp", False))
     ckpt_dir = os.path.join(config.ROOT, "checkpoints")
 
     effective_batch = settings["batch_size"] * accum_steps * get_world_size()
-    precision = "bfloat16" if settings.get("use_amp") else "float32"
+    precision = acc.mixed_precision
 
     log(f"\nTraining Qwen Nano ({raw_model.count_params():,} parameters)")
     log(
@@ -626,46 +589,39 @@ def train(
             for pg in optimizer.param_groups:
                 pg["lr"] = lr
 
-            x, y = x.to(device), y.to(device)
+            # Models with an auxiliary loss (e.g. MTP in qwen_next_nano) take the
+            # targets and return it alongside the logits — it has to be computed
+            # inside the wrapped forward or its grads never get synced across ranks.
+            out = model(x, y) if needs_targets else model(x)
+            logits, aux = out if isinstance(out, tuple) else (out, None)
+            # Auxiliary losses (MTP) go into the gradient only — reported losses
+            # stay pure LM loss so runs with and without them are comparable.
+            lm_loss = F.cross_entropy(logits.flatten(0, 1), y.flatten())
+            loss = lm_loss if aux is None else lm_loss + aux
+            loss = loss / accum_steps
 
-            with amp_ctx:
-                # Models with an auxiliary loss (e.g. MTP in qwen_next_nano) take the
-                # targets and return it alongside the logits — it has to be computed
-                # inside the DDP-wrapped forward or its grads never get synced.
-                out = model(x, y) if needs_targets else model(x)
-                logits, aux = out if isinstance(out, tuple) else (out, None)
-                # Auxiliary losses (MTP) go into the gradient only — reported
-                # losses stay pure LM loss so runs with and without them are
-                # directly comparable.
-                lm_loss = F.cross_entropy(logits.flatten(0, 1), y.flatten())
-                loss = lm_loss if aux is None else lm_loss + aux
-                loss = loss / accum_steps
-
-            loss.backward()
+            acc.backward(loss)
             epoch_loss += lm_loss.item()  # LM loss only, not the aux term
             micro_step += 1
 
             if micro_step % accum_steps == 0:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                acc.clip_grad_norm_(model.parameters(), 1.0)
                 optimizer.step()
                 optimizer.zero_grad()
                 global_step += 1
 
                 if global_step % settings["eval_freq"] == 0:
-                    val_loss = calc_loss(
-                        val_loader, raw_model, device, settings["eval_iter"], amp_ctx
-                    )
+                    val_loss = calc_loss(val_loader, raw_model, device, settings["eval_iter"])
                     log(
                         f"  Step {global_step:5d} | train {lm_loss.item():.4f} | val {val_loss:.4f} | lr {lr:.2e}"
                     )
 
                 if ckpt_freq > 0 and global_step % ckpt_freq == 0:
                     save_checkpoint(model, optimizer, cfg, settings, global_step, epoch, ckpt_dir)
-                    if is_distributed():
-                        dist.barrier()
+                    wait()
 
         if micro_step % accum_steps != 0:
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            acc.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
             optimizer.zero_grad()
             global_step += 1
@@ -679,8 +635,7 @@ def train(
             out_ids = generate(raw_model, ids, max_new_tokens=40, temperature=0.8, top_k=25)
             log(f"  >> {tokenizer.decode(out_ids[0].tolist())}\n")
 
-        if is_distributed():
-            dist.barrier()
+        wait()
 
     if ckpt_freq > 0:
         save_checkpoint(
@@ -729,19 +684,9 @@ def main():
 
     args = parser.parse_args()
 
-    # DDP init
-    ddp = "RANK" in os.environ and "WORLD_SIZE" in os.environ
-    if ddp:
-        dist.init_process_group(backend="nccl")
-        rank = dist.get_rank()
-        device = torch.device(f"cuda:{rank}")
-        torch.cuda.set_device(device)
-    elif torch.cuda.is_available():
-        device = torch.device("cuda")
-    elif torch.backends.mps.is_available():
-        device = torch.device("mps")
-    else:
-        device = torch.device("cpu")
+    # Accelerate picks the device and sets up the process group, whether this
+    # was launched with `python`, `accelerate launch` or `torchrun`.
+    device = accelerator().device
 
     # defaults < config file < flags actually typed
     file_cfg = config.load(args.config)
@@ -754,7 +699,6 @@ def main():
 
     text, data_cfg = data.from_args(args, file_cfg.get("data"), ov, log=log)
     log(f"Text length: {len(text):,} characters")
-
 
     settings = {**TRAIN_SETTINGS, **file_cfg.get("train", {})}
     if args.epochs:
@@ -788,7 +732,9 @@ def main():
     ckpt_dir = os.path.join(config.ROOT, "checkpoints")
     if is_main_process():
         saved = config.snapshot(
-            ckpt_dir, {"model": cfg, "train": settings, "data": data_cfg, "seed": seed, "size": size}, device=device
+            ckpt_dir,
+            {"model": cfg, "train": settings, "data": data_cfg, "seed": seed, "size": size},
+            device=device,
         )
         log(f"Resolved config: {saved}  (rerun with --config {saved})")
 
@@ -850,9 +796,6 @@ def main():
         speedup = t1 / t2 if t2 > 0 else float("inf")
         print(f"\nKV cache speedup: {speedup:.2f}x faster")
         print(f"{'=' * 60}")
-
-    if ddp:
-        dist.destroy_process_group()
 
 
 if __name__ == "__main__":
