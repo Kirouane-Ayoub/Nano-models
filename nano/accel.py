@@ -66,7 +66,16 @@ def log(msg):
 
 
 def wait():
-    if _ACCELERATOR is not None:
+    """Barrier, but only when there is actually more than one process.
+
+    The world-size guard is load-bearing, not an optimisation:
+    `wait_for_everyone()` calls into `c10d::barrier` even at world size 1, and
+    that operator is not implemented for MPS — so a single-process `torchrun`
+    on Apple hardware trains fine and then dies at the end of the epoch.
+    Distributed operators cannot fall back to CPU, so there is no way around it
+    other than not calling it.
+    """
+    if is_distributed():
         _ACCELERATOR.wait_for_everyone()
 
 

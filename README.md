@@ -56,7 +56,7 @@ python -m nano.models.gpt_nano --resume checkpoints/ckpt_step_500.pt
 
 # Multi-GPU — Accelerate handles device, process group and mixed precision
 accelerate launch -m nano.models.qwen_nano --size qwen-0.6B --batch-size 32 --grad-accum 4
-torchrun --nproc_per_node=8 -m nano.models.qwen_nano --size qwen-0.6B    # still works
+torchrun --nproc_per_node=8 -m nano.models.qwen_nano --size qwen-0.6B    # also works
 ```
 
 Launching with `python`, `accelerate launch` or `torchrun` all go through the same code path — `nano/accel.py` wraps Accelerate, so the training loops carry no `init_process_group`, DDP wrapper, `DistributedSampler` or autocast context. `accelerate config` unlocks FSDP and DeepSpeed for the larger sizes.

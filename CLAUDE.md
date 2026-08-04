@@ -53,10 +53,14 @@ Other optional extras, also lazy and never at module import time: `datasets`
 (only for `--dataset`), `transformers` and `trl` (only for `nano/hf.py` and
 `examples/`).
 
-Two things to know before touching the loops. `accelerator()` is a singleton
+Three things to know before touching the loops. `accelerator()` is a singleton
 because Accelerate keeps global state — a second one with different settings
-silently ignores them. And do not add a `DistributedSampler`: `prepare()` shards
-the dataloaders already, and doing both gives each rank a slice of a slice.
+silently ignores them. Do not add a `DistributedSampler`: `prepare()` shards the
+dataloaders already, and doing both gives each rank a slice of a slice. And keep
+the world-size guard in `accel.wait()`: `wait_for_everyone()` calls
+`c10d::barrier` even at world size 1, which is unimplemented for MPS, so a
+single-process `torchrun` on a Mac trains fine and then dies at the epoch
+boundary.
 
 ## Running the checks
 
