@@ -71,6 +71,29 @@ python -m nano.models.qwen_next_nano --config checkpoints/config.resolved.json
 
 Verified round-tripping to identical loss on all four models.
 
+## Training with Hugging Face / TRL
+
+`nano/hf.py` wraps any of these architectures as a `PreTrainedModel`, so they work with TRL's trainers, `save_pretrained`, and the Hub:
+
+```python
+from nano.hf import NanoConfig, NanoForCausalLM
+
+model = NanoForCausalLM(NanoConfig(arch="qwen_next", size="nano"))
+```
+
+```bash
+python -m nano.hf                  # check the wrapper's loss matches the native loop
+python examples/sft_trl.py --arch qwen_next --steps 20
+```
+
+Three constraints, all of which fail silently if ignored — see the module docstring for why:
+
+- **No attention masks.** Every variant is causal-only, so a padded batch would attend to padding. Use equal-length samples; the wrapper raises rather than let it slide. TRL's `packing=True` is *not* a fix — it flattens the batch and needs a FlashAttention varlen kernel.
+- **`loss_type="nll"`.** TRL's default chunked loss bypasses the wrapper and calls the backbone directly.
+- **`gradient_checkpointing=False`.** Unsupported, and irrelevant at these sizes.
+
+Verified: the wrapper's loss matches the native training loop exactly for all four architectures, including the MTP and DSA auxiliary-loss paths, and all four train under `SFTTrainer`.
+
 ## Adding an attention mechanism
 
 One decorator, nothing else to edit:
