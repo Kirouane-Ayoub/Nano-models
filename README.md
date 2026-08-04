@@ -38,10 +38,18 @@ Works on CPU, Apple MPS, and CUDA. Multi-GPU uses `torchrun` with PyTorch DDP.
 python -m nano.models.gpt_nano
 python -m nano.models.qwen_nano
 python -m nano.models.deepseek_nano
+python -m nano.models.qwen_next_nano
 
 # Pick a size and (for GPT) an attention variant
 python -m nano.models.gpt_nano --size small --attention gqa --epochs 5
-python -m nano.models.gpt_nano --attention all                        # benchmark all attention types
+python -m nano.models.gpt_nano --attention all         # benchmark all ten attention types
+
+# Swap components on the hybrid model
+python -m nano.models.qwen_next_nano --linear kda --short-conv 4 --residual mhc
+
+# Train on a Hugging Face dataset, or from a config file
+python -m nano.models.qwen_next_nano --dataset roneneldan/TinyStories --dataset-limit 5000
+python -m nano.models.qwen_next_nano --config configs/kimi_like.json
 
 # Resume from a checkpoint
 python -m nano.models.gpt_nano --resume checkpoints/ckpt_step_500.pt
@@ -50,7 +58,17 @@ python -m nano.models.gpt_nano --resume checkpoints/ckpt_step_500.pt
 torchrun --nproc_per_node=8 -m nano.models.qwen_nano --size qwen-0.6B --batch-size 32 --grad-accum 4
 ```
 
-Each script accepts `--size`, `--epochs`, `--batch-size`, `--grad-accum`, `--resume`. See the docstring at the top of each file for the full list.
+Each script accepts `--size`, `--epochs`, `--batch-size`, `--grad-accum`, `--resume`, `--config`, `--seed` and the dataset flags. See the docstring at the top of each file for the full list.
+
+Every file self-tests — no pytest, no CI:
+
+```bash
+python -m nano.attention_zoo                        # all ten attention variants
+python -m nano.models.qwen_next_nano --self-check   # hybrid components
+python -m nano.models.qwen_next_nano --train-check  # what only gradients reveal
+python -m nano.models.deepseek_nano --self-check    # MoE routing and load balancing
+python -m nano.hf                                   # HF adapter vs the native loop
+```
 
 ## Training data
 
@@ -304,6 +322,16 @@ python -m nano.models.gpt_nano          # as a module
 python nano/models/gpt_nano.py          # as a script
 ```
 
+
+## Roadmap
+
+[docs/ROADMAP.md](./docs/ROADMAP.md) has the open work in full — what blocks each item and what would count as done. In short:
+
+1. **Run an actual experiment.** Everything here is verified mechanically; nothing is verified to *help*. Hub datasets and reproducible configs were the missing pieces, and they now exist.
+2. **Multi-GPU and CUDA.** Never run. The auxiliary-loss plumbing exists specifically so MTP's gradients sync inside the DDP-wrapped forward, and that path has never executed.
+3. **Attention masks.** Would unlock padded and chat-style SFT. The hard part is the linear layers, where masking means suppressing a recurrent state update rather than masking a score matrix.
+4. **Generation wired to `past_key_values`,** for DPO and GRPO.
+5. **`--attn mla` for the hybrid,** which is what makes a faithful Kimi Linear without a separate model file.
 
 ## License
 
