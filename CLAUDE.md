@@ -16,7 +16,6 @@ nano/
   models/            one readable file per architecture
 configs/             worked example configs
 docs/                ARCHITECTURES.md
-greek_demo/          a separate corpus-building demo
 ```
 
 Anything path-based resolves against `config.ROOT` (the repo root), so

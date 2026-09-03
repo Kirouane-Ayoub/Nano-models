@@ -314,7 +314,6 @@ nano-models/
 │       └── qwen_next_nano.py   # Qwen3-Next / Kimi Linear / DeepSeek-V4 / Gemma 4
 ├── configs/                # worked example configs
 ├── docs/ARCHITECTURES.md   # every component: problem, solution, paper
-├── greek_demo/             # separate corpus-building demo
 └── the-verdict.txt         # tiny training corpus (downloaded on first run)
 ```
 
