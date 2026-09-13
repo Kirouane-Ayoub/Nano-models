@@ -70,7 +70,7 @@ import torch.nn.functional as F
 
 from nano import config, data
 from nano.attention_zoo import GatedDeltaNet, KimiDeltaAttention
-from nano.accel import accelerator, is_main_process, log
+from nano.accel import current_device, is_main_process, log
 from nano.models.qwen_nano import (
     RMSNorm,
     SwiGLUFeedForward,
@@ -940,7 +940,7 @@ def main():
 
     # Accelerate picks the device and sets up the process group, whether this
     # was launched with `python`, `accelerate launch` or `torchrun`.
-    device = accelerator().device
+    device = current_device()
 
     # defaults < config file < flags actually typed
     file_cfg = config.load(args.config)

@@ -24,21 +24,51 @@ still run on torch alone.
 _ACCELERATOR = None
 
 
+def _accelerate():
+    try:
+        import accelerate
+    except ImportError as e:
+        raise SystemExit(f"Training needs `accelerate`: pip install accelerate ({e})") from None
+    return accelerate
+
+
+def current_device():
+    """The device this process trains on, *without* building the Accelerator.
+
+    The mains need the device before the training settings are resolved, and
+    building the Accelerator just to read `.device` fixed its mixed precision at
+    "no" for the whole run: Accelerate's state is created once, so the bf16 and
+    gradient-accumulation settings `train()` passed later were dropped on the
+    floor, and every model logged "Precision: no" on GPU and MPS. PartialState
+    knows the device and process group and leaves precision to whoever builds
+    the Accelerator.
+    """
+    return _accelerate().PartialState().device
+
+
 def accelerator(mixed_precision=None, gradient_accumulation_steps=1):
     """The process-wide Accelerator, created once.
 
-    A singleton because Accelerate keeps global state — building a second one
-    with different settings silently ignores the new settings.
+    A singleton because Accelerate keeps global state — a second Accelerator
+    with different settings is rejected. Asking this singleton for different
+    settings after it exists is an error too, rather than a silent no-op; that
+    silence is how mixed precision went missing (see `current_device`).
     """
     global _ACCELERATOR
     if _ACCELERATOR is None:
-        try:
-            from accelerate import Accelerator
-        except ImportError as e:
-            raise SystemExit(f"Training needs `accelerate`: pip install accelerate ({e})") from None
-        _ACCELERATOR = Accelerator(
+        _ACCELERATOR = _accelerate().Accelerator(
             mixed_precision=mixed_precision or "no",
             gradient_accumulation_steps=gradient_accumulation_steps,
+        )
+    elif mixed_precision is not None and (
+        mixed_precision != _ACCELERATOR.mixed_precision
+        or gradient_accumulation_steps != _ACCELERATOR.gradient_accumulation_steps
+    ):
+        raise RuntimeError(
+            f"accelerator() already built with mixed_precision={_ACCELERATOR.mixed_precision!r}, "
+            f"grad_accum={_ACCELERATOR.gradient_accumulation_steps}; asked for "
+            f"{mixed_precision!r}, {gradient_accumulation_steps}. Use current_device() for the "
+            "device before training settings are known."
         )
     return _ACCELERATOR
 

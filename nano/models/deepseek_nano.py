@@ -41,6 +41,7 @@ from nano import config, data
 
 from nano.accel import (
     accelerator,
+    current_device,
     get_world_size,
     is_main_process,
     log,
@@ -864,7 +865,7 @@ def main():
 
     # Accelerate picks the device and sets up the process group, whether this
     # was launched with `python`, `accelerate launch` or `torchrun`.
-    device = accelerator().device
+    device = current_device()
 
     # defaults < config file < flags actually typed
     file_cfg = config.load(args.config)
