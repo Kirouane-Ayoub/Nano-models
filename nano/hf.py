@@ -61,6 +61,7 @@ from nano.models.deepseek_nano import DeepSeekNano
 from nano.models.deepseek_nano import MODEL_SIZES as DEEPSEEK_SIZES
 from nano.models.gpt_nano import MODEL_SIZES as GPT_SIZES
 from nano.models.gpt_nano import GPTNano
+from nano.models.looped_nano import LoopedNano
 from nano.models.qwen_nano import MODEL_SIZES as QWEN_SIZES
 from nano.models.qwen_nano import QwenNano, compute_rope_params
 from nano.models.qwen_next_nano import MODEL_SIZES as QWEN_NEXT_SIZES
@@ -70,6 +71,7 @@ from nano.models.qwen_next_nano import QwenNextNano
 ARCHITECTURES = {
     "gpt": (GPTNano, GPT_SIZES, {}),
     "qwen": (QwenNano, QWEN_SIZES, {}),
+    "looped": (LoopedNano, QWEN_SIZES, {"loops": 4, "loop_sigma": 0.5, "loop_bptt": 0}),
     "deepseek": (DeepSeekNano, DEEPSEEK_SIZES, {"moe_latent_dim": 0, "balance_speed": 1e-3}),
     "qwen_next": (
         QwenNextNano,
@@ -138,14 +140,14 @@ class NanoForCausalLM(PreTrainedModel):
     def _init_weights(self, module):
         """Only reached for weights genuinely missing from a checkpoint.
 
-        Matches the architectures' own scheme (normal, std 0.02) rather than
-        doing nothing: a no-op here leaves missing weights as whatever was in
-        memory, and `from_pretrained` then quietly returns a model full of NaN.
+        Delegates to the architecture's own `_init_weights` rather than doing
+        nothing: a no-op here leaves missing weights as whatever was in memory,
+        and `from_pretrained` then quietly returns a model full of NaN. And
+        rather than a generic N(0, 0.02): transformers also runs this over every
+        module at construction, which silently replaced looped_nano's identity
+        adapter init until the delegation.
         """
-        if isinstance(module, (torch.nn.Linear, torch.nn.Embedding)):
-            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
-            if getattr(module, "bias", None) is not None:
-                torch.nn.init.zeros_(module.bias)
+        self.model._init_weights(module)
 
     def tie_weights(self, **kwargs):
         """Re-tie the head and rebuild the RoPE tables after loading.
@@ -238,6 +240,7 @@ def _self_check():
         ("deepseek", {}),
         ("qwen_next", {}),
         ("qwen_next", {"mtp_weight": 0.3}),  # aux loss path
+        ("looped", {}),  # weight-shared depth, per-iteration KV cache
         ("gpt", {"attention": "dsa", "top_k": 4}),  # module-stashed aux loss
     ):
         cfg = build_nano_cfg(arch, "nano", vocab_size=V, drop_rate=0.0, **extra)

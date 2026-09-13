@@ -16,6 +16,7 @@ The goal is not to be fast or competitive — it's to make each architectural id
 | Qwen Nano | [`nano/models/qwen_nano.py`](./nano/models/qwen_nano.py) | nano (5M) → qwen-0.6B (620M) | RMSNorm, SwiGLU, RoPE, Grouped-Query Attention with QK-norm, no bias. |
 | DeepSeek Nano | [`nano/models/deepseek_nano.py`](./nano/models/deepseek_nano.py) | nano (5M) → large (500M) | Multi-Head Latent Attention (MLA), Mixture of Experts with shared + routed experts, aux-loss-free load balancing, LatentMoE, RMSNorm + SwiGLU + RoPE. |
 | Qwen-Next Nano | [`nano/models/qwen_next_nano.py`](./nano/models/qwen_next_nano.py) | nano (5M) → large (350M) | Hybrid 3:1 linear/full attention (Qwen3-Next, Qwen3.5, Kimi Linear), gated attention, Gated DeltaNet or KDA, multi-token prediction, mHC hyper-connections, per-layer embeddings. Only 1-in-4 layers holds a KV cache. |
+| Looped Nano | [`nano/models/looped_nano.py`](./nano/models/looped_nano.py) | nano (5M) → large (350M) | Depth recurrence (Huginn, Ouro): prelude → weight-shared core looped *r* times → coda. Input injection, sampled depth with truncated backprop, one KV cache per iteration. Compute per token is a test-time choice. |
 
 Shared building blocks live in [`nano/attention_zoo.py`](./nano/attention_zoo.py): `mha`, `gqa`, `gated`, `mla`, `swa`, `deltanet`, `kda`, `dsa`, `csa`, `hca`, all with the same `(cfg) → forward(x, use_cache)` interface and a KV cache.
 
@@ -70,6 +71,8 @@ python -m nano.attention_zoo                        # all ten attention variants
 python -m nano.models.qwen_next_nano --self-check   # hybrid components
 python -m nano.models.qwen_next_nano --train-check  # what only gradients reveal
 python -m nano.models.deepseek_nano --self-check    # MoE routing and load balancing
+python -m nano.models.looped_nano --self-check      # per-iteration KV cache, causality across loops
+python -m nano.models.looped_nano --train-check     # truncated backprop, depth extrapolation
 python -m nano.hf                                   # HF adapter vs the native loop
 ```
 
@@ -234,6 +237,17 @@ What's new vs Qwen:
 
 `python -m nano.models.qwen_next_nano --self-check` asserts the layer pattern, the gate, and that incremental decoding (KV cache + recurrent state) matches a full forward pass. `--train-check` overfits tiny models to assert the things only gradients reveal: that the MTP head really predicts *t+2* and not *t+1*, and that mHC stays on-manifold with all *n* streams differentiated.
 
+### Looped Nano
+
+Reference: Huginn — *Scaling up Test-Time Compute with Latent Reasoning: A Recurrent Depth Approach* (Geiping et al., 2025, arXiv 2502.05171); Ouro — *Scaling Latent Reasoning via Looped Language Models* (2025, arXiv 2510.25741); Universal Transformer (2018).
+
+What's new vs Qwen: the blocks are identical, the topology is not. Instead of *n* distinct layers, a **prelude** reads the tokens once, a small **core** is applied *r* times with the same weights, and a **coda** reads out. Parameters stay fixed while depth — and compute per token — becomes a dial you can turn at inference. Huginn (3.5B) improves when unrolled deeper than it was trained; Ouro (1.4B/2.6B, 4 loops) matches dense models 3x its size.
+- **Input injection** — each iteration sees the embedding again through an adapter over `[state ; embedding]`, initialised to `[I | I]` so an iteration starts as `core(s + e)`. Without it the state drifts from the input and deeper unrolls get worse, not better.
+- **Sampled depth, truncated backprop (`--loops`, `--loop-sigma`, `--loop-bptt`)** — training draws *r* from a log-normal Poisson around `--loops` and backpropagates through only the last *k* iterations. Sampling is what makes test-time depth transferable; truncation is what makes deep unrolls affordable. `--loop-sigma 0` trains at a fixed depth like Ouro.
+- **One KV cache per iteration** — the core's attention runs *r* times per token, and iteration 3 of token *t* must attend to iteration 3 of earlier tokens, not iteration 1's keys. The model keeps a cache slot per iteration and swaps it in around each pass. Ouro measured what sharing costs: >10 points at prefill.
+
+`python -m nano.models.looped_nano --self-check` asserts that looping shares weights (same parameter count at *r*=1 and *r*=4, `loops=1` equals the unlooped model), that incremental decoding matches a full forward — and that the same check *fails* when the cache slots are shared, so the test has teeth — and that no output before *t* moves when token *t* changes. `--train-check` asserts that truncated backprop still reaches the prelude, and that a model trained at *r̄*=4 keeps a bounded loss unrolled to *r*=8.
+
 <!-- NOTES: Qwen-Next — paste your learnings here.
 Suggested structure:
 - Why 3:1 and not pure-linear: what recall actually costs
@@ -311,7 +325,8 @@ nano-models/
 │       ├── gpt_nano.py         # GPT-2 style
 │       ├── qwen_nano.py        # Qwen3 style
 │       ├── deepseek_nano.py    # DeepSeek-V3 style (MLA + MoE)
-│       └── qwen_next_nano.py   # Qwen3-Next / Kimi Linear / DeepSeek-V4 / Gemma 4
+│       ├── qwen_next_nano.py   # Qwen3-Next / Kimi Linear / DeepSeek-V4 / Gemma 4
+│       └── looped_nano.py      # Huginn / Ouro depth recurrence
 ├── configs/                # worked example configs
 ├── docs/ARCHITECTURES.md   # every component: problem, solution, paper
 └── the-verdict.txt         # tiny training corpus (downloaded on first run)

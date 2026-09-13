@@ -30,6 +30,7 @@ records its architecture, seed, corpus and git commit and can be replayed from
 | Do hyper-connections converge faster? | `--residual mhc` vs `plain` |
 | What does MTP cost and buy? | `--mtp-weight 0.3` vs `0` |
 | How much recall does 3:1 give up? | `--ratio 3` vs `--ratio 1` |
+| Does a looped core match distinct layers at equal effective depth? | `looped_nano --loops 4` (10 deep at nano) vs `qwen_nano` with `n_layers` matched |
 
 **Needs:** a GPU and `--size small` or `medium`. The differences will not
 separate below that.

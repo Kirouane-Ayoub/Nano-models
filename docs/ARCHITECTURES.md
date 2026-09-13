@@ -25,6 +25,7 @@ independent — read the ones you need.
 | mHC hyper-connections | `--residual mhc` | `nano/models/qwen_next_nano.py` |
 | Per-layer embeddings | `--ple-dim 16` | `nano/models/qwen_next_nano.py` |
 | Multi-token prediction | `--mtp-weight 0.3` | `nano/models/qwen_next_nano.py` |
+| Looped depth (Huginn/Ouro) | `--loops 4 --loop-bptt K` | `nano/models/looped_nano.py` |
 | MoE + shared expert | `num_experts` in config | `nano/models/deepseek_nano.py` |
 | Aux-loss-free balancing | `--balance-speed 1e-3` | `nano/models/deepseek_nano.py` |
 | LatentMoE | `--moe-latent-dim D` | `nano/models/deepseek_nano.py` |
@@ -300,6 +301,31 @@ separating stored knowledge from active compute by a different route than MoE.
 earlier layer's. They still compute their own queries, so they can attend
 differently. ~50% cache reduction — 2.7 GB at 128k context for Gemma 4 E2B.
 
+### Looped depth — depth-recurrent transformers
+**Papers:** *Universal Transformers* (Dehghani et al., 2018); Huginn, arXiv
+2502.05171 (Geiping et al., 2025); Ouro, arXiv 2510.25741 (2025).
+
+**Problem.** Depth is fixed at training time and paid for in parameters. Every
+token gets the same amount of compute whether it needs it or not.
+
+**Solution.** Apply the same block *r* times. Huginn's shape: a prelude reads
+the tokens into *e*, a core block maps `[s ; e]` → *s* repeatedly from *s₀*,
+a coda reads out. Compute scales with *r*, parameters do not, and *r* is a
+test-time choice — Huginn trained with a mean of 32 loops and keeps improving
+past it. Ouro loops a whole 24-layer stack 4 times and matches dense models
+3x its size; its exit gate `λ_t = σ(Linear(h_t))` with an entropy-regularised
+loss `Σ p(t)·L_t − βH(p)` learns how many loops each token needs.
+
+Three things make it work. *Input injection* — feeding *e* back in at every
+iteration — keeps the state anchored to the input so deeper unrolls do not
+drift. *Sampled depth* (log-normal Poisson) with *truncated backprop* through
+the last *k* iterations is what makes 32 loops trainable and lets depth
+transfer. And *one KV cache per iteration*: see § 6.
+
+Implemented in `nano/models/looped_nano.py` on qwen_nano's blocks. The adapter
+is initialised to `[I | I]`, so an iteration begins as `core(s + e)`. The exit
+gate is not implemented; `loops` is a fixed dial.
+
 ### MTP — Multi-Token Prediction
 **Paper:** *Better & Faster Large Language Models via Multi-token Prediction*
 (Meta, 2024); DeepSeek-V3; Qwen3.5; Nemotron 3.
@@ -334,4 +360,5 @@ directly whether it was doing its job.
 | **Autocast dtype in MoE routing** | Expert output is bf16 under autocast while softmax keeps probabilities in fp32, and `index_add_` rejects mismatched types. Unreachable until a latent projection made the MoE input bf16. |
 | **Compressed-entry causality** | An entry summarising tokens `[s, s+m)` may only be read once the group *closes*, at `s+m-1`. Reading earlier leaks the future — and the loss curve looks unusually **good**, not broken. |
 | **Accelerator built for its device** | Every main called `accelerator().device` before the training settings were known. The singleton was created with `mixed_precision="no"`, and the bf16 and grad-accumulation settings `train()` passed afterwards were dropped — every GPU/MPS run logged `Precision: no` and `--grad-accum` changed the log line but not the optimizer. Now `current_device()` reads the device off `PartialState`, and asking the singleton for different settings raises. |
+| **Looped KV cache** | A weight-shared core applied *r* times needs *r* KV caches. With one, iteration 3 of the current token attends to iteration 1's keys of earlier tokens; prefill and one-token decode then disagree by ~1e-1 while training is unaffected. `looped_nano` keeps a cache slot per iteration, and its self-check asserts the incremental test *fails* when the slots are shared. |
 | **Init RNG shifts** | Comparing "same model with and without component X" is invalid if X adds modules: it changes how much RNG the weight init consumes, so every weight differs. Detach the component from one model instead. |
