@@ -5,6 +5,7 @@ solves it, where it lives here, and the paper it came from.
 
 Ordered roughly by what part of the model it touches. Each entry is
 independent — read the ones you need.
+For the same components in publication order, see [TIMELINE.md](./TIMELINE.md).
 
 > Paper links are given as arXiv IDs only where verified. Older entries cite
 > title and origin instead, which is enough to find them unambiguously.
