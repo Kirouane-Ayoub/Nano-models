@@ -103,18 +103,14 @@ token for token.
 
 ---
 
-## 5. `--attn mla` for the hybrid
+## 5. `--attn mla` for the hybrid — done
 
-The one architecture piece still missing. Kimi Linear pairs its KDA layers with
-gated **MLA**, while `qwen_next_nano` uses gated GQA in the full-attention slots.
-MLA exists in the zoo but with the `(x, use_cache)` signature and no RoPE, so it
-cannot drop into the hybrid block as-is.
-
-A RoPE-aware gated-MLA adapter is roughly 30 lines and makes GQA-vs-MLA a
-one-flag experiment. With it plus a `kimi` preset
-(`linear=kda, short_conv=4, ratio=3, attn=mla`), the repo covers Kimi Linear
-faithfully without a separate model file — it is a configuration of one that
-already exists, not a new architecture.
+Landed as `GatedMLA` in `qwen_next_nano.py` with `--attn mla`, and
+`configs/kimi_like.json` now sets it, so Kimi Linear is a configuration of the
+hybrid: `linear=kda, short_conv=4, ratio=3, attn=mla`. Remaining gap: RoPE is
+applied to the re-expanded K each call rather than DeepSeek's decoupled rotary
+key. The tests verify this implementation's prefill/decode equivalence,
+not equivalence to DeepSeek's decoupled RoPE architecture.
 
 ---
 

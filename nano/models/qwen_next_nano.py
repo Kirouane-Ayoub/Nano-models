@@ -53,6 +53,7 @@ Usage:
     python -m nano.models.qwen_next_nano --posenc prope --rope-fraction 0.5  # partial RoPE (Gemma 4)
     python -m nano.models.qwen_next_nano --linear swa --ratio 5 --window 128  # Gemma 4 local:global layout
     python -m nano.models.qwen_next_nano --linear mamba2                  # Nemotron 3 layout (Mamba-2 + attention)
+    python -m nano.models.qwen_next_nano --linear kda --attn mla          # Kimi Linear's pairing
     python -m nano.models.qwen_next_nano --residual mhc                   # 4 hyper-connected residual streams
     python -m nano.models.qwen_next_nano --ple-dim 16                     # per-layer embeddings (Gemma 4)
     python -m nano.models.qwen_next_nano --self-check                     # no training, just asserts
@@ -229,6 +230,79 @@ class SharedKVAttention(GroupedQueryAttention):
 
 
 # ──────────────────────────────────────────────
+# Gated MLA — the other thing the attention slot can hold
+# ──────────────────────────────────────────────
+
+
+class GatedMLA(nn.Module):
+    """Multi-head latent attention with Qwen's output gate, RoPE-aware, so it
+    can sit in the hybrid's attention slot in place of gated GQA (Kimi Linear
+    pairs KDA with exactly this).
+
+    K and V are not stored. One small latent c = W_DKV(x) is cached per token
+    and K, V are re-expanded from it on every call — the cache is `latent_dim`
+    floats per token against GQA's 2 · groups · head_dim. Head diversity is kept
+    (each head has its own up-projection), which is what GQA gives up.
+
+    ponytail: RoPE is applied to the full expanded K each call, as
+    `deepseek_nano` does, so the whole history is re-rotated per decode step.
+    DeepSeek's decoupled RoPE uses a separate rotary key cached alongside the
+    latent. The self-check proves prefill and decode agree for this
+    implementation; it does not establish equivalence to that architecture.
+    """
+
+    def __init__(self, cfg):
+        super().__init__()
+        d, self.n_heads, self.head_dim = cfg["emb_dim"], cfg["n_heads"], cfg["head_dim"]
+        self.d_out = self.n_heads * self.head_dim
+        self.latent_dim = cfg.get("latent_dim", d // 4)
+        self.W_query = nn.Linear(d, self.d_out, bias=False)
+        self.W_DKV = nn.Linear(d, self.latent_dim, bias=False)
+        self.W_UK = nn.Linear(self.latent_dim, self.d_out, bias=False)
+        self.W_UV = nn.Linear(self.latent_dim, self.d_out, bias=False)
+        self.out_gate = nn.Linear(d, self.d_out, bias=False)
+        self.out_proj = nn.Linear(self.d_out, d, bias=False)
+        self.q_norm = RMSNorm(self.head_dim) if cfg.get("qk_norm", False) else None
+        self.k_norm = RMSNorm(self.head_dim) if cfg.get("qk_norm", False) else None
+        self.dropout = nn.Dropout(cfg["drop_rate"])
+        self.pos_enc = cfg.get("pos_enc", "rope")
+        self.register_buffer("cache_latent", None, persistent=False)
+        self.cache_seq_len = 0
+
+    def forward(self, x, cos, sin, use_cache=False):
+        B, T, _ = x.shape
+        H, hd = self.n_heads, self.head_dim
+        q = self.W_query(x).view(B, T, H, hd).transpose(1, 2)
+        latent = self.W_DKV(x)
+        start = 0
+        if use_cache:
+            if self.cache_latent is not None:
+                latent = torch.cat([self.cache_latent, latent], dim=1)
+            self.cache_latent = latent
+            start, self.cache_seq_len = self.cache_seq_len, self.cache_seq_len + T
+        T_k = latent.shape[1]
+        k = self.W_UK(latent).view(B, T_k, H, hd).transpose(1, 2)
+        v = self.W_UV(latent).view(B, T_k, H, hd).transpose(1, 2)
+        if self.q_norm is not None:
+            q, k = self.q_norm(q), self.k_norm(k)
+        if self.pos_enc != "nope":
+            q = apply_rope_offset(q, cos[start : start + T], sin[start : start + T])
+            k = apply_rope_offset(k, cos[:T_k], sin[:T_k])  # the latent cache is the whole history
+        attn = (q @ k.transpose(-2, -1)) / (hd**0.5)
+        q_pos = torch.arange(start, start + T, device=x.device)
+        k_pos = torch.arange(T_k, device=x.device)
+        attn = attn.masked_fill(q_pos.unsqueeze(-1) < k_pos.unsqueeze(0), float("-inf"))
+        attn = self.dropout(torch.softmax(attn, dim=-1))
+        out = (attn @ v).transpose(1, 2).reshape(B, T, self.d_out)
+        out = out * torch.sigmoid(self.out_gate(x))  # gate before the projection, as in GQA
+        return self.out_proj(out)
+
+    def reset_cache(self):
+        self.cache_latent = None
+        self.cache_seq_len = 0
+
+
+# ──────────────────────────────────────────────
 # Hybrid block — same shell, two possible mixers
 # ──────────────────────────────────────────────
 
@@ -251,13 +325,16 @@ class HybridBlock(nn.Module):
         self.is_attn = kind == "attn"
         self.norm1 = RMSNorm(cfg["emb_dim"])
         if self.is_attn:
-            # Gated attention: qwen_nano's GQA + the output gate.
+            # Gated attention: qwen_nano's GQA + the output gate, or gated MLA.
             gated = {**cfg, "attn_out_gate": True}
-            self.attn = (
-                SharedKVAttention(gated, kv_donor)
-                if kv_donor is not None
-                else GroupedQueryAttention(gated)
-            )
+            if cfg.get("attn", "gqa") == "mla":
+                self.attn = GatedMLA(cfg)
+            else:
+                self.attn = (
+                    SharedKVAttention(gated, kv_donor)
+                    if kv_donor is not None
+                    else GroupedQueryAttention(gated)
+                )
         else:
             # ponytail: linear layers get no positional encoding — the recurrence
             # is already order-dependent, and Qwen3-Next doesn't add one either.
@@ -352,6 +429,10 @@ class QwenNextNano(nn.Module):
         self.tok_emb = nn.Embedding(cfg["vocab_size"], cfg["emb_dim"])
         self.drop = nn.Dropout(cfg["drop_rate"])
 
+        if cfg.get("attn", "gqa") not in ("gqa", "mla"):
+            raise ValueError(f"attn={cfg['attn']!r} must be 'gqa' or 'mla'")
+        if cfg.get("attn", "gqa") == "mla" and cfg.get("kv_share", 0):
+            raise ValueError("kv_share reuses another layer's K/V; MLA caches a latent instead — use attn=gqa")
         # KV sharing: the last `kv_share` attention layers reuse K/V from the most
         # recent earlier attention layer that computes its own (Gemma 4).
         attn_positions = [i for i, k in enumerate(self.pattern) if k == "attn"]
@@ -594,6 +675,42 @@ def self_check():
         f"  kv_share  ok — {shared.own_kv_layers()}/{shared.kv_layers()} attention layers own K/V, "
         f"-{unshared.count_params() - shared.count_params():,} params"
     )
+
+    # Gated MLA in the attention slots (Kimi Linear pairs KDA with gated MLA).
+    # It must change the output, decode exactly through a *latent* cache that is
+    # smaller per token than GQA's K/V, stay causal, and refuse kv_share, which
+    # is a GQA-only mechanism.
+    cfg_g, gqa_m = build(attn="gqa")
+    cfg_m, mla_m = build(attn="mla")
+    probe = torch.randint(0, cfg_m["vocab_size"], (2, 12))
+    assert not torch.allclose(gqa_m(probe), mla_m(probe)), "attn=mla is a no-op"
+    check_incremental(mla_m, cfg_m["vocab_size"])
+    a, b = probe.clone(), probe.clone()
+    b[:, 6] = (b[:, 6] + 1) % cfg_m["vocab_size"]
+    torch.testing.assert_close(mla_m(a)[:, :6], mla_m(b)[:, :6])
+    def cache_bytes_per_token(model):
+        model.reset_kv_cache()
+        model(probe[:, :8], use_cache=True)
+        total = 0
+        for blk in model.blocks:
+            if blk.is_attn:
+                for name, buf in blk.attn.named_buffers():
+                    if name.startswith("cache") and buf is not None:
+                        total += buf.numel() * buf.element_size()
+        return total // (2 * 8)
+    g_bytes, m_bytes = cache_bytes_per_token(gqa_m), cache_bytes_per_token(mla_m)
+    assert m_bytes < g_bytes, f"MLA cache {m_bytes} B/token is not smaller than GQA's {g_bytes}"
+    try:
+        build(attn="mla", hybrid_ratio=1, kv_share=1)
+        raise AssertionError("attn=mla with kv_share should be refused")
+    except ValueError:
+        pass
+    for combo in ({"pos_enc": "nope"}, {"pos_enc": "prope", "rope_fraction": 0.5},
+                  {"residual": "mhc", "mhc_streams": 2}, {"norm_style": "sandwich"}):
+        cfg_c, m = build(attn="mla", **combo)
+        check_incremental(m, cfg_c["vocab_size"])
+    print(f"  mla       ok — gated MLA in the attention slot, cache {g_bytes} → {m_bytes} B/token, "
+          f"decode exact, causal, kv_share refused")
 
     # NoPE: no rotation applied, everything else identical.
     cfg_np, nope = build(pos_enc="nope")
@@ -1018,6 +1135,13 @@ def main():
     config.add_argument(parser)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
+        "--attn",
+        type=str,
+        default="gqa",
+        choices=["gqa", "mla"],
+        help="Full-attention slot: gated GQA (Qwen3-Next) or gated MLA (Kimi Linear)",
+    )
+    parser.add_argument(
         "--linear",
         type=str,
         default="deltanet",
@@ -1186,6 +1310,7 @@ def main():
     cfg = {
         **MODEL_SIZES[size],
         "linear_attn": args.linear,
+        "attn": args.attn,
         "window_size": args.window,
         "hybrid_ratio": args.ratio,
         "mtp_weight": args.mtp_weight,
@@ -1205,6 +1330,7 @@ def main():
     cfg.update(file_cfg.get("model", {}))
     for key, flag, value in (
         ("linear_attn", "--linear", args.linear),
+        ("attn", "--attn", args.attn),
         ("window_size", "--window", args.window),
         ("hybrid_ratio", "--ratio", args.ratio),
         ("mtp_weight", "--mtp-weight", args.mtp_weight),
@@ -1253,7 +1379,7 @@ def main():
 
     log(
         f"\nLayout: {' '.join('A' if k == 'attn' else 'L' for k in model.pattern)}"
-        f"  (L = {cfg['linear_attn']}, A = gated attention)"
+        f"  (L = {cfg['linear_attn']}, A = gated {cfg.get('attn', 'gqa').upper()})"
     )
     log(
         f"KV-cached layers: {model.own_kv_layers()}/{cfg['n_layers']} "

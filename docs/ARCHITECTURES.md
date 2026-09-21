@@ -21,6 +21,7 @@ independent — read the ones you need.
 | Mamba-2 (+ Mamba-3 flags) | `--attention mamba2`, `--linear mamba2`, `mamba_trapezoidal`, `mamba_complex` | `nano/attention_zoo.py` |
 | DSA, CSA, HCA, MoBA | `--attention dsa\|csa\|hca\|moba` | `nano/attention_zoo.py` |
 | Hybrid linear:full ratio | `--ratio N` | `nano/models/qwen_next_nano.py` |
+| Gated MLA in the hybrid (Kimi Linear) | `--attn mla`, `configs/kimi_like.json` | `nano/models/qwen_next_nano.py` |
 | Local:global (SWA) layout | `--linear swa --ratio 5 --window 128` | `nano/models/qwen_next_nano.py` |
 | ShortConv | `--short-conv 4` | `nano/attention_zoo.py` |
 | KV sharing | `--kv-share N` | `nano/models/qwen_next_nano.py` |
@@ -166,6 +167,10 @@ halve the head count, which is what the paper does.
 **Solution.** Compress K and V into a small shared latent vector, cache *that*,
 and reconstruct per-head K/V on the fly. You cache one small vector per token
 instead of one K and V per head. Keeps head diversity, which GQA sacrifices.
+In the hybrid model `--attn mla` swaps gated GQA for gated MLA in the
+full-attention slots, which is Kimi Linear's pairing with KDA; the self-check
+measures the cache at one quarter of GQA's bytes per token on the nano
+preset (64 versus 256 bytes in float32).
 
 ### SWA — Sliding Window Attention
 **Paper:** Longformer (AI2, 2020); Mistral 7B (Mistral, 2023).
