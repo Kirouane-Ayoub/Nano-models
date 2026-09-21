@@ -513,9 +513,8 @@ class SlidingWindowAttention(nn.Module):
         self.n_heads = cfg["n_heads"]
         self.head_dim = d // self.n_heads
         self.d_out = d
-        self.window_size = cfg.get("window_size")
-        if self.window_size is None:
-            self.window_size = cfg["context_length"] // 2
+        # `or`, not a .get default: the hybrid CLI passes an explicit None when --window is omitted
+        self.window_size = cfg.get("window_size") or cfg["context_length"] // 2
         # Optional per-head sink logit, as gpt-oss pairs with its 128-token windows
         self.sink = nn.Parameter(torch.zeros(self.n_heads)) if cfg.get("attn_sink") else None
 
