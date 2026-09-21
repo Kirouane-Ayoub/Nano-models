@@ -1,9 +1,10 @@
 {
-  "_comment": "Kimi Linear's recipe: KDA linear layers, ShortConv on Q/K/V, 3:1 hybrid.",
+  "_comment": "Kimi Linear's recipe: KDA linear layers, ShortConv on Q/K/V, gated MLA in the attention slots, 3:1 hybrid.",
   "size": "nano",
   "seed": 42,
   "model": {
     "linear_attn": "kda",
+    "attn": "mla",
     "hybrid_ratio": 3,
     "short_conv": 4,
     "mtp_weight": 0.0
