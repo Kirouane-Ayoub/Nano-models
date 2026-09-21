@@ -55,6 +55,7 @@ Usage:
     python -m nano.models.qwen_next_nano --linear mamba2                  # Nemotron 3 layout (Mamba-2 + attention)
     python -m nano.models.qwen_next_nano --linear kda --attn mla          # Kimi Linear's pairing
     python -m nano.models.qwen_next_nano --attn mla --dsa-top-k 64 --index-share 2  # DSA + IndexShare (MiniMax)
+    python -m nano.models.qwen_next_nano --config configs/qwen_flash_next.json  # Qwen3.8-Flash-Next recipe
     python -m nano.models.qwen_next_nano --residual mhc                   # 4 hyper-connected residual streams
     python -m nano.models.qwen_next_nano --ple-dim 16                     # per-layer embeddings (Gemma 4)
     python -m nano.models.qwen_next_nano --self-check                     # no training, just asserts
@@ -85,6 +86,8 @@ from nano.attention_zoo import (
     LightningIndexer,
     Mamba2,
     SlidingWindowAttention,
+    qsa_index_loss,
+    qsa_select,
 )
 from nano.components import DepthRouter, Engram, HyperConnections, PerLayerEmbeddings, sinkhorn
 from nano.accel import current_device, is_main_process, log
@@ -336,6 +339,68 @@ class GatedMLA(nn.Module):
 
 
 # ──────────────────────────────────────────────
+# Gated QSA — Qwen3.8-Flash-Next's attention slot
+# ──────────────────────────────────────────────
+
+
+class GatedQSA(GroupedQueryAttention):
+    """qwen_nano's gated GQA with RoPE, plus Qwen Sparse Attention's block
+    indexer: 4-token micro-blocks scored by a trained lightning indexer, top-k
+    blocks plus the query's own partial block, attention over the *uncompressed*
+    K/V of those positions. Qwen3.8-Flash-Next runs one of these after every
+    three Gated DeltaNet layers. Selection and objective are the zoo's
+    `qsa_select` / `qsa_index_loss`, so the mechanism has one home; this class
+    only adds RoPE-aware plumbing and the index-key cache.
+    """
+
+    def __init__(self, cfg):
+        super().__init__({**cfg, "attn_out_gate": True})
+        d = cfg["emb_dim"]
+        self.block, self.top_k = cfg.get("qsa_block", 4), cfg.get("qsa_top_k", 512)
+        self.indexer = LightningIndexer(d, d, cfg.get("index_dim", 32), cfg.get("index_heads", 2))
+        self.register_buffer("cache_ik", None, persistent=False)
+        self.aux_index_loss = None
+
+    def forward(self, x, cos, sin, use_cache=False):
+        B, T, _ = x.shape
+        ik = self.indexer.W_ik(x)
+        if use_cache:
+            ik = ik if self.cache_ik is None else torch.cat([self.cache_ik, ik], dim=1)
+            self.cache_ik = ik
+        self._ik = ik
+        self._iq = self.indexer.W_iq(x).view(B, T, self.indexer.index_heads, self.indexer.index_dim)
+        self._iw = self.indexer.W_iw(x)
+        return super().forward(x, cos, sin, use_cache=use_cache)
+
+    def _attend(self, q, k, v, x):
+        B, T_q = q.shape[0], q.shape[2]
+        k = k.repeat_interleave(self.group_size, dim=1)
+        v = v.repeat_interleave(self.group_size, dim=1)
+        T_k = k.shape[2]
+        attn = (q @ k.transpose(-2, -1)) / (self.head_dim**0.5)
+        q_pos = torch.arange(T_k - T_q, T_k, device=x.device)  # queries sit at the end of the keys
+        k_pos = torch.arange(T_k, device=x.device)
+        causal = q_pos.unsqueeze(-1) < k_pos.unsqueeze(0)
+        allowed, scores, candidate, kb = qsa_select(
+            self._iq, self._iw, self._ik, q_pos, k_pos, self.block, self.top_k
+        )
+        self.aux_index_loss = None
+        if self.training and self.top_k:
+            dense = torch.softmax(attn.masked_fill(causal, float("-inf")), dim=-1).mean(dim=1)
+            self.aux_index_loss, _ = qsa_index_loss(scores, candidate, dense, kb)
+        attn = attn.masked_fill(causal | ~allowed.unsqueeze(1), float("-inf"))
+        attn = self.dropout(torch.softmax(attn, dim=-1))
+        out = (attn @ v).transpose(1, 2).contiguous().view(B, T_q, self.d_out)
+        out = out * torch.sigmoid(self.out_gate(x))
+        return self.out_proj(out)
+
+    def reset_cache(self):
+        super().reset_cache()
+        self.cache_ik = None
+        self.aux_index_loss = None
+
+
+# ──────────────────────────────────────────────
 # Hybrid block — same shell, two possible mixers
 # ──────────────────────────────────────────────
 
@@ -362,6 +427,8 @@ class HybridBlock(nn.Module):
             gated = {**cfg, "attn_out_gate": True}
             if cfg.get("attn", "gqa") == "mla":
                 self.attn = GatedMLA(cfg, share_indexer_from=index_owner)
+            elif cfg.get("attn", "gqa") == "qsa":
+                self.attn = GatedQSA(cfg)
             else:
                 self.attn = (
                     SharedKVAttention(gated, kv_donor)
@@ -462,10 +529,10 @@ class QwenNextNano(nn.Module):
         self.tok_emb = nn.Embedding(cfg["vocab_size"], cfg["emb_dim"])
         self.drop = nn.Dropout(cfg["drop_rate"])
 
-        if cfg.get("attn", "gqa") not in ("gqa", "mla"):
-            raise ValueError(f"attn={cfg['attn']!r} must be 'gqa' or 'mla'")
-        if cfg.get("attn", "gqa") == "mla" and cfg.get("kv_share", 0):
-            raise ValueError("kv_share reuses another layer's K/V; MLA caches a latent instead — use attn=gqa")
+        if cfg.get("attn", "gqa") not in ("gqa", "mla", "qsa"):
+            raise ValueError(f"attn={cfg['attn']!r} must be 'gqa', 'mla' or 'qsa'")
+        if cfg.get("attn", "gqa") != "gqa" and cfg.get("kv_share", 0):
+            raise ValueError("kv_share is a GQA-only mechanism — use attn=gqa")
         if cfg.get("dsa_top_k", 0) and cfg.get("attn", "gqa") != "mla":
             raise ValueError("dsa_top_k needs attn=mla: the lightning indexer scores the MLA latent")
         if cfg.get("index_share", 1) > 1 and not cfg.get("dsa_top_k", 0):
@@ -561,7 +628,7 @@ class QwenNextNano(nn.Module):
         # forward (the MTP block in eval) would otherwise hand back a stale one
         # and an eval forward would return a tuple.
         for m in self.modules():
-            if isinstance(m, GatedMLA):
+            if hasattr(m, "aux_index_loss"):
                 m.aux_index_loss = None
         x = self.drop(self.tok_emb(idx))
         if self.mhc_streams:
@@ -596,7 +663,7 @@ class QwenNextNano(nn.Module):
         aux += [
             m.aux_index_loss
             for m in self.modules()
-            if isinstance(m, GatedMLA) and m.aux_index_loss is not None
+            if getattr(m, "aux_index_loss", None) is not None
         ]
         return (logits, sum(aux)) if aux else logits
 
@@ -824,6 +891,31 @@ def self_check():
             pass
     print(f"  dsa/share ok — top-{cfg_d['dsa_top_k']} indexer on MLA bites, aux loss flows, decode exact; "
           f"index_share=2 → 1 indexer for 2 layers, identical selection")
+
+    # QSA in the attention slot (Qwen3.8-Flash-Next pairs it with Gated DeltaNet
+    # at 3:1). Gated GQA with RoPE plus the block indexer: must bite, decode
+    # exactly through the index-key cache, stay causal, and train its indexer.
+    cfg_q, qsa_m = build(attn="qsa", qsa_block=4, qsa_top_k=1)
+    probe = torch.randint(0, cfg_q["vocab_size"], (2, 12))
+    qsa_m.eval()
+    sparse = qsa_m(probe)
+    for blk in qsa_m.blocks:
+        if blk.is_attn:
+            blk.attn.top_k = 10**6
+    assert not torch.allclose(qsa_m(probe), sparse), "QSA selection does not bite in the hybrid"
+    for blk in qsa_m.blocks:
+        if blk.is_attn:
+            blk.attn.top_k = 1
+    check_incremental(qsa_m, cfg_q["vocab_size"])
+    a, b = probe.clone(), probe.clone()
+    b[:, 6] = (b[:, 6] + 1) % cfg_q["vocab_size"]
+    torch.testing.assert_close(qsa_m(a)[:, :6], qsa_m(b)[:, :6])
+    qsa_m.train()
+    out = qsa_m(probe)
+    assert isinstance(out, tuple) and torch.isfinite(out[1]) and out[1].requires_grad, "QSA indexer aux missing"
+    qsa_m.eval()
+    assert not isinstance(qsa_m(probe), tuple)
+    print("  qsa slot  ok — gated GQA + block indexer in the attention slot, decode exact, causal, aux flows")
 
     # NoPE: no rotation applied, everything else identical.
     cfg_np, nope = build(pos_enc="nope")
@@ -1251,9 +1343,11 @@ def main():
         "--attn",
         type=str,
         default="gqa",
-        choices=["gqa", "mla"],
-        help="Full-attention slot: gated GQA (Qwen3-Next) or gated MLA (Kimi Linear)",
+        choices=["gqa", "mla", "qsa"],
+        help="Full-attention slot: gated GQA (Qwen3-Next), gated MLA (Kimi Linear) or gated QSA (Qwen3.8-Flash-Next)",
     )
+    parser.add_argument("--qsa-block", type=int, default=4, metavar="B", help="With --attn qsa: micro-block size (Qwen: 4)")
+    parser.add_argument("--qsa-top-k", type=int, default=512, metavar="K", help="With --attn qsa: blocks kept per query (Qwen: 512)")
     parser.add_argument(
         "--dsa-top-k",
         type=int,
@@ -1438,6 +1532,8 @@ def main():
         **MODEL_SIZES[size],
         "linear_attn": args.linear,
         "attn": args.attn,
+        "qsa_block": args.qsa_block,
+        "qsa_top_k": args.qsa_top_k,
         "dsa_top_k": args.dsa_top_k,
         "index_share": args.index_share,
         "window_size": args.window,
@@ -1460,6 +1556,8 @@ def main():
     for key, flag, value in (
         ("linear_attn", "--linear", args.linear),
         ("attn", "--attn", args.attn),
+        ("qsa_block", "--qsa-block", args.qsa_block),
+        ("qsa_top_k", "--qsa-top-k", args.qsa_top_k),
         ("dsa_top_k", "--dsa-top-k", args.dsa_top_k),
         ("index_share", "--index-share", args.index_share),
         ("window_size", "--window", args.window),
@@ -1512,6 +1610,7 @@ def main():
         f"\nLayout: {' '.join('A' if k == 'attn' else 'L' for k in model.pattern)}"
         f"  (L = {cfg['linear_attn']}, A = gated {cfg.get('attn', 'gqa').upper()}"
         + (f", DSA top-{cfg['dsa_top_k']}" if cfg.get("dsa_top_k", 0) else "")
+        + (f", {cfg['qsa_block']}-token blocks top-{cfg['qsa_top_k']}" if cfg.get("attn") == "qsa" else "")
         + (f", indexer shared x{cfg['index_share']}" if cfg.get("index_share", 1) > 1 else "")
         + ")"
     )
