@@ -65,7 +65,7 @@ from nano.models.looped_nano import LoopedNano
 from nano.models.qwen_nano import MODEL_SIZES as QWEN_SIZES
 from nano.models.qwen_nano import QwenNano, compute_rope_params
 from nano.models.qwen_next_nano import MODEL_SIZES as QWEN_NEXT_SIZES
-from nano.models.qwen_next_nano import QwenNextNano
+from nano.models.qwen_next_nano import QwenNextNano, build_rope_tables
 
 #: arch name -> (model class, size presets, extra config defaults)
 ARCHITECTURES = {
@@ -165,7 +165,10 @@ class NanoForCausalLM(PreTrainedModel):
         cfg = self.config.nano
         if hasattr(self.model, "cos") and "head_dim" in cfg:
             device = self.model.tok_emb.weight.device
-            cos, sin = compute_rope_params(cfg["head_dim"], cfg["rope_base"], cfg["context_length"])
+            if isinstance(self.model, QwenNextNano):
+                cos, sin = build_rope_tables(cfg)
+            else:
+                cos, sin = compute_rope_params(cfg["head_dim"], cfg["rope_base"], cfg["context_length"])
             self.model.cos, self.model.sin = cos.to(device), sin.to(device)
 
     def get_input_embeddings(self):
@@ -305,6 +308,29 @@ def _self_check():
         again = NanoForCausalLM.from_pretrained(d).eval()
         torch.testing.assert_close(again(input_ids=ids).logits, hf(input_ids=ids).logits)
     print("  save/from_pretrained        ok — weights and config round-trip")
+
+    # The wrapper rebuilds non-persistent tables during construction/loading.
+    # Compare to an independent native model so losing partial RoPE is visible.
+    for fraction in (0.0, 0.5, 1.0):
+        cfg = build_nano_cfg(
+            "qwen_next", vocab_size=V, drop_rate=0.0,
+            pos_enc="prope", rope_fraction=fraction,
+        )
+        native = QwenNextNano(cfg).eval()
+        hf = NanoForCausalLM(NanoConfig(arch="qwen_next", nano=cfg)).eval()
+        hf.model.load_state_dict(native.state_dict())
+        with torch.no_grad():
+            expected = native(ids)
+            torch.testing.assert_close(hf.model.cos, native.cos)
+            torch.testing.assert_close(hf.model.sin, native.sin)
+            torch.testing.assert_close(hf(input_ids=ids).logits, expected)
+            with tempfile.TemporaryDirectory() as d:
+                hf.save_pretrained(d)
+                again = NanoForCausalLM.from_pretrained(d).eval()
+                torch.testing.assert_close(again.model.cos, native.cos)
+                torch.testing.assert_close(again.model.sin, native.sin)
+                torch.testing.assert_close(again(input_ids=ids).logits, expected)
+    print("  partial RoPE                ok — native, wrapped and reloaded logits agree")
 
     print("hf adapter self-check passed")
 
