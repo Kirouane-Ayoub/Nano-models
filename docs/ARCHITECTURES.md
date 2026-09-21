@@ -23,6 +23,7 @@ independent — read the ones you need.
 | Local:global (SWA) layout | `--linear swa --ratio 5 --window 128` | `nano/models/qwen_next_nano.py` |
 | ShortConv | `--short-conv 4` | `nano/attention_zoo.py` |
 | KV sharing | `--kv-share N` | `nano/models/qwen_next_nano.py` |
+| Sandwich norm | `--norm sandwich` | `nano/models/qwen_next_nano.py` |
 | NoPE | `--posenc nope` | `nano/models/qwen_nano.py` |
 | p-RoPE (partial RoPE) | `--posenc prope --rope-fraction 0.5` | `nano/models/qwen_next_nano.py` |
 | mHC hyper-connections | `--residual mhc` | `nano/models/qwen_next_nano.py` |
@@ -285,6 +286,21 @@ stays global either way.
 
 LayerNorm without mean subtraction or bias. Same stabilization, fewer
 operations. Universal now.
+
+### Sandwich norm
+**Paper:** Gemma 2 (2024), arXiv 2408.00118; kept in Gemma 3 and 4. OLMo 2
+(2024) uses the post-norm half alone.
+
+**Problem.** Pre-norm scales what goes *into* a sublayer and says nothing
+about what comes out. One attention layer can emit a spike that then rides
+the residual stream to the top, and the deeper the model the more chances
+that has to happen.
+
+**Solution.** Normalise the output too: `x + RMSNorm(attn(RMSNorm(x)))`, same
+for the FFN. Every contribution to the residual is capped at unit scale
+before it is added. Two extra vectors per layer, no change to the cache or
+the mixer, and it is what let Gemma go deeper at a fixed width. The
+trade-off is one more reduction per sublayer on the critical path.
 
 ### QK-norm
 **Paper:** *Scaling Vision Transformers to 22B* (Google, 2023); Qwen3.
