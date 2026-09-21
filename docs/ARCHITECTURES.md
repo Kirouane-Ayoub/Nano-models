@@ -15,8 +15,9 @@ independent — read the ones you need.
 
 | Component | Flag | File |
 |---|---|---|
-| MHA, GQA, gated, MLA, SWA | `--attention <name>` | `nano/attention_zoo.py` |
+| MHA, GQA, gated, sink, kv1, MLA, SWA | `--attention <name>` | `nano/attention_zoo.py` |
 | Gated DeltaNet, KDA | `--attention deltanet\|kda`, `--linear` | `nano/attention_zoo.py` |
+| Lightning Attention | `--attention lightning` | `nano/attention_zoo.py` |
 | DSA, CSA, HCA | `--attention dsa\|csa\|hca` | `nano/attention_zoo.py` |
 | Hybrid linear:full ratio | `--ratio N` | `nano/models/qwen_next_nano.py` |
 | ShortConv | `--short-conv 4` | `nano/attention_zoo.py` |
@@ -64,6 +65,33 @@ what break low-bit quantization.
 
 **Solution.** A sigmoid gate on the attention output before the output
 projection. A head can now emit ≈0, so no sink is needed. Two lines of code.
+
+### Attention sinks
+**Paper:** gpt-oss (OpenAI, 2025); *Efficient Streaming Language Models with
+Attention Sinks* (MIT, 2023) for the diagnosis.
+
+**Problem.** The same one Gated Attention fixes: softmax has to put its mass
+somewhere, and a head with nothing to say puts it on token 0.
+
+**Solution.** Give it somewhere harmless to put it. One learned scalar per head
+is appended to the logit row, softmax runs over T+1 entries, and the sink's
+column is dropped before multiplying by V. A head that wants to emit nothing
+raises its sink logit. Fixes the problem on the input side where gating fixes
+it on the output side; gpt-oss ships sinks with alternating 128-token sliding
+window and full layers. One parameter per head.
+
+### K-as-V
+**Paper:** Gemma 4 (Google DeepMind, 2026), arXiv 2607.02770.
+
+**Problem.** GQA shrinks the cache by sharing heads. What is left is still two
+tensors per token per layer.
+
+**Solution.** Drop the value projection and use K as V. The cache halves again,
+and the head loses only the ability to *store* something different from what
+it *matches on*. Gemma 4 does this only on the sparse global layers — the ones
+whose cache grows with context — and keeps separate values on the 5:1 sliding
+window layers where the cache is bounded anyway. Combined with KV sharing it
+takes their global cache down ~37%.
 
 ### MLA — Multi-Head Latent Attention
 **Paper:** DeepSeek-V2 (DeepSeek, 2024).
@@ -144,6 +172,25 @@ a fast local buffer or a slow long-range memory. It can't be both.
 **Solution.** Give every key channel its own decay rate. One head can then hold
 a quickly-forgotten feature and a slowly-decaying one at the same time. In this
 repo the entire difference from the parent class is the shape of one tensor.
+
+### Lightning Attention
+**Paper:** TransNormerLLM (OpenNLPLab, 2023), arXiv 2307.14995; Lightning
+Attention-2 (2024), arXiv 2401.04658; shipped in MiniMax-01 (2025) and Ling 2.5
+(2026).
+
+**Problem.** Linear attention needs a way to forget, and needs to be trainable
+in parallel. Learned gates (DeltaNet) solve forgetting but make the recurrence
+data-dependent, which is harder to write a fast kernel for.
+
+**Solution.** Forget at a *fixed* rate. Each head gets a constant decay from
+the ALiBi power-law slopes, so heads span short buffers to near-permanent
+memory without learning anything. With the decay fixed, the attention matrix
+factors into a (T×T) decay mask times QKᵀ, and the paper's contribution is a
+blockwise kernel that computes it in O(n) without a cumsum. No softmax; an
+RMSNorm on the output does the normalising and a sigmoid gate lets a head
+switch off. Ling 2.5 pairs it with MLA on the full-attention layers where
+Qwen3.5 pairs DeltaNet with gated attention. MiniMax dropped it again in M2 for
+plain GQA — the trade-off is not settled.
 
 ### ShortConv
 **Paper:** Kimi Linear (2025), LFM2.5; *Dynamic Short Convolutions Improve
