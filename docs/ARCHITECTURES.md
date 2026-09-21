@@ -31,6 +31,7 @@ independent — read the ones you need.
 | mHC hyper-connections | `--residual mhc` | `nano/models/qwen_next_nano.py` |
 | Per-layer embeddings | `--ple-dim 16` | `nano/models/qwen_next_nano.py` |
 | Engram conditional memory | `--engram-dim 16 --engram-layer 1` | `nano/models/qwen_next_nano.py` |
+| Mixture-of-Depths | `--mod-capacity 0.5` | `nano/models/qwen_next_nano.py` |
 | Multi-token prediction | `--mtp-weight 0.3` | `nano/models/qwen_next_nano.py` |
 | Parallel block (GPT-J/PaLM) | `--block parallel` | `nano/models/gpt_nano.py` |
 | Looped depth (Huginn/Ouro) | `--loops 4 --loop-bptt K` | `nano/models/looped_nano.py` |
@@ -549,6 +550,31 @@ Causal by construction because the n-gram ends at t. What breaks is cached
 decode: the module must remember the previous n−1 token ids or the n-gram at
 the new token is wrong while everything else looks fine. The projection is
 zero-initialised so a model with Engram starts exactly as one without.
+
+### Mixture-of-Depths
+**Paper:** *Mixture-of-Depths* (Google DeepMind, 2024), arXiv 2404.02258.
+
+**Problem.** Every token pays for every layer, but most tokens do not need
+most layers. MoE varies *which* parameters a token uses; nothing varies *how
+many*.
+
+**Solution.** Put a scalar router in front of a block. The top `capacity`
+fraction of tokens go through it, their update scaled by the router score so
+the router learns; the rest skip the block on the residual. Half the tokens
+at every other layer is the paper's setting, and quality holds at a fraction
+of the FLOPs.
+
+**The catch, and the fix that ships with it.** Top-k ranks tokens across the
+sequence, so token t's fate depends on tokens after it — non-causal, like
+expert-choice routing. Unlike expert choice, the paper solves it: a second
+scalar head is trained with a BCE loss to predict the top-k decision from the
+token alone, and at inference that predictor makes the call. Train routes by
+top-k and trains the predictor; eval routes by the predictor and is causal.
+The self-check asserts exact capacity in train mode and causality in eval
+mode; the train-check asserts the predictor learns to agree with the top-k.
+In this repo skipped tokens are masked rather than removed, so they still
+serve as keys and the FLOP saving is not realised — the routing is what is
+demonstrated.
 
 ### KV sharing (cross-layer attention)
 **Paper:** Gemma 4 (Google, 2026).
