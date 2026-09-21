@@ -339,6 +339,19 @@ def _self_check():
                 torch.testing.assert_close(again(input_ids=ids).logits, expected)
     print("  partial RoPE                ok — native, wrapped and reloaded logits agree")
 
+    # A zero projection would hide broken hash buffers, so activate memory
+    # before verifying that save/load preserves both row mapping and logits.
+    cfg = build_nano_cfg("qwen_next", vocab_size=V, drop_rate=0.0, engram_dim=8)
+    hf = NanoForCausalLM(NanoConfig(arch="qwen_next", nano=cfg)).eval()
+    with torch.no_grad(), tempfile.TemporaryDirectory() as d:
+        hf.model.engram.proj.weight.normal_(std=0.1)
+        expected = hf(input_ids=ids).logits
+        hf.save_pretrained(d)
+        again = NanoForCausalLM.from_pretrained(d).eval()
+        torch.testing.assert_close(again.model.engram.mult, hf.model.engram.mult)
+        torch.testing.assert_close(again(input_ids=ids).logits, expected)
+    print("  engram                      ok — hash mapping and active memory survive reload")
+
     print("hf adapter self-check passed")
 
 
