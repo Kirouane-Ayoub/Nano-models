@@ -50,6 +50,7 @@ Usage:
     python -m nano.models.qwen_next_nano --logit-softcap 30               # bound the LM head (Gemma 2)
     python -m nano.models.qwen_next_nano --posenc prope --rope-fraction 0.5  # partial RoPE (Gemma 4)
     python -m nano.models.qwen_next_nano --linear swa --ratio 5 --window 128  # Gemma 4 local:global layout
+    python -m nano.models.qwen_next_nano --linear mamba2                  # Nemotron 3 layout (Mamba-2 + attention)
     python -m nano.models.qwen_next_nano --residual mhc                   # 4 hyper-connected residual streams
     python -m nano.models.qwen_next_nano --ple-dim 16                     # per-layer embeddings (Gemma 4)
     python -m nano.models.qwen_next_nano --self-check                     # no training, just asserts
@@ -74,7 +75,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from nano import config, data
-from nano.attention_zoo import GatedDeltaNet, KimiDeltaAttention, SlidingWindowAttention
+from nano.attention_zoo import GatedDeltaNet, KimiDeltaAttention, Mamba2, SlidingWindowAttention
 from nano.accel import current_device, is_main_process, log
 from nano.models.qwen_nano import (
     RMSNorm,
@@ -138,7 +139,12 @@ MODEL_SIZES = {
 # What fills the cheap slot between full-attention layers. "swa" is not linear
 # attention — it is a windowed softmax with a bounded cache — but it takes the
 # same position in the pattern: Gemma 4 runs 5 local : 1 global, gpt-oss 1 : 1.
-LINEAR_MIXERS = {"deltanet": GatedDeltaNet, "kda": KimiDeltaAttention, "swa": SlidingWindowAttention}
+LINEAR_MIXERS = {
+    "deltanet": GatedDeltaNet,
+    "kda": KimiDeltaAttention,
+    "mamba2": Mamba2,  # Nemotron 3's layout: Mamba-2 in the cheap slot
+    "swa": SlidingWindowAttention,
+}
 
 
 def build_rope_tables(cfg):
