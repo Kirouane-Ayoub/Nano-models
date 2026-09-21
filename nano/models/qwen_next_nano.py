@@ -569,15 +569,16 @@ class QwenNextNano(nn.Module):
 
         self.ple = PerLayerEmbeddings(cfg, cfg["n_layers"]) if cfg.get("ple_dim", 0) else None
         self.engram = Engram(cfg) if cfg.get("engram_dim", 0) else None
-        self.engram_layer = cfg.get("engram_layer", 1)  # early, where DeepSeek puts it
-        if self.engram is not None and (
-            not isinstance(self.engram_layer, int)
-            or not 0 <= self.engram_layer < cfg["n_layers"]
-        ):
-            raise ValueError(
-                f"engram_layer={self.engram_layer} must be a zero-based index "
-                f"in [0, {cfg['n_layers'] - 1}]"
-            )
+        layer = cfg.get("engram_layer", 1)  # early, where DeepSeek puts it
+        if self.engram is not None:
+            # A JSON config can hand us 1.0; coerce like looped_nano does with
+            # `loops`, but refuse anything that is not an index into the blocks.
+            if layer != int(layer) or not 0 <= int(layer) < cfg["n_layers"]:
+                raise ValueError(
+                    f"engram_layer={layer} must be a zero-based index in [0, {cfg['n_layers'] - 1}]"
+                )
+            layer = cfg["engram_layer"] = int(layer)  # normalize the in-memory config to an integer
+        self.engram_layer = layer
 
         self.mtp_weight = cfg.get("mtp_weight", 0.0)
         self.logit_softcap = cfg.get("logit_softcap", 0.0)  # 0 = off; Gemma 2 uses 30
@@ -899,6 +900,8 @@ def self_check():
     # a token-history buffer so cached decode still sees the n-gram; the memory
     # must be causal on its own; the hash must actually spread across rows.
     cfg_en, en = build(engram_dim=8)
+    cfg_f, _ = build(engram_dim=8, engram_layer=1.0)  # JSON floats are coerced
+    assert cfg_f["engram_layer"] == 1 and isinstance(cfg_f["engram_layer"], int)
     for invalid_layer in (-1, cfg_en["n_layers"], 0.5):
         try:
             build(engram_dim=8, engram_layer=invalid_layer)
