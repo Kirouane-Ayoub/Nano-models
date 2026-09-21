@@ -189,14 +189,27 @@ class FeedForward(nn.Module):
 
 
 class TransformerBlock(nn.Module):
+    """Pre-norm block. `block="parallel"` (GPT-J 2021, PaLM 2022) feeds attention
+    and the FFN the same residual input through separate learned norms and
+    sums their outputs, instead of running the FFN on attention's result.
+    The branches are independent, but this implementation does not execute
+    them concurrently or fuse their projections, so no speedup is guaranteed.
+    The cost is that the FFN can no longer react to
+    what attention just retrieved in the same layer; at scale that was found
+    to be nearly free, and small models feel it more. Kept as two norms so a
+    checkpoint trained one way still loads the other."""
+
     def __init__(self, cfg):
         super().__init__()
+        self.parallel = cfg.get("block", "sequential") == "parallel"
         self.norm1 = LayerNorm(cfg["emb_dim"])
         self.attn = get_attention(cfg.get("attention", "mha"), cfg)
         self.norm2 = LayerNorm(cfg["emb_dim"])
         self.ff = FeedForward(cfg)
 
     def forward(self, x, use_cache=False):
+        if self.parallel:
+            return x + self.attn(self.norm1(x), use_cache=use_cache) + self.ff(self.norm2(x))
         x = x + self.attn(self.norm1(x), use_cache=use_cache)
         x = x + self.ff(self.norm2(x))
         return x
@@ -596,6 +609,46 @@ def run_single(attn_type, text, settings, device, args, base_cfg):
     }
 
 
+def self_check():
+    """The attention variants are tested in attention_zoo; this covers what the
+    model adds on top: the block wiring and cached decode through the stack."""
+    torch.manual_seed(0)
+    V = 128
+
+    def build(**over):
+        cfg = {**MODEL_SIZES["nano"], "vocab_size": V, "drop_rate": 0.0, **over}
+        torch.manual_seed(0)
+        return cfg, GPTNano(cfg).eval()
+
+    def check_incremental(model, T=12, prefill=8):
+        idx = torch.randint(0, V, (2, T))
+        full = model(idx)
+        model.reset_kv_cache()
+        pre = model(idx[:, :prefill], use_cache=True)
+        torch.testing.assert_close(pre, full[:, :prefill], atol=1e-4, rtol=1e-4)
+        step = torch.cat([model(idx[:, t : t + 1], use_cache=True) for t in range(prefill, T)], 1)
+        torch.testing.assert_close(step, full[:, prefill:], atol=1e-4, rtol=1e-4)
+
+    # Parallel block: attention and FFN read the same residual through separate
+    # norms and sum their outputs. Same parameters, different function, and the
+    # KV cache must still be exact — the FFN no longer sees attention's output.
+    _, seq = build()
+    cfg_par, par = build(block="parallel")
+    assert seq.count_params() == par.count_params(), "parallel block changed the param count"
+    idx = torch.randint(0, V, (2, 12))
+    assert not torch.allclose(seq(idx), par(idx)), "parallel block is a no-op"
+    d = cfg_par["emb_dim"]
+    blk = par.blocks[0]
+    h = torch.randn(1, 5, d)
+    want = h + blk.attn(blk.norm1(h)) + blk.ff(blk.norm2(h))
+    torch.testing.assert_close(blk(h), want)
+    check_incremental(par)
+    check_incremental(seq)
+    print("  block     ok — parallel: x + attn(norm1(x)) + ff(norm2(x)), same params, decode exact")
+
+    print("\nAll checks passed")
+
+
 def main():
     attn_choices = list(ATTENTION_REGISTRY.keys()) + ["all"]
     size_choices = list(MODEL_SIZES.keys())
@@ -630,6 +683,14 @@ def main():
         choices=attn_choices,
         help="Attention mechanism (default: mha)",
     )
+    parser.add_argument(
+        "--block",
+        type=str,
+        default="sequential",
+        choices=["sequential", "parallel"],
+        help="Block layout: attention then FFN, or parallel branches with separate norms and summed outputs",
+    )
+    parser.add_argument("--self-check", action="store_true", help="Run assertions and exit")
     config.add_argument(parser)
     parser.add_argument("--seed", type=int, default=42)
 
@@ -660,6 +721,10 @@ def main():
     parser.add_argument("--top-k", type=int, default=40, help="Top-k sampling")
 
     args = parser.parse_args()
+
+    if args.self_check:
+        self_check()
+        return
 
     # ── Initialize DDP if launched via torchrun ──
     # Accelerate picks the device and sets up the process group, whether this
@@ -693,6 +758,7 @@ def main():
     base_cfg = MODEL_SIZES[size].copy()
     base_cfg.update(file_cfg.get("model", {}))
     ov(base_cfg, "attention", "--attention", args.attention)
+    ov(base_cfg, "block", "--block", args.block)
 
     # ── Resume from checkpoint ──
     resume_step = 0
