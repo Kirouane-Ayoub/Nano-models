@@ -15,20 +15,23 @@ independent — read the ones you need.
 
 | Component | Flag | File |
 |---|---|---|
-| MHA, GQA, gated, sink, kv1, MLA, SWA | `--attention <name>` | `nano/attention_zoo.py` |
+| MHA, GQA, gated, sink, kv1, diff, softcap, ssmax, MLA, SWA | `--attention <name>` | `nano/attention_zoo.py` |
 | Gated DeltaNet, KDA | `--attention deltanet\|kda`, `--linear` | `nano/attention_zoo.py` |
 | Lightning Attention | `--attention lightning` | `nano/attention_zoo.py` |
 | DSA, CSA, HCA | `--attention dsa\|csa\|hca` | `nano/attention_zoo.py` |
 | Hybrid linear:full ratio | `--ratio N` | `nano/models/qwen_next_nano.py` |
+| Local:global (SWA) layout | `--linear swa --ratio 5 --window 128` | `nano/models/qwen_next_nano.py` |
 | ShortConv | `--short-conv 4` | `nano/attention_zoo.py` |
 | KV sharing | `--kv-share N` | `nano/models/qwen_next_nano.py` |
 | NoPE | `--posenc nope` | `nano/models/qwen_nano.py` |
+| p-RoPE (partial RoPE) | `--posenc prope --rope-fraction 0.5` | `nano/models/qwen_next_nano.py` |
 | mHC hyper-connections | `--residual mhc` | `nano/models/qwen_next_nano.py` |
 | Per-layer embeddings | `--ple-dim 16` | `nano/models/qwen_next_nano.py` |
 | Multi-token prediction | `--mtp-weight 0.3` | `nano/models/qwen_next_nano.py` |
 | Looped depth (Huginn/Ouro) | `--loops 4 --loop-bptt K` | `nano/models/looped_nano.py` |
 | MoE + shared expert | `num_experts` in config | `nano/models/deepseek_nano.py` |
 | Aux-loss-free balancing | `--balance-speed 1e-3` | `nano/models/deepseek_nano.py` |
+| Sigmoid routing | `--router sigmoid` | `nano/models/deepseek_nano.py` |
 | LatentMoE | `--moe-latent-dim D` | `nano/models/deepseek_nano.py` |
 
 ---
@@ -78,7 +81,8 @@ is appended to the logit row, softmax runs over T+1 entries, and the sink's
 column is dropped before multiplying by V. A head that wants to emit nothing
 raises its sink logit. Fixes the problem on the input side where gating fixes
 it on the output side; gpt-oss ships sinks with alternating 128-token sliding
-window and full layers. One parameter per head.
+window and full layers, so both `gqa` and `swa` accept the `attn_sink` flag.
+One parameter per head.
 
 ### K-as-V
 **Paper:** Gemma 4 (Google DeepMind, 2026), arXiv 2607.02770.
@@ -92,6 +96,52 @@ it *matches on*. Gemma 4 does this only on the sparse global layers — the ones
 whose cache grows with context — and keeps separate values on the 5:1 sliding
 window layers where the cache is bounded anyway. Combined with KV sharing it
 takes their global cache down ~37%.
+
+### Logit softcapping
+**Paper:** Gemma 2 (Google DeepMind, 2024), arXiv 2408.00118.
+
+**Problem.** Nothing bounds a q·k dot product. A head can drive its logits
+large enough that softmax is exactly one-hot: brittle, gradient-free, and the
+first thing to overflow in fp16.
+
+**Solution.** Pass the logits through `c · tanh(s / c)`. Near zero it is the
+identity, so ordinary logits are untouched; large ones saturate smoothly at ±c
+instead of running away. Gemma 2 uses c=50 on attention logits and c=30 on the
+final vocabulary logits. Gemma 3 removed the attention cap and used QK-norm
+instead, which bounds the dot product at the source. Zero parameters, one line,
+and a good example of two fixes for the same failure at different points.
+
+### Scalable Softmax
+**Paper:** *Scalable-Softmax Is Superior for Attention* (Nakanishi, 2025), arXiv 2501.19399.
+
+**Problem.** With bounded logits, softmax over n keys flattens as n grows: the
+largest probability decays towards 1/n. Past the training length a head
+physically cannot focus on one token any more. The paper calls it attention
+fading.
+
+**Solution.** Multiply the logits by `s · log(n)`, where n is the number of
+keys the row can see. The log(n) growth cancels the flattening exactly, so a
+head's sharpness no longer depends on context length. s is one learned scalar
+per head, trained values land near 0.43. Costs nothing and needs no cache
+changes; in this repo the scale is computed from the query position, so
+cached decode matches prefill. The paper shows retrieval holding up at ten
+times the training length where plain softmax has collapsed.
+
+### Differential Attention
+**Paper:** *Differential Transformer* (Microsoft, 2024), arXiv 2410.05258.
+
+**Problem.** Softmax gives every token a non-zero share, so irrelevant context
+always gets *some* attention. Over a long context that floor of noise drowns
+the few tokens that matter, which is why retrieval degrades with length.
+
+**Solution.** Compute two attention maps from separate Q/K projections and
+subtract them, scaled by a learned λ. Both maps carry the same noise floor and
+different signal; the difference cancels the common mode, like a differential
+amplifier. λ starts near 0.8 and is learned per layer. Each head is
+RMS-normed on its own, because the subtraction can leave a head with tiny
+magnitude. At λ=0 the second map is inert and you have plain attention, which
+is what the self-test checks. Cost: twice the Q and K parameters unless you
+halve the head count, which is what the paper does.
 
 ### MLA — Multi-Head Latent Attention
 **Paper:** DeepSeek-V2 (DeepSeek, 2024).
@@ -218,6 +268,14 @@ exact lookup, while KV cache and prefill cost fall ~4×. Qwen3-Next, Qwen3.5 and
 Kimi Linear all landed on ~3:1; Ling 2.5 uses 7:1. This convergence across
 independent labs is the strongest single signal in 2026 architecture work.
 
+**The other hybrid.** Gemma 4 and gpt-oss fill the cheap slot with sliding
+window attention instead of a recurrence: 5 local : 1 global in Gemma 4 with a
+128-token window, 1 : 1 in gpt-oss. The cache is bounded rather than constant,
+but each local layer is still exact softmax attention over its window, so
+recall inside the window never degrades. In this repo `--linear swa` puts the
+zoo's SWA in the same layer positions the linear mixers use; the last layer
+stays global either way.
+
 ---
 
 ## 3. Normalization and position
@@ -260,6 +318,22 @@ is enough for the model to infer where it is. Often extrapolates better.
 Hybrid models typically use no positional encoding in their linear layers,
 since the recurrence is inherently ordered.
 
+### p-RoPE — partial RoPE
+**Paper:** *Round and Round We Go! What makes Rotary Positional Encodings
+useful?* (Barbero et al., 2024), arXiv 2410.06205; shipped in Gemma 4 (2026).
+
+**Problem.** RoPE's lowest-frequency pairs barely rotate over a whole context,
+so the model uses them as position-free content channels anyway — except that
+they *do* rotate a little, and at lengths past training that drift is noise.
+
+**Solution.** Keep only the highest-frequency fraction of pairs rotary and set
+the rest to the identity (cos=1, sin=0). Those pairs become honest NoPE
+channels, the fast ones still carry position. In this repo it is a
+modification of the cos/sin tables, so `apply_rope` and the KV cache are
+unchanged. Fraction 1 is plain RoPE and fraction 0 is NoPE exactly, which is
+what the self-check anchors on; Gemma 4's report pairs it with the 5:1
+local:global layout for long-context stability.
+
 ---
 
 ## 4. Feed-forward and routing
@@ -273,6 +347,21 @@ token.
 **Solution.** Many expert MLPs, a router picking top-k per token. Total
 parameters grow; active parameters per token stay flat. By 2026 this is the
 default for every serious open-weight release.
+
+### Sigmoid routing
+**Paper:** DeepSeek-V3 (2024), arXiv 2412.19437.
+
+**Problem.** A softmax router couples the experts: pushing one score up pulls
+every other weight down. The router cannot express "these two are both a good
+fit", and the coupling also feeds the collapse dynamics that load balancing
+has to fight.
+
+**Solution.** Score each expert with its own sigmoid, pick the top-k, then
+normalise the chosen weights to sum to 1. Each affinity is judged
+independently; the sum constraint is applied after selection rather than
+built into the scoring. DeepSeek-V3 made this switch alongside aux-loss-free
+balancing, and the two are usually adopted together. In this repo it is one
+method on the router with the same output shape and sum as softmax.
 
 ### Shared expert
 **Paper:** DeepSeek-V2 / V3.
@@ -408,5 +497,6 @@ directly whether it was doing its job.
 | **Compressed-entry causality** | An entry summarising tokens `[s, s+m)` may only be read once the group *closes*, at `s+m-1`. Reading earlier leaks the future — and the loss curve looks unusually **good**, not broken. |
 | **Accelerator built for its device** | Every main called `accelerator().device` before the training settings were known. The singleton was created with `mixed_precision="no"`, and the bf16 and grad-accumulation settings `train()` passed afterwards were dropped — every GPU/MPS run logged `Precision: no` and `--grad-accum` changed the log line but not the optimizer. Now `current_device()` reads the device off `PartialState`, and asking the singleton for different settings raises. |
 | **Looped KV cache** | A weight-shared core applied *r* times needs *r* KV caches. With one, iteration 3 of the current token attends to iteration 1's keys of earlier tokens; prefill and one-token decode then disagree by ~1e-1 while training is unaffected. `looped_nano` keeps a cache slot per iteration, and its self-check asserts the incremental test *fails* when the slots are shared. |
+| **SWA cache trimmed before attending** | The sliding-window cache was cut to the window *before* the attention step. A cached prefill longer than the window then gave its early queries nothing but future keys: all-masked rows, softmax of −∞, NaN. Every decode step after the prefill still matched the full forward exactly, so the zoo test passed. It surfaced only when SWA went into the hybrid model, where the NaN prefill output is the next layer's input. The zoo test now compares the prefill output too. |
 | **fp32 buffers in a half-precision matmul** | `module.to(torch.float16)` casts parameters and buffers, but not tensors *computed* from them. Lightning's decay mask came from an fp32 `arange`, stayed fp32, and the `(QKᵀ ⊙ decay) @ V` matmul raised a dtype mismatch. Invisible under autocast, which the training path always uses; only explicit `.to(dtype)` inference hit it. Every zoo entry now passes an fp16/bf16 forward without autocast. |
 | **Init RNG shifts** | Comparing "same model with and without component X" is invalid if X adds modules: it changes how much RNG the weight init consumes, so every weight differs. Detach the component from one model instead. |
