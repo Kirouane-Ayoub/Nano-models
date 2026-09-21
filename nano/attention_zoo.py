@@ -673,11 +673,15 @@ class LightningAttention(nn.Module):
             diff = (pos.unsqueeze(-1) - pos.unsqueeze(0)).float()  # (T, T), i - j
             decay = torch.exp(-self.slope.view(H, 1, 1) * diff.clamp(min=0))
             decay = decay.masked_fill(diff < 0, 0.0)  # causal
-            out = ((q @ k.transpose(-1, -2)) * decay) @ v
+            out = ((q @ k.transpose(-1, -2)) * decay.to(q.dtype)) @ v
 
         out = out.transpose(1, 2).reshape(B, T, d)
-        # fp32 for the norm, as the repo's RMSNorm does; avoids the autocast dtype warning
-        out = self.norm(out.float()) * torch.sigmoid(self.W_gate(x))
+        # Normalise in fp32 and cast back, as the repo's RMSNorm does. The weight
+        # is cast alongside (a no-op in fp32) so it keeps its gradient.
+        out = F.rms_norm(
+            out.float(), self.norm.normalized_shape, self.norm.weight.float(), self.norm.eps
+        ).to(out.dtype)
+        out = out * torch.sigmoid(self.W_gate(x))
         return self.out_proj(out)
 
     def reset_cache(self):
@@ -1105,6 +1109,27 @@ def _self_test():
     poked[:, :-1] += 10.0
     torch.testing.assert_close(attn(poked)[:, -1], attn(x)[:, -1], atol=1e-5, rtol=1e-5)
     print("  lightning ok — per-head decay bites, infinite slope forgets the past")
+
+    # Explicit low-precision inference must also work without autocast. Check
+    # prefill plus decode against an fp32 reference, and exercise norm gradients.
+    for dtype, tol in ((torch.float16, 3e-3), (torch.bfloat16, 3e-2)):
+        reference = get_attention("lightning", cfg).eval()
+        attn = get_attention("lightning", cfg).eval().to(dtype=dtype)
+        attn.load_state_dict(reference.state_dict())
+        sample = x[:, :8].to(dtype)
+        expected = reference(sample.float())
+        full = attn(sample)
+        cached = torch.cat([
+            attn(sample[:, :5], use_cache=True),
+            *[attn(sample[:, t:t + 1], use_cache=True) for t in range(5, 8)],
+        ], dim=1)
+        for result in (full, cached):
+            assert result.dtype == dtype
+            torch.testing.assert_close(result.float(), expected, atol=tol, rtol=tol)
+        (full.float().square().mean() + cached.float().square().mean()).backward()
+        for parameter in attn.parameters():
+            assert parameter.grad is not None and torch.isfinite(parameter.grad).all()
+    print("  lightning ok — fp16/bf16 forward, cached decode and gradients without autocast")
 
     # Compressed attention: group arithmetic, the availability rule, and the
     # short-sequence case where no group has closed yet.
