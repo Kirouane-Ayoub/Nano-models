@@ -20,9 +20,10 @@ For the same components in publication order, see [TIMELINE.md](./TIMELINE.md).
 | Gated DeltaNet, KDA | `--attention deltanet\|kda`, `--linear` | `nano/attention_zoo.py` |
 | Lightning Attention | `--attention lightning` | `nano/attention_zoo.py` |
 | Mamba-2 (+ Mamba-3 flags) | `--attention mamba2`, `--linear mamba2`, `mamba_trapezoidal`, `mamba_complex` | `nano/attention_zoo.py` |
-| DSA, CSA, HCA, MoBA | `--attention dsa\|csa\|hca\|moba` | `nano/attention_zoo.py` |
+| DSA, CSA, HCA, MoBA, QSA | `--attention dsa\|csa\|hca\|moba\|qsa` | `nano/attention_zoo.py` |
 | Hybrid linear:full ratio | `--ratio N` | `nano/models/qwen_next_nano.py` |
 | Gated MLA in the hybrid (Kimi Linear) | `--attn mla`, `configs/kimi_like.json` | `nano/models/qwen_next_nano.py` |
+| Gated QSA in the hybrid (Qwen3.8-Flash-Next) | `--attn qsa --qsa-top-k K`, `configs/qwen_flash_next.json` | `nano/models/qwen_next_nano.py` |
 | DSA on the hybrid + IndexShare (MiniMax) | `--attn mla --dsa-top-k 64 --index-share 2` | `nano/models/qwen_next_nano.py` |
 | Local:global (SWA) layout | `--linear swa --ratio 5 --window 128` | `nano/models/qwen_next_nano.py` |
 | ShortConv | `--short-conv 4` | `nano/attention_zoo.py` |
@@ -44,6 +45,7 @@ For the same components in publication order, see [TIMELINE.md](./TIMELINE.md).
 | Aux-loss-free balancing | `--balance-speed 1e-3` | `nano/models/deepseek_nano.py` |
 | Sigmoid routing | `--router sigmoid` | `nano/models/deepseek_nano.py` |
 | Expert-choice routing | `--routing expert` | `nano/models/deepseek_nano.py` |
+| DeepSeek-V4 routing: hash bootstrap, sqrt(softplus), clamped SwiGLU | `--hash-layers 3 --router sqrtsoftplus --swiglu-limit 10`, `configs/deepseek_v4_flash.json` | `nano/models/deepseek_nano.py` |
 | Muon optimizer | `--optim muon` (hybrid), or `"train": {"optimizer": "muon"}` in any config | `nano/optim.py` |
 | LatentMoE | `--moe-latent-dim D` | `nano/models/deepseek_nano.py` |
 
@@ -231,6 +233,29 @@ in the future has an entirely masked row: softmax of all −∞ is NaN.
 contain them. The self-test also checks the routing rule directly: k=0 still
 leaves exactly the current block visible. Smaller blocks exercise sparse
 routing under cached decoding and future-token perturbations.
+
+### QSA — Qwen Sparse Attention
+**Paper:** *On the Design of Qwen3.8-Next Architecture: Evaluation, Efficiency,
+and Training Stability* (Alibaba, Aug 2026), [arXiv 2608.30320](https://arxiv.org/abs/2608.30320).
+See also the Qwen3.8-Flash-Next model card and SGLang day-0 write-up.
+
+**Problem.** DSA selects single tokens, so its indexer must score every key;
+MoBA selects blocks cheaply but by an untrained mean key that cannot learn what
+the attention actually wants.
+
+**Solution.** Both at once. Group keys into 4-token micro-blocks, give each
+block one *index* key (the mean of the tokens' index keys, unit norm), score
+blocks with a small ReLU indexer that is trained against the dense attention
+exactly as DSA's is, keep the top-k blocks plus the query's own partial block,
+and then attend with ordinary gated GQA over the **uncompressed** K/V of those
+positions. Qwen keeps 512 blocks, 2,048 tokens, per query at 1M context. The
+indexer runs on a 4× shorter sequence than DSA's; the attention sees real
+keys, unlike CSA's pooled entries. Qwen3.8-Flash-Next puts one QSA layer after
+every three Gated DeltaNet layers.
+
+**Watch.** As with MoBA, the own-block rule is what keeps every row non-empty;
+the self-test pins k=0 to exactly the current partial block, k=1 to one extra
+closed block, and asserts the indexer loss falls when only the indexer trains.
 
 ### CSA / HCA — Compressed Attention
 **Paper:** DeepSeek-V4 (DeepSeek, 2026), arXiv 2606.19348.
@@ -461,6 +486,27 @@ independently; the sum constraint is applied after selection rather than
 built into the scoring. DeepSeek-V3 made this switch alongside aux-loss-free
 balancing, and the two are usually adopted together. In this repo it is one
 method on the router with the same output shape and sum as softmax.
+
+### DeepSeek-V4 routing: hash bootstrap, Sqrt(Softplus), clamped SwiGLU
+**Source:** DeepSeek-V4 (2026), arXiv 2606.19348 §2.1; shipped in V4-Flash (284B/13B) and V4-Pro.
+
+Three small changes to the V3 router, all in `deepseek_nano`:
+
+- **Hash-routed bootstrap layers.** In the first three MoE layers the *choice*
+  of experts is a frozen `token_id → experts` table; only the combine weights
+  are learned. Early layers mostly look up token identity anyway, so a fixed
+  assignment costs nothing there and removes the router-collapse risk exactly
+  where it is worst — before the representations have differentiated. It
+  replaces V3's dense FFNs in those layers. `--hash-layers N`. The table here
+  is balanced by construction; DeepSeek's is built from token frequencies.
+- **Sqrt(Softplus) affinities.** V3's sigmoid saturates, so once an expert is
+  preferred it cannot be preferred *more*. `sqrt(softplus(s))` keeps growing
+  with the score, tempered by the square root, then normalised over the chosen
+  experts as before. `--router sqrtsoftplus`.
+- **Clamped SwiGLU** in the routed experts: gate clamped from above and up on
+  both sides at 10 before the product. A routed expert sees a slice of the
+  data and is more prone to the rare huge activation than a dense FFN; the
+  clamp is the identity everywhere else. `--swiglu-limit 10`.
 
 ### Expert-choice routing
 **Paper:** *Mixture-of-Experts with Expert Choice Routing* (Google, 2022), arXiv 2202.09368.

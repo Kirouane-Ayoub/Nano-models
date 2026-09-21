@@ -82,6 +82,7 @@ compute — GQA, MLA, sliding windows, linear mixers, sparse selection — and t
 |---|---|---|---|
 | 2026-01 | Engram conditional memory | DeepSeek, arXiv 2601.07372 | `qwen_next_nano --engram-dim`, `components.py` |
 | 2026-02 | Gated attention + Gated DeltaNet at 397B | Qwen3.5, released 2026-02-16 | the hybrid's default layout |
+| 2026-02 | Linear attention + sparse MoE at "Flash" size | Qwen3.5-Flash, released 2026-02-25 | the hybrid's default layout, `deepseek_nano` MoE |
 | 2026-03 | Mamba-3: trapezoidal step, complex state | arXiv 2603.15569 | `mamba_trapezoidal`, `mamba_complex`; `mamba_nano --discretization trapezoidal --complex` |
 | 2026-04 | LatentMoE | Nemotron 3 Super, arXiv 2604.12374 | `deepseek_nano --moe-latent-dim` |
 | 2026-06 | Short conv vs. short window, the open argument | *Dynamic Short Convolutions*, arXiv 2606.03825 | note in the ShortConv entry |
@@ -89,6 +90,8 @@ compute — GQA, MLA, sliding windows, linear mixers, sparse selection — and t
 | 2026-06 | Lightning attention + MLA hybrid | Ling 2.6, arXiv 2606.15079 | `--attention lightning`, `--attn mla` |
 | 2026-06 | Compressed sparse / heavily compressed attention; mHC shipped | DeepSeek-V4, arXiv 2606.19348 | `--attention csa`, `--attention hca`, `--residual mhc` |
 | 2026-07 | K reused as V, p-RoPE and PLE shipped, KV sharing, last layer always global | Gemma 4, arXiv 2607.02770 | `--attention kv1`, `gemma_nano.py`, `--kv-share`, `--ple-dim` |
+| 2026-07 | V4 at 284B/13B: CSA+HCA, mHC ×4, hash-routed bootstrap MoE, Muon, K=V MQA with per-head sinks | DeepSeek-V4-Flash, released 2026-07-31 | `csa`, `hca`, `--residual mhc`, `--optim muon`, `kv1`, `sink`; routing trio via `--hash-layers --router sqrtsoftplus --swiglu-limit`, preset `configs/deepseek_v4_flash.json` |
+| 2026-08 | 3:1 GDN + Qwen Sparse Attention (4-token micro-block indexer, top-512 blocks), 51B n-gram embedding at layer 2, 512-expert MoE top-10 | Qwen3.8-Flash-Next, released 2026-08 | `--attention qsa`, `--attn qsa` in the hybrid, `--engram-dim`; preset `configs/qwen_flash_next.json` |
 
 ## Reading the columns
 
