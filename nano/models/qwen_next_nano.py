@@ -45,6 +45,7 @@ Usage:
     python -m nano.models.qwen_next_nano --short-conv 4                   # ShortConv on Q/K/V (Kimi Linear)
     python -m nano.models.qwen_next_nano --ratio 1 --kv-share 1           # last attn layer reuses K/V (Gemma 4)
     python -m nano.models.qwen_next_nano --posenc nope                    # drop RoPE
+    python -m nano.models.qwen_next_nano --norm sandwich                  # post-norm too (Gemma)
     python -m nano.models.qwen_next_nano --posenc prope --rope-fraction 0.5  # partial RoPE (Gemma 4)
     python -m nano.models.qwen_next_nano --linear swa --ratio 5 --window 128  # Gemma 4 local:global layout
     python -m nano.models.qwen_next_nano --residual mhc                   # 4 hyper-connected residual streams
@@ -309,7 +310,15 @@ class SharedKVAttention(GroupedQueryAttention):
 
 class HybridBlock(nn.Module):
     """Pre-norm block. The only thing that varies between layers is the mixer:
-    a linear-attention recurrence, or gated GQA with RoPE."""
+    a linear-attention recurrence, or gated GQA with RoPE.
+
+    `norm_style="sandwich"` (Gemma 2/3/4) adds a second RMSNorm on each
+    sublayer's *output* before it joins the residual. Pre-norm keeps the input
+    to a sublayer well-scaled but says nothing about what comes out; a single
+    attention layer can emit a spike that dominates the residual stream from
+    then on. The post-norm caps every contribution to unit scale, which is what
+    let Gemma train deeper at a fixed width. Two extra vectors per layer.
+    """
 
     def __init__(self, cfg, kind, kv_donor=None):
         super().__init__()
@@ -329,6 +338,9 @@ class HybridBlock(nn.Module):
             self.attn = LINEAR_MIXERS[cfg["linear_attn"]]({**cfg, "qkv_bias": False})
         self.norm2 = RMSNorm(cfg["emb_dim"])
         self.ff = SwiGLUFeedForward(cfg)
+        sandwich = cfg.get("norm_style", "pre") == "sandwich"
+        self.post1 = RMSNorm(cfg["emb_dim"]) if sandwich else nn.Identity()
+        self.post2 = RMSNorm(cfg["emb_dim"]) if sandwich else nn.Identity()
 
         # Residual style: one stream, or n hyper-connected streams.
         if cfg.get("residual", "plain") == "mhc":
@@ -340,19 +352,20 @@ class HybridBlock(nn.Module):
             self.hc_attn = self.hc_ff = None
 
     def _mix(self, h, cos, sin, use_cache):
-        return (
+        out = (
             self.attn(h, cos, sin, use_cache=use_cache)
             if self.is_attn
             else self.attn(h, use_cache=use_cache)
         )
+        return self.post1(out)
 
     def forward(self, x, cos, sin, use_cache=False):
         if self.hc_attn is None:
             x = x + self._mix(self.norm1(x), cos, sin, use_cache)
-            return x + self.ff(self.norm2(x))
+            return x + self.post2(self.ff(self.norm2(x)))
         # x is (B, T, n, d) here — each sublayer reads and writes all n streams.
         x = self.hc_attn(x, lambda h: self._mix(self.norm1(h), cos, sin, use_cache))
-        return self.hc_ff(x, lambda h: self.ff(self.norm2(h)))
+        return self.hc_ff(x, lambda h: self.post2(self.ff(self.norm2(h))))
 
 
 # ──────────────────────────────────────────────
@@ -672,6 +685,19 @@ def self_check():
     check_incremental(narrow, cfg_w["vocab_size"])
     print(f"  swa slot  ok — L=swa(window {cfg_w['window_size']}) A=gated, incremental decode exact")
 
+    # Sandwich norm (Gemma 2/3/4): a second RMSNorm on each sublayer's output.
+    # Must change the output, cost exactly two norm vectors per layer, and keep
+    # incremental decode exact — with a plain residual and with mHC streams.
+    cfg_pre, pre = build()
+    cfg_sw, sandwich = build(norm_style="sandwich")
+    assert not torch.allclose(pre(probe), sandwich(probe)), "sandwich norm is a no-op"
+    extra = sandwich.count_params() - pre.count_params()
+    assert extra == 2 * cfg_sw["emb_dim"] * cfg_sw["n_layers"], extra
+    check_incremental(sandwich, cfg_sw["vocab_size"])
+    cfg_sh, sandwich_hc = build(norm_style="sandwich", residual="mhc", mhc_streams=2)
+    check_incremental(sandwich_hc, cfg_sh["vocab_size"])
+    print(f"  sandwich  ok — +{extra:,} params (2 norms × {cfg_sw['n_layers']} layers), decode exact, works under mHC")
+
     # mHC: the manifold constraint must hold exactly, n=1 must degenerate to a
     # plain residual, and the identity init must start out as one.
     cfg_hc, mhc = build(residual="mhc", mhc_streams=4, mhc_noise=0.0)
@@ -959,6 +985,13 @@ def main():
         help="With --posenc prope: fraction of rotary pairs kept, highest frequencies first",
     )
     parser.add_argument(
+        "--norm",
+        type=str,
+        default="pre",
+        choices=["pre", "sandwich"],
+        help="Block normalisation: pre-norm only, or pre + post on each sublayer (Gemma 2/3/4)",
+    )
+    parser.add_argument(
         "--residual",
         type=str,
         default="plain",
@@ -1039,6 +1072,7 @@ def main():
         "short_conv": args.short_conv,
         "kv_share": args.kv_share,
         "pos_enc": args.posenc,
+        "norm_style": args.norm,
         "rope_fraction": args.rope_fraction,
         "residual": args.residual,
         "mhc_streams": args.mhc_streams,
@@ -1053,6 +1087,7 @@ def main():
         ("short_conv", "--short-conv", args.short_conv),
         ("kv_share", "--kv-share", args.kv_share),
         ("pos_enc", "--posenc", args.posenc),
+        ("norm_style", "--norm", args.norm),
         ("rope_fraction", "--rope-fraction", args.rope_fraction),
         ("residual", "--residual", args.residual),
         ("mhc_streams", "--mhc-streams", args.mhc_streams),
@@ -1099,7 +1134,7 @@ def main():
     if model.mtp is not None:
         log(f"MTP: weight {cfg['mtp_weight']}, {model.mtp_params():,} training-only params")
     log(
-        f"Components: posenc={cfg['pos_enc']}, short_conv={cfg['short_conv'] or 'off'}, "
+        f"Components: posenc={cfg['pos_enc']}, norm={cfg.get('norm_style', 'pre')}, short_conv={cfg['short_conv'] or 'off'}, "
         f"kv_share={cfg['kv_share'] or 'off'} ({model.own_kv_layers()} layers own their KV), "
         f"residual={cfg['residual']}"
         + (f" x{model.mhc_streams} streams" if model.mhc_streams else "")
