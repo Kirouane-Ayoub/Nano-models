@@ -13,6 +13,7 @@ not something to install.
 nano/
   attention_zoo.py   interchangeable attention and state-space mixers
   components.py      mHC, PLE, Engram, Mixture-of-Depths — the hybrid's swappable parts
+  optim.py           Muon (+ AdamW for the rest), one optimizer object
   config.py          config loading, precedence, run snapshots, ROOT
   models/            one readable file per architecture
 configs/             worked example configs

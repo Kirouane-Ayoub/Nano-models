@@ -41,6 +41,7 @@ independent — read the ones you need.
 | Aux-loss-free balancing | `--balance-speed 1e-3` | `nano/models/deepseek_nano.py` |
 | Sigmoid routing | `--router sigmoid` | `nano/models/deepseek_nano.py` |
 | Expert-choice routing | `--routing expert` | `nano/models/deepseek_nano.py` |
+| Muon optimizer | `--optim muon` (hybrid), or `"train": {"optimizer": "muon"}` in any config | `nano/optim.py` |
 | LatentMoE | `--moe-latent-dim D` | `nano/models/deepseek_nano.py` |
 
 ---
@@ -690,3 +691,32 @@ directly whether it was doing its job.
 | **Expert choice is non-causal** | Expert-choice routing picks each expert's top tokens over the whole sequence, so which experts process token t depends on tokens after t. A decoder trained with it reads the future through its routing and the loss looks *better*, not broken. The MoE self-check asserts the leak exists, so nobody mistakes the flag for a free balancing fix. |
 | **fp32 buffers in a half-precision matmul** | `module.to(torch.float16)` casts parameters and buffers, but not tensors *computed* from them. Lightning's decay mask came from an fp32 `arange`, stayed fp32, and the `(QKᵀ ⊙ decay) @ V` matmul raised a dtype mismatch. Invisible under autocast, which the training path always uses; only explicit `.to(dtype)` inference hit it. Every zoo entry now passes an fp16/bf16 forward without autocast. |
 | **Init RNG shifts** | Comparing "same model with and without component X" is invalid if X adds modules: it changes how much RNG the weight init consumes, so every weight differs. Detach the component from one model instead. |
+
+---
+
+## 7. Training
+
+### Muon
+**Sources:** Keller Jordan (2024), modded-nanogpt; *Muon is Scalable for LLM
+Training* / MuonClip in Kimi K2 (Moonshot, 2025), arXiv 2502.16982; adopted by
+Kimi K2.5, GLM-5 and others in 2026.
+
+**Problem.** AdamW scales every weight *entry* by its own running variance. A
+weight matrix is not a bag of entries: its gradient has a few dominant
+singular directions that swamp the rest, and Adam's per-entry rescaling does
+nothing about that.
+
+**Solution.** Treat the matrix as a matrix. Take the momentum-averaged gradient
+G and replace it with its polar factor UVᵀ, the nearest orthogonal matrix, so
+every singular direction moves by the same amount. Five quintic Newton-Schulz
+iterations compute that without an SVD. Only 2-D weights inside the blocks get
+this; embeddings, the tied head, norms, biases, conv kernels and Mamba's 1-D
+parameters stay on AdamW, in the same optimizer object. Muon takes a much
+larger learning rate than Adam (0.02 against 3e-4 here), so the schedule
+scales each group by its own ratio.
+
+Not architecture, and not verified to improve anything at this size — see
+"Known gaps". The self-test in `python -m nano.optim` checks the mechanism:
+Newton-Schulz flattens a 100× singular-value spread to within [0.68, 1.15],
+the update's singular values all equal lr·√(m/n), and the parameter routing is
+exactly block matrices versus everything else.

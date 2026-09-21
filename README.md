@@ -52,6 +52,7 @@ python -m nano.models.gpt_nano --block parallel        # GPT-J / PaLM parallel b
 
 # Swap components on the hybrid model
 python -m nano.models.qwen_next_nano --linear kda --short-conv 4 --residual mhc
+python -m nano.models.qwen_next_nano --optim muon                      # Muon on block matrices
 
 # Train on a Hugging Face dataset, or from a config file
 python -m nano.models.qwen_next_nano --dataset roneneldan/TinyStories --dataset-limit 5000
@@ -83,6 +84,7 @@ python -m nano.models.gemma_nano --self-check       # window boundary, dual RoPE
 python -m nano.models.gemma_nano --train-check      # overfits, (1+w) norms move
 python -m nano.models.mamba_nano --self-check       # constant-memory state, no attention, Mamba-3 dials
 python -m nano.models.mamba_nano --train-check      # overfits, Δ stays selective
+python -m nano.optim                                # Muon: Newton-Schulz, routing, update scale
 python -m nano.hf                                   # HF adapter vs the native loop
 ```
 
