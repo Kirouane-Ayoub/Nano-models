@@ -8,6 +8,7 @@ these stays a readable *mechanism*. Nothing here knows about the layout; each
 class takes a config dict and a tensor.
 
     HyperConnections     mHC — n residual streams mixed by a doubly stochastic matrix (DeepSeek V4)
+    GatedResidual        GR — n branches, per-channel gated read, per-branch scalar write (Qwen3.8-Next)
     PerLayerEmbeddings   PLE — a per-layer embedding slice added after every block (Gemma 4)
     Engram               hashed n-gram lookup memory added to the residual (DeepSeek, 2026)
     DepthRouter          Mixture-of-Depths — route tokens past a block, causal predictor for decode
@@ -111,6 +112,73 @@ class HyperConnections(nn.Module):
         # point of the constraint.
         mixed = torch.einsum("btid,ij->btjd", streams, self.res_matrix())
         return mixed + y.unsqueeze(2) * self.post.view(1, 1, -1, 1)
+
+
+# ──────────────────────────────────────────────
+# GR — Gated Residual
+# ──────────────────────────────────────────────
+
+
+class GatedResidual(nn.Module):
+    """Qwen3.8-Next's answer to hyper-connections (Aug 2026, arXiv 2608.30320 §GR).
+
+    Same starting point as mHC: widen the residual to n branches so depth and
+    width stop fighting over one vector. Different conclusion about what the
+    extra branches need. mHC learns a read vector, a write vector and an n×n
+    doubly stochastic mixing matrix between branches. Qwen's ablation (their
+    Table 5) found the mixing matrix "adds little" once the read and write are
+    expressive enough — so GR drops it and spends the budget on the read:
+
+        R̂_i = RMSNorm_i(R_i)                                 per-branch norm, own gain
+        G    = σ(W_u · SiLU(W_d · vec(R̂) / n))                 per-*channel* gate, low-rank
+        x    = (1/n) Σ_i G_i ⊙ R̂_i                            what the sublayer sees
+        y    = F(x)
+        s    = 2 σ(W_w · vec(R̂) / n)                          one scalar per branch
+        R'_i = R_i + s_i · y                                   write, no mixing
+
+    Two things to notice. The read *replaces* pre-norm — the branches are
+    normalised on the way in, so a block using GR has no norm of its own. And
+    the gate is elementwise: a channel can be read from branch 2 while its
+    neighbour is read from branch 3, which a per-branch scalar cannot express.
+    The paper credits the elementwise self-gate after RMSNorm with a stability
+    gain in its own right.
+
+    Initialisation is ordinary: branches start as n copies of the embedding and
+    the per-branch write scalars s_i differ from step one, so no symmetry
+    breaking is needed (contrast HyperConnections' one-hot init and jitter).
+    Bottleneck rank r = d/8. Their 25B-A3B run: loss 1.590 against 1.594 for
+    dynamic mHC and 1.617 for a plain pre-norm residual.
+    """
+
+    def __init__(self, d, n=4, rank=None):
+        super().__init__()
+        self.n = n
+        rank = rank or max(1, d // 8)
+        self.gain = nn.Parameter(torch.ones(n, d))  # per-branch RMSNorm gains
+        self.W_d = nn.Linear(n * d, rank, bias=False)
+        self.W_u = nn.Linear(rank, n * d, bias=False)
+        self.W_w = nn.Linear(n * d, n, bias=False)
+
+    def read(self, R):
+        """R: (B, T, n, d) → (x (B, T, d), R̂ (B, T, n, d), gate G (B, T, n, d))."""
+        # Accumulate RMS in FP32, like the backbone RMSNorm: finite FP16
+        # residuals above ~256 would otherwise overflow when squared.
+        R_float = R.float()
+        R_hat = (R_float * torch.rsqrt(R_float.pow(2).mean(dim=-1, keepdim=True) + 1e-6)
+                 * self.gain.float()).to(R.dtype)
+        flat = R_hat.flatten(-2)
+        G = torch.sigmoid(self.W_u(F.silu(self.W_d(flat) / self.n))).view_as(R_hat)
+        return (G * R_hat).mean(dim=2), R_hat, G
+
+    def write_scale(self, R_hat):
+        """(B, T, n) in (0, 2): how much of the sublayer output each branch takes."""
+        return 2 * torch.sigmoid(self.W_w(R_hat.flatten(-2)) / self.n)
+
+    def forward(self, R, fn):
+        """R: (B, T, n, d). fn maps (B, T, d) → (B, T, d). Returns the updated branches."""
+        x, R_hat, _ = self.read(R)
+        y = fn(x)
+        return R + self.write_scale(R_hat).unsqueeze(-1) * y.unsqueeze(2)
 
 
 # ──────────────────────────────────────────────
