@@ -13,6 +13,9 @@ Supported types:
     - mla:      Multi-Head Latent Attention (DeepSeek)
     - sink:     GQA + learned per-head sink logit (gpt-oss)
     - kv1:      GQA reusing K as V, half the KV cache (Gemma 4)
+    - diff:     Differential Attention — two softmax maps subtracted (DIFF Transformer)
+    - softcap:  GQA with c·tanh(s/c) logit softcapping (Gemma 2/3)
+    - ssmax:    GQA with logits scaled by s·log(n), Scalable Softmax (2025)
     - swa:      Sliding Window Attention (Mistral, Gemma)
     - deltanet: Gated DeltaNet linear attention (Qwen3-Next)
     - kda:      Kimi Delta Attention — DeltaNet with per-channel decay (Kimi Linear)
@@ -164,6 +167,10 @@ class GroupedQueryAttention(nn.Module):
         self.out_gate = nn.Linear(d, d, bias=False) if cfg.get("attn_out_gate") else None
         # Optional per-head sink logit — see SinkAttention below
         self.sink = nn.Parameter(torch.zeros(self.n_heads)) if cfg.get("attn_sink") else None
+        # Optional logit softcap — see SoftcapAttention below
+        self.softcap = cfg.get("attn_softcap")
+        # Optional scalable-softmax scale — see ScalableSoftmaxAttention below
+        self.ssmax_s = nn.Parameter(torch.full((self.n_heads,), 0.43)) if cfg.get("attn_ssmax") else None
 
         self.register_buffer("cache_k", None, persistent=False)
         self.register_buffer("cache_v", None, persistent=False)
@@ -196,6 +203,8 @@ class GroupedQueryAttention(nn.Module):
 
         T_q, T_k = q.shape[2], k.shape[2]
         attn = (q @ k.transpose(-2, -1)) / (self.head_dim**0.5)
+        if self.softcap:
+            attn = self.softcap * torch.tanh(attn / self.softcap)
 
         # Causal mask
         device = q.device
@@ -205,6 +214,11 @@ class GroupedQueryAttention(nn.Module):
         else:
             q_pos = torch.arange(T_q, device=device)
         k_pos = torch.arange(T_k, device=device)
+        if self.ssmax_s is not None:
+            # n = keys visible to this row; the scale grows with log n so the
+            # distribution keeps its sharpness as the context lengthens.
+            log_n = torch.log((q_pos + 1).float()).view(1, 1, T_q, 1)
+            attn = attn * (self.ssmax_s.view(1, -1, 1, 1) * log_n)
         mask = q_pos.unsqueeze(-1) < k_pos.unsqueeze(0)
         attn = attn.masked_fill(mask, float("-inf"))
 
@@ -249,7 +263,8 @@ class SinkAttention(GroupedQueryAttention):
     column is dropped before multiplying by V. A head with nothing to retrieve
     pushes its mass onto the sink and emits ~0, without needing token 0 as a
     dumping ground. One parameter per head. gpt-oss pairs it with alternating
-    128-token sliding-window and full layers.
+    128-token sliding-window and full layers; `swa` takes the same `attn_sink`
+    flag for that layout.
     """
 
     def __init__(self, cfg):
@@ -274,6 +289,130 @@ class KAsVAttention(GroupedQueryAttention):
 
     def __init__(self, cfg):
         super().__init__({**cfg, "k_as_v": True})
+
+
+@register("softcap", "Logit softcapping — GQA with c·tanh(s/c) on attention scores (Gemma 2/3)")
+class SoftcapAttention(GroupedQueryAttention):
+    """GQA with attention logits squashed into (−c, c) by c·tanh(s/c) (Gemma 2, 2024).
+
+    Attention logits have no ceiling, so a head can grow a q·k product large
+    enough to make softmax exactly one-hot — a sharp, brittle distribution with
+    vanishing gradient, and the dot products that get there are what overflow
+    in fp16. The cap is identity near zero and saturates smoothly at ±c, so
+    small logits are untouched and large ones cannot run away. Gemma 2 uses
+    c=50 on attention and c=30 on the final logits; Gemma 3 dropped the
+    attention cap in favour of QK-norm, which solves the same problem at the
+    source. One line, no parameters.
+    """
+
+    def __init__(self, cfg):
+        super().__init__({**cfg, "attn_softcap": cfg.get("attn_softcap", 50.0)})
+
+
+@register("ssmax", "Scalable Softmax — GQA with logits scaled by s·log(n) (Nakanishi, 2025)")
+class ScalableSoftmaxAttention(GroupedQueryAttention):
+    """GQA with attention logits multiplied by s·log(n), n = number of visible keys.
+
+    Softmax over n items with bounded logits flattens as n grows: the max
+    probability decays towards 1/n, so at long context a head cannot single
+    out one token however hard it tries. That is "attention fading", and it is
+    a big part of why length generalisation fails. Multiplying the logits by
+    log(n) exactly cancels the effect — the sharpness of the distribution
+    becomes independent of how many keys there are. s is one learned scalar per
+    head; the paper's trained models settle near 0.43, which is the init here.
+    Zero cost, and the paper reports it improves retrieval at lengths far past
+    training. arXiv 2501.19399.
+    """
+
+    def __init__(self, cfg):
+        super().__init__({**cfg, "attn_ssmax": True})
+
+
+@register("diff", "Differential Attention — two softmax maps subtracted, cancels noise (DIFF Transformer)")
+class DifferentialAttention(nn.Module):
+    """out = (softmax(q1·k1) - λ·softmax(q2·k2)) · v   (Microsoft, 2024, arXiv 2410.05258)
+
+    Softmax attention assigns a floor of probability to every token, including
+    the irrelevant ones, and that noise adds up. Two attention maps computed from
+    separate Q/K projections share the same noise floor and differ in signal; the
+    difference keeps the signal and cancels the noise, like a differential
+    amplifier. λ is learned per layer as exp(λq1·λk1) − exp(λq2·λk2) + λ_init,
+    which keeps it around λ_init at start. Each head's output is RMS-normed on
+    its own (the paper's GroupNorm) and scaled by (1 − λ_init) so the residual
+    contribution matches ordinary attention at init.
+
+    Exact at λ=0: the second map is inert, so `diff` with λ=0 is plain MHA with
+    a per-head norm. The self-test asserts exactly that.
+
+    ponytail: the paper halves the head count to keep parameters equal to MHA.
+    Here Q and K are simply doubled, so this entry has ~1.5× MHA's attention
+    params; make `n_heads` half as big if you need a fair comparison.
+    """
+
+    def __init__(self, cfg):
+        super().__init__()
+        d = cfg["emb_dim"]
+        self.n_heads = cfg["n_heads"]
+        self.head_dim = d // self.n_heads
+        self.lambda_init = cfg.get("diff_lambda_init", 0.8)
+        b = cfg["qkv_bias"]
+        self.W_query1, self.W_query2 = nn.Linear(d, d, bias=b), nn.Linear(d, d, bias=b)
+        self.W_key1, self.W_key2 = nn.Linear(d, d, bias=b), nn.Linear(d, d, bias=b)
+        self.W_value = nn.Linear(d, d, bias=b)
+        self.out_proj = nn.Linear(d, d, bias=False)
+        self.dropout = nn.Dropout(cfg["drop_rate"])
+        self.norm = nn.RMSNorm(self.head_dim)
+        init = lambda: nn.Parameter(torch.randn(self.head_dim) * 0.1)
+        self.lambda_q1, self.lambda_k1, self.lambda_q2, self.lambda_k2 = init(), init(), init(), init()
+
+        for name in ("cache_k1", "cache_k2", "cache_v"):
+            self.register_buffer(name, None, persistent=False)
+        self.cache_pos = 0
+
+    def lam(self):
+        return (
+            torch.exp(self.lambda_q1 @ self.lambda_k1)
+            - torch.exp(self.lambda_q2 @ self.lambda_k2)
+            + self.lambda_init
+        )
+
+    def _heads(self, t, B, T):
+        return t.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
+
+    def forward(self, x, use_cache=False):
+        B, T, d = x.shape
+        q1, q2 = self._heads(self.W_query1(x), B, T), self._heads(self.W_query2(x), B, T)
+        k1, k2 = self._heads(self.W_key1(x), B, T), self._heads(self.W_key2(x), B, T)
+        v = self._heads(self.W_value(x), B, T)
+
+        if use_cache:
+            if self.cache_k1 is None:
+                self.cache_k1, self.cache_k2, self.cache_v = k1, k2, v
+            else:
+                self.cache_k1 = torch.cat([self.cache_k1, k1], dim=2)
+                self.cache_k2 = torch.cat([self.cache_k2, k2], dim=2)
+                self.cache_v = torch.cat([self.cache_v, v], dim=2)
+            k1, k2, v = self.cache_k1, self.cache_k2, self.cache_v
+            q_pos = torch.arange(self.cache_pos, self.cache_pos + T, device=x.device)
+            self.cache_pos += T
+        else:
+            q_pos = torch.arange(T, device=x.device)
+        mask = q_pos.unsqueeze(-1) < torch.arange(k1.shape[2], device=x.device).unsqueeze(0)
+
+        def attend(q, k):
+            s = (q @ k.transpose(-2, -1)) / (self.head_dim**0.5)
+            return torch.softmax(s.masked_fill(mask, float("-inf")), dim=-1)
+
+        attn = self.dropout(attend(q1, k1) - self.lam() * attend(q2, k2))
+        out = attn @ v
+        # Per-head norm in fp32 and cast back, as the repo's RMSNorm does (see § 6 gotchas)
+        out = F.rms_norm(out.float(), (self.head_dim,), self.norm.weight.float(), self.norm.eps)
+        out = out.to(attn.dtype) * (1 - self.lambda_init)
+        return self.out_proj(out.transpose(1, 2).reshape(B, T, d))
+
+    def reset_cache(self):
+        self.cache_k1 = self.cache_k2 = self.cache_v = None
+        self.cache_pos = 0
 
 
 # ──────────────────────────────────────────────
@@ -374,6 +513,8 @@ class SlidingWindowAttention(nn.Module):
         self.head_dim = d // self.n_heads
         self.d_out = d
         self.window_size = cfg.get("window_size", cfg["context_length"] // 2)
+        # Optional per-head sink logit, as gpt-oss pairs with its 128-token windows
+        self.sink = nn.Parameter(torch.zeros(self.n_heads)) if cfg.get("attn_sink") else None
 
         self.W_query = nn.Linear(d, d, bias=cfg["qkv_bias"])
         self.W_key = nn.Linear(d, d, bias=cfg["qkv_bias"])
@@ -398,11 +539,14 @@ class SlidingWindowAttention(nn.Module):
             else:
                 self.cache_k = torch.cat([self.cache_k, k_new], dim=2)
                 self.cache_v = torch.cat([self.cache_v, v_new], dim=2)
-            # Trim cache to window size
+            k, v = self.cache_k, self.cache_v
+            # Trim to the window only *after* this call has attended. A prefill
+            # longer than the window needs the early keys for its early queries;
+            # trimming first left those rows with nothing but future keys, so
+            # they came back NaN — while every later decode step still matched.
             if self.cache_k.shape[2] > self.window_size:
                 self.cache_k = self.cache_k[:, :, -self.window_size :]
                 self.cache_v = self.cache_v[:, :, -self.window_size :]
-            k, v = self.cache_k, self.cache_v
         else:
             k, v = k_new, v_new
 
@@ -424,7 +568,12 @@ class SlidingWindowAttention(nn.Module):
         mask = (diff < 0) | (diff >= self.window_size)
         attn = attn.masked_fill(mask, float("-inf"))
 
-        attn = self.dropout(torch.softmax(attn, dim=-1))
+        if self.sink is not None:
+            sink = self.sink.view(1, -1, 1, 1).expand(B, -1, T_q, 1)
+            attn = torch.softmax(torch.cat([attn, sink], dim=-1), dim=-1)[..., :-1]
+        else:
+            attn = torch.softmax(attn, dim=-1)
+        attn = self.dropout(attn)
         out = (attn @ v).transpose(1, 2).contiguous().view(B, T_q, self.d_out)
         return self.out_proj(out)
 
@@ -1048,7 +1197,12 @@ def _self_test():
         # Prefill, then decode one token at a time — the cache (or recurrent
         # state, or conv state) must reproduce the full forward exactly.
         attn.reset_cache()
-        attn(x[:, :prefill], use_cache=True)
+        pre = attn(x[:, :prefill], use_cache=True)
+        # The prefill output itself must match too, not just the decode steps.
+        # A cache that is trimmed or rewritten *before* attending returns garbage
+        # for early positions while every later step still lines up — and in a
+        # stacked model that garbage is the next layer's input.
+        torch.testing.assert_close(pre, full[:, :prefill], atol=1e-4, rtol=1e-4)
         step = torch.cat([attn(x[:, t : t + 1], use_cache=True) for t in range(prefill, T)], dim=1)
         torch.testing.assert_close(step, full[:, prefill:], atol=1e-4, rtol=1e-4)
 
@@ -1130,6 +1284,64 @@ def _self_test():
         for parameter in attn.parameters():
             assert parameter.grad is not None and torch.isfinite(parameter.grad).all()
     print("  lightning ok — fp16/bf16 forward, cached decode and gradients without autocast")
+
+    # Differential attention: out = (softmax(q1k1) - λ softmax(q2k2)) v. At λ=0
+    # the second map must be completely inert, and once λ≠0 it must bite.
+    attn = get_attention("diff", {**cfg, "diff_lambda_init": 0.0}).eval()
+    with torch.no_grad():
+        for prm in (attn.lambda_q1, attn.lambda_k1, attn.lambda_q2, attn.lambda_k2):
+            prm.zero_()
+    assert abs(attn.lam().item()) < 1e-7, f"λ should be 0, got {attn.lam().item()}"
+    base = attn(x)
+    with torch.no_grad():
+        attn.W_key2.weight.add_(torch.randn_like(attn.W_key2.weight))
+    torch.testing.assert_close(attn(x), base, atol=1e-6, rtol=0)  # inert at λ=0
+    with torch.no_grad():
+        attn.lambda_q1.fill_(0.1), attn.lambda_k1.fill_(0.1)
+    assert not torch.allclose(attn(x), base, atol=1e-3), "second map does nothing at λ>0"
+    print(f"  diff      ok — second map inert at λ=0, bites at λ={attn.lam().item():.2f}")
+
+    # Softcapping: c·tanh(s/c) on the logits. With a huge cap it must equal
+    # plain gqa on the same weights; with a small one it must flatten attention.
+    ref = get_attention("gqa", cfg).eval()
+    # tanh(z)≈z−z³/3, so the residual error is logits³/(3c²): c=1e9 keeps it
+    # under 1e-9 even for logits in the thousands.
+    loose = get_attention("softcap", {**cfg, "attn_softcap": 1e9}).eval()
+    tight = get_attention("softcap", {**cfg, "attn_softcap": 0.5}).eval()
+    loose.load_state_dict(ref.state_dict())
+    tight.load_state_dict(ref.state_dict())
+    big = x * 20  # large logits, so the cap has something to cap
+    torch.testing.assert_close(loose(big), ref(big), atol=1e-5, rtol=1e-5)
+    assert not torch.allclose(tight(big), ref(big), atol=1e-2), "cap of 0.5 did nothing"
+    print("  softcap   ok — exact at cap→∞, bites at cap=0.5")
+
+    # gpt-oss pairs sinks with 128-token sliding windows, so swa must take the
+    # same flag: drain check plus incremental decode, since the window trims the
+    # cache and the sink column must survive that.
+    attn = get_attention("swa", {**cfg, "attn_sink": True}).eval()
+    base = attn(x)
+    attn.reset_cache()
+    attn(x[:, :prefill], use_cache=True)
+    step = torch.cat([attn(x[:, t : t + 1], use_cache=True) for t in range(prefill, T)], dim=1)
+    torch.testing.assert_close(step, base[:, prefill:], atol=1e-4, rtol=1e-4)
+    with torch.no_grad():
+        attn.sink.fill_(30.0)
+    drained = attn(x) - attn.out_proj.bias  # swa's out_proj has a bias, gqa's does not
+    assert drained.norm() < 1e-3 * base.norm(), "swa sink did not drain"
+    print("  swa+sink  ok — sink survives window trimming, drains at high logit")
+
+    # Scalable softmax: logits scaled by s·log(n), n = keys visible to that row.
+    # With s = 1/log(T) the last row's factor is exactly 1, so it must equal gqa
+    # on the same weights, while every earlier row (n < T) must differ.
+    ref = get_attention("gqa", cfg).eval()
+    attn = get_attention("ssmax", cfg).eval()
+    attn.load_state_dict(ref.state_dict(), strict=False)
+    with torch.no_grad():
+        attn.ssmax_s.fill_(1 / torch.log(torch.tensor(float(T))))
+    out, want = attn(x), ref(x)
+    torch.testing.assert_close(out[:, -1], want[:, -1], atol=1e-5, rtol=1e-5)
+    assert not torch.allclose(out[:, 1:-1], want[:, 1:-1], atol=1e-3), "ssmax scale did nothing"
+    print("  ssmax     ok — row n=T matches gqa at s=1/log T, shorter rows are rescaled")
 
     # Compressed attention: group arithmetic, the availability rule, and the
     # short-sequence case where no group has closed yet.
