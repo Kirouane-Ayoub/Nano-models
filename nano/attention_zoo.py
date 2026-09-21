@@ -218,7 +218,8 @@ class GroupedQueryAttention(nn.Module):
             # n = keys visible to this row; the scale grows with log n so the
             # distribution keeps its sharpness as the context lengthens.
             log_n = torch.log((q_pos + 1).float()).view(1, 1, T_q, 1)
-            attn = attn * (self.ssmax_s.view(1, -1, 1, 1) * log_n)
+            scale = self.ssmax_s.view(1, -1, 1, 1) * log_n
+            attn = attn * scale.to(attn.dtype)
         mask = q_pos.unsqueeze(-1) < k_pos.unsqueeze(0)
         attn = attn.masked_fill(mask, float("-inf"))
 
@@ -512,7 +513,9 @@ class SlidingWindowAttention(nn.Module):
         self.n_heads = cfg["n_heads"]
         self.head_dim = d // self.n_heads
         self.d_out = d
-        self.window_size = cfg.get("window_size", cfg["context_length"] // 2)
+        self.window_size = cfg.get("window_size")
+        if self.window_size is None:
+            self.window_size = cfg["context_length"] // 2
         # Optional per-head sink logit, as gpt-oss pairs with its 128-token windows
         self.sink = nn.Parameter(torch.zeros(self.n_heads)) if cfg.get("attn_sink") else None
 
@@ -1266,24 +1269,25 @@ def _self_test():
 
     # Explicit low-precision inference must also work without autocast. Check
     # prefill plus decode against an fp32 reference, and exercise norm gradients.
-    for dtype, tol in ((torch.float16, 3e-3), (torch.bfloat16, 3e-2)):
-        reference = get_attention("lightning", cfg).eval()
-        attn = get_attention("lightning", cfg).eval().to(dtype=dtype)
-        attn.load_state_dict(reference.state_dict())
-        sample = x[:, :8].to(dtype)
-        expected = reference(sample.float())
-        full = attn(sample)
-        cached = torch.cat([
-            attn(sample[:, :5], use_cache=True),
-            *[attn(sample[:, t:t + 1], use_cache=True) for t in range(5, 8)],
-        ], dim=1)
-        for result in (full, cached):
-            assert result.dtype == dtype
-            torch.testing.assert_close(result.float(), expected, atol=tol, rtol=tol)
-        (full.float().square().mean() + cached.float().square().mean()).backward()
-        for parameter in attn.parameters():
-            assert parameter.grad is not None and torch.isfinite(parameter.grad).all()
-    print("  lightning ok — fp16/bf16 forward, cached decode and gradients without autocast")
+    for name in ("lightning", "ssmax"):
+        for dtype, tol in ((torch.float16, 3e-3), (torch.bfloat16, 3e-2)):
+            reference = get_attention(name, cfg).eval()
+            attn = get_attention(name, cfg).eval().to(dtype=dtype)
+            attn.load_state_dict(reference.state_dict())
+            sample = x[:, :8].to(dtype)
+            expected = reference(sample.float())
+            full = attn(sample)
+            cached = torch.cat([
+                attn(sample[:, :5], use_cache=True),
+                *[attn(sample[:, t:t + 1], use_cache=True) for t in range(5, 8)],
+            ], dim=1)
+            for result in (full, cached):
+                assert result.dtype == dtype
+                torch.testing.assert_close(result.float(), expected, atol=tol, rtol=tol)
+            (full.float().square().mean() + cached.float().square().mean()).backward()
+            for parameter in attn.parameters():
+                assert parameter.grad is not None and torch.isfinite(parameter.grad).all()
+        print(f"  {name:9s} ok — fp16/bf16 forward, cached decode and gradients without autocast")
 
     # Differential attention: out = (softmax(q1k1) - λ softmax(q2k2)) v. At λ=0
     # the second map must be completely inert, and once λ≠0 it must bite.
