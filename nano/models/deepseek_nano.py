@@ -339,6 +339,7 @@ class MoEFeedForward(nn.Module):
 
         # LatentMoE: everything below runs in `d`, not emb_dim
         self.router_score = cfg.get("router_score", "softmax")  # "softmax" | "sigmoid"
+        self.router_choice = cfg.get("router_choice", "token")  # "token" | "expert"
         self.moe_latent = cfg.get("moe_latent_dim", 0)
         d = self.moe_latent or cfg["emb_dim"]
         self.down = nn.Linear(cfg["emb_dim"], d, bias=False) if self.moe_latent else None
@@ -380,6 +381,41 @@ class MoEFeedForward(nn.Module):
             return p / p.sum(dim=-1, keepdim=True)
         return torch.softmax(picked, dim=-1)
 
+    def expert_choice(self, scores):
+        """Expert-choice routing (Zhou et al., 2022): each expert takes its top
+        `capacity` tokens instead of each token taking its top-k experts.
+
+        capacity = ceil(N·k / E), so the total number of (token, expert) pairs
+        matches token choice, but every expert gets exactly the same share.
+        Load balance by construction — no bias, no auxiliary loss. A token may
+        be picked by many experts or by none; with none, the block's residual
+        carries it through unchanged.
+
+        The catch: the top-k runs down the *token* axis, over the whole batch
+        and sequence at once. Whether expert e takes token t depends on how
+        strongly the tokens after t want it, so routing leaks the future. Fine
+        for an encoder, and the reason decoder LLMs kept token choice and fixed
+        balance the DeepSeek-V3 way instead. The self-check asserts the leak.
+        Returns (E, capacity) token indices into the flattened sequence.
+        """
+        n_tokens = scores.shape[0]
+        capacity = -(-n_tokens * self.num_experts_per_tok // self.num_experts)
+        return torch.topk(scores.t(), min(capacity, n_tokens), dim=-1).indices
+
+    def _forward_expert_choice(self, x_flat, scores):
+        weights = (
+            torch.sigmoid(scores)
+            if self.router_score == "sigmoid"
+            else torch.softmax(scores, dim=-1)
+        )  # (N, E): the pair weight is the token's own affinity for the expert
+        out_flat = torch.zeros_like(x_flat)
+        for eid, idx in enumerate(self.expert_choice(scores)):
+            expert_out = self.experts[eid](x_flat.index_select(0, idx))
+            out_flat.index_add_(
+                0, idx, (expert_out * weights[idx, eid].unsqueeze(-1)).to(out_flat.dtype)
+            )
+        return out_flat
+
     def forward(self, x):
         if self.down is not None:
             x = self.down(x)
@@ -387,6 +423,12 @@ class MoEFeedForward(nn.Module):
 
         # Router scores
         scores = self.gate(x)  # (B, T, num_experts)
+        if self.router_choice == "expert":
+            result = self._forward_expert_choice(x.reshape(B * T, D), scores.reshape(B * T, -1))
+            result = result.reshape(B, T, D)
+            if self.shared_expert is not None:
+                result = result + self.shared_expert(x)
+            return self.up(result) if self.up is not None else result
         # The balancing bias steers *selection* only. Gating weights come from
         # the raw scores, so a bias can never inflate an expert's contribution.
         sel_scores = scores + self.expert_bias if self.balance_speed else scores
@@ -790,6 +832,34 @@ def self_check():
     assert not torch.allclose(sig(x), full(x), atol=1e-4), "router_score has no effect on output"
     print("  sigmoid_router ok — weights sum to 1, differ from softmax on the same gate")
 
+    # Expert-choice routing: experts pick tokens, so every expert processes
+    # exactly `capacity` tokens and balance is structural — no bias, no aux loss.
+    # The price is causality: expert e's top tokens are chosen over the whole
+    # sequence, so which experts see token t depends on tokens after t. Assert
+    # the leak instead of pretending it is not there.
+    ec = MoEFeedForward({**base, "balance_speed": 0.0, "router_choice": "expert"}).eval()
+    ec.load_state_dict(full.state_dict())
+    with torch.no_grad():
+        assign = ec.expert_choice(ec.gate(x).reshape(-1, base["num_experts"]))  # (E, capacity)
+        cap = -(-B * T * base["num_experts_per_tok"] // base["num_experts"])
+        assert assign.shape == (base["num_experts"], cap), assign.shape
+        # Every expert holds exactly `cap` tokens (the shape), and the total number
+        # of (token, expert) pairs equals token choice's N·k. Tokens, unlike
+        # experts, are *not* balanced: some get several experts, some none.
+        per_token = torch.bincount(assign.flatten(), minlength=B * T)
+        assert per_token.sum() == base["num_experts"] * cap
+        unrouted = int((per_token == 0).sum())
+        assert not torch.allclose(ec(x), full(x), atol=1e-4), "expert choice equals token choice"
+        poked = x.clone()
+        poked[:, -1] += 5.0
+        leak = not torch.allclose(ec(poked)[:, :-1], ec(x)[:, :-1], atol=1e-6)
+        assert leak, "expected a future leak through expert-choice selection — is capacity per token now?"
+        assert torch.allclose(full(poked)[:, :-1], full(x)[:, :-1], atol=1e-6), "token choice leaked"
+    print(
+        f"  expert_choice ok — every expert takes exactly {cap} tokens, {unrouted}/{B * T} tokens "
+        f"get none (residual only); non-causal, as documented"
+    )
+
     # The balancing bias must steer selection without touching gate weights.
     moe = MoEFeedForward({**base, "balance_speed": 1e-3}).eval()
     with torch.no_grad():
@@ -881,6 +951,14 @@ def main():
         choices=["softmax", "sigmoid"],
         help="Gate weights over the selected experts: softmax (V2) or normalised sigmoid (V3)",
     )
+    parser.add_argument(
+        "--routing",
+        type=str,
+        default="token",
+        choices=["token", "expert"],
+        help="Who chooses: tokens pick top-k experts (default), or experts pick top-capacity tokens "
+        "(expert choice — balanced by construction, but non-causal; see docs)",
+    )
     data.add_arguments(parser)
     parser.add_argument("--epochs", type=int, default=None)
     parser.add_argument("--batch-size", type=int, default=None)
@@ -927,11 +1005,13 @@ def main():
     cfg = MODEL_SIZES[size].copy()
     cfg["moe_latent_dim"] = args.moe_latent_dim
     cfg["router_score"] = args.router
+    cfg["router_choice"] = args.routing
     cfg["balance_speed"] = args.balance_speed
     cfg.update(file_cfg.get("model", {}))
     ov(cfg, "moe_latent_dim", "--moe-latent-dim", args.moe_latent_dim)
     ov(cfg, "balance_speed", "--balance-speed", args.balance_speed)
     ov(cfg, "router_score", "--router", args.router)
+    ov(cfg, "router_choice", "--routing", args.routing)
 
     resume_step = 0
     resume_epoch = 0
