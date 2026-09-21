@@ -338,6 +338,7 @@ class MoEFeedForward(nn.Module):
         hidden = cfg["expert_hidden_dim"]
 
         # LatentMoE: everything below runs in `d`, not emb_dim
+        self.router_score = cfg.get("router_score", "softmax")  # "softmax" | "sigmoid"
         self.moe_latent = cfg.get("moe_latent_dim", 0)
         d = self.moe_latent or cfg["emb_dim"]
         self.down = nn.Linear(cfg["emb_dim"], d, bias=False) if self.moe_latent else None
@@ -365,6 +366,20 @@ class MoEFeedForward(nn.Module):
         self.expert_load = counts
         self.expert_bias += self.balance_speed * torch.sign(counts.mean() - counts)
 
+    def gate_weights(self, picked):
+        """Combine weights for the selected experts, from their raw scores.
+
+        softmax (Switch, DeepSeek-V2) couples the experts: raising one score
+        lowers every other weight, so the router cannot say "both of these are
+        good". DeepSeek-V3 switched to a sigmoid per expert, normalised to sum
+        to 1 after selection, so each affinity is judged on its own. Same shape,
+        same sum; only the gradient coupling differs.
+        """
+        if self.router_score == "sigmoid":
+            p = torch.sigmoid(picked)
+            return p / p.sum(dim=-1, keepdim=True)
+        return torch.softmax(picked, dim=-1)
+
     def forward(self, x):
         if self.down is not None:
             x = self.down(x)
@@ -376,7 +391,7 @@ class MoEFeedForward(nn.Module):
         # the raw scores, so a bias can never inflate an expert's contribution.
         sel_scores = scores + self.expert_bias if self.balance_speed else scores
         topk_indices = torch.topk(sel_scores, self.num_experts_per_tok, dim=-1).indices
-        topk_probs = torch.softmax(torch.gather(scores, -1, topk_indices), dim=-1)
+        topk_probs = self.gate_weights(torch.gather(scores, -1, topk_indices))
 
         if self.training and self.balance_speed:
             self._update_bias(topk_indices)
@@ -761,6 +776,20 @@ def self_check():
         f"{n_full:,} -> {n_lat:,} params ({n_lat / n_full:.0%})"
     )
 
+    # Sigmoid routing (DeepSeek-V3): gate weights are normalised sigmoids of the
+    # selected scores rather than a softmax over them. They must still sum to 1
+    # per token, and they must actually differ from softmax on the same weights.
+    sig = MoEFeedForward({**base, "balance_speed": 0.0, "router_score": "sigmoid"})
+    sig.load_state_dict(full.state_dict())
+    with torch.no_grad():
+        picked = torch.gather(sig.gate(x), -1, torch.topk(sig.gate(x), 2, -1).indices)
+        w_sig, w_soft = sig.gate_weights(picked), full.gate_weights(picked)
+    torch.testing.assert_close(w_sig.sum(-1), torch.ones(B, T), atol=1e-6, rtol=0)
+    torch.testing.assert_close(w_soft.sum(-1), torch.ones(B, T), atol=1e-6, rtol=0)
+    assert not torch.allclose(w_sig, w_soft, atol=1e-3), "sigmoid routing equals softmax"
+    assert not torch.allclose(sig(x), full(x), atol=1e-4), "router_score has no effect on output"
+    print("  sigmoid_router ok — weights sum to 1, differ from softmax on the same gate")
+
     # The balancing bias must steer selection without touching gate weights.
     moe = MoEFeedForward({**base, "balance_speed": 1e-3}).eval()
     with torch.no_grad():
@@ -845,6 +874,13 @@ def main():
         default=1e-3,
         help="Aux-loss-free load-balancing bias speed (DeepSeek-V3 uses 1e-3; 0 disables)",
     )
+    parser.add_argument(
+        "--router",
+        type=str,
+        default="softmax",
+        choices=["softmax", "sigmoid"],
+        help="Gate weights over the selected experts: softmax (V2) or normalised sigmoid (V3)",
+    )
     data.add_arguments(parser)
     parser.add_argument("--epochs", type=int, default=None)
     parser.add_argument("--batch-size", type=int, default=None)
@@ -890,10 +926,12 @@ def main():
 
     cfg = MODEL_SIZES[size].copy()
     cfg["moe_latent_dim"] = args.moe_latent_dim
+    cfg["router_score"] = args.router
     cfg["balance_speed"] = args.balance_speed
     cfg.update(file_cfg.get("model", {}))
     ov(cfg, "moe_latent_dim", "--moe-latent-dim", args.moe_latent_dim)
     ov(cfg, "balance_speed", "--balance-speed", args.balance_speed)
+    ov(cfg, "router_score", "--router", args.router)
 
     resume_step = 0
     resume_epoch = 0
