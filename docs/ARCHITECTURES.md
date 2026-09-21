@@ -28,10 +28,10 @@ independent — read the ones you need.
 | Final logit softcap | `--logit-softcap 30` | `nano/models/qwen_next_nano.py` |
 | NoPE | `--posenc nope` | `nano/models/qwen_nano.py` |
 | p-RoPE (partial RoPE) | `--posenc prope --rope-fraction 0.5` | `nano/models/qwen_next_nano.py` |
-| mHC hyper-connections | `--residual mhc` | `nano/models/qwen_next_nano.py` |
-| Per-layer embeddings | `--ple-dim 16` | `nano/models/qwen_next_nano.py` |
-| Engram conditional memory | `--engram-dim 16 --engram-layer 1` | `nano/models/qwen_next_nano.py` |
-| Mixture-of-Depths | `--mod-capacity 0.5` | `nano/models/qwen_next_nano.py` |
+| mHC hyper-connections | `--residual mhc` | `nano/components.py` |
+| Per-layer embeddings | `--ple-dim 16` | `nano/components.py` |
+| Engram conditional memory | `--engram-dim 16 --engram-layer 1` | `nano/components.py` |
+| Mixture-of-Depths | `--mod-capacity 0.5` | `nano/components.py` |
 | Multi-token prediction | `--mtp-weight 0.3` | `nano/models/qwen_next_nano.py` |
 | Parallel block (GPT-J/PaLM) | `--block parallel` | `nano/models/gpt_nano.py` |
 | Looped depth (Huginn/Ouro) | `--loops 4 --loop-bptt K` | `nano/models/looped_nano.py` |
