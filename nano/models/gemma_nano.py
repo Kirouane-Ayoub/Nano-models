@@ -191,9 +191,10 @@ class GemmaAttention(nn.Module):
     """GQA with QK-norm and RoPE. `local=True` adds a sliding window and a
     bounded cache; `local=False` may reuse K as V (Gemma 4).
 
-    Order inside forward is QK-norm, then RoPE, then cache — norm before
-    rotation so the rotation acts on unit-scale vectors, and rotation before
-    caching so cached keys carry their absolute position.
+    QK-norm precedes RoPE. Separate-value layers cache rotated keys and values.
+    K-as-V layers cache only unrotated, normed keys and reconstruct their
+    rotated form for attention. This halves persistent cache storage at the
+    cost of rotating the full key history on each decode call.
 
     ponytail: with K-as-V the value is the *normed, unrotated* key. Rotating it
     would bake position into the values, which nothing downstream can undo.
@@ -235,16 +236,24 @@ class GemmaAttention(nn.Module):
         start = self.cache_pos if use_cache else 0
         q_pos = torch.arange(start, start + T, device=x.device)
         q = apply_rope_offset(q, cos[q_pos], sin[q_pos])
-        k = apply_rope_offset(k, cos[q_pos], sin[q_pos])
-
+        if self.W_value is None:
+            if use_cache:
+                if self.cache_k is not None:
+                    k = torch.cat([self.cache_k, k], dim=2)
+                self.cache_k = k
+            v = k
+            k_pos = torch.arange(start + T - k.shape[2], start + T, device=x.device)
+            k = apply_rope_offset(k, cos[k_pos], sin[k_pos])
+        else:
+            k = apply_rope_offset(k, cos[q_pos], sin[q_pos])
+            if use_cache:
+                if self.cache_k is not None:
+                    k = torch.cat([self.cache_k, k], dim=2)
+                    v = torch.cat([self.cache_v, v], dim=2)
+                self.cache_k, self.cache_v = k, v
+            k_pos = torch.arange(start + T - k.shape[2], start + T, device=x.device)
         if use_cache:
-            if self.cache_k is not None:
-                k = torch.cat([self.cache_k, k], dim=2)
-                v = torch.cat([self.cache_v, v], dim=2)
-            self.cache_k, self.cache_v = k, v
             self.cache_pos += T
-        T_k = k.shape[2]
-        k_pos = torch.arange(start + T - T_k, start + T, device=x.device)
 
         k = k.repeat_interleave(self.group_size, dim=1)
         v = v.repeat_interleave(self.group_size, dim=1)
@@ -259,8 +268,9 @@ class GemmaAttention(nn.Module):
         # Trim only after attending: a prefill longer than the window needs its
         # early keys for its early queries (see ARCHITECTURES.md § 6).
         if use_cache and self.local and self.cache_k.shape[2] > self.window:
-            self.cache_k = self.cache_k[:, :, -self.window :]
-            self.cache_v = self.cache_v[:, :, -self.window :]
+            # A slice alone retains the full prefill allocation through its base.
+            self.cache_k = self.cache_k[:, :, -self.window :].clone()
+            self.cache_v = self.cache_v[:, :, -self.window :].clone()
         return self.out_proj(out)
 
     def reset_cache(self):
@@ -449,6 +459,32 @@ def self_check():
     check_incremental(short)
     check_incremental(model)
     print("  kv cache  ok — prefill and decode match the full forward, window trim included")
+
+    # Check allocated storage, not just shapes, immediately after prefill and
+    # after chunked decoding. K-as-V must retain exactly one tensor per layer.
+    for k_as_v in (False, True):
+        _, cached_model = build(window_size=4, k_as_v=k_as_v)
+        tokens = torch.randint(0, V, (2, 20))
+        with torch.no_grad():
+            full = cached_model(tokens)
+            start = 0
+            for length in (9, 3, 8):
+                end = start + length
+                out = cached_model(tokens[:, start:end], use_cache=True)
+                torch.testing.assert_close(out, full[:, start:end], atol=1e-4, rtol=1e-4)
+                for block in cached_model.blocks:
+                    a = block.attn
+                    kept = min(end, a.window) if a.local else end
+                    expected_bytes = 2 * a.n_kv_groups * kept * a.head_dim * a.cache_k.element_size()
+                    assert a.cache_k.untyped_storage().nbytes() == expected_bytes
+                    if k_as_v and not a.local:
+                        assert a.cache_v is None, "K-as-V retained a second cache"
+                    else:
+                        assert a.cache_v.untyped_storage().nbytes() == expected_bytes
+                start = end
+        cached_model.reset_kv_cache()
+        assert all(b.attn.cache_k is None and b.attn.cache_v is None for b in cached_model.blocks)
+    print("  storage   ok — local allocations bounded, K-as-V caches once, chunked decode exact")
 
     # 8. Causality across the whole stack.
     a = torch.randint(0, V, (1, 10))
