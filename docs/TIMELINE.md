@@ -3,8 +3,10 @@
 Every component and architecture in this repo, in the order the ideas were
 published. Dates are the month of the originating paper (the arXiv identifier
 encodes it: `2405.21060` is May 2024) or of the model release when there is no
-paper. The last column is where it lives here. `ARCHITECTURES.md` explains each
-one; this file only orders them.
+paper. Later adoption milestones are labelled separately from the originating
+idea. The last column identifies the implementation or notes related work
+that is not implemented. `ARCHITECTURES.md` explains each component; this file
+only orders them.
 
 Two things the order shows. First, almost nothing in a 2026 model is from 2026:
 the components are 2023–2025 ideas that a lab finally shipped together. Second,
@@ -17,14 +19,16 @@ compute — GQA, MLA, sliding windows, linear mixers, sparse selection — and t
 | Date | Idea | Paper / origin | Here |
 |---|---|---|---|
 | 2016-08 | Tied input/output embeddings | Press & Wolf, arXiv 1608.05859 | every model ties `head` to `tok_emb` |
+| 2017-01 | Sparse MoE, top-k routing | Shazeer et al., [arXiv 1701.06538](https://arxiv.org/abs/1701.06538); later top-1 simplification: Switch Transformer, arXiv 2101.03961 (2021-01) | `deepseek_nano.py` |
 | 2017-06 | Multi-head attention, the transformer | *Attention Is All You Need*, arXiv 1706.03762 | `--attention mha` |
+| 2017-06 | Embedding scaled by √d | *Attention Is All You Need*, [arXiv 1706.03762](https://arxiv.org/abs/1706.03762), §3.4 | `gemma_nano.py` |
 | 2018-07 | Depth recurrence (looped layers) | *Universal Transformers*, arXiv 1807.03819 | origin of `looped_nano.py` |
-| 2019-10 | RMSNorm | arXiv 1910.07467 | every model |
-| 2019-10 | Embedding scaled by √d | T5, arXiv 1910.10683 | `gemma_nano.py` |
+| 2019-10 | RMSNorm | arXiv 1910.07467 | all model families except `gpt_nano`, which uses LayerNorm |
 | 2020-02 | Gated FFNs: SwiGLU, GeGLU | *GLU Variants Improve Transformer*, arXiv 2002.05202 | SwiGLU in `qwen_nano`, GeGLU in `gemma_nano` |
 | 2020-04 | Sliding-window attention | Longformer, arXiv 2004.05150; Mistral 7B, arXiv 2310.06825 (2023-10) | `--attention swa`, `--linear swa` |
-| 2021-01 | Mixture of Experts, top-k routing | Switch Transformer, arXiv 2101.03961 | `deepseek_nano.py` |
+| 2020-10 | Query-key normalization | Henry et al., [arXiv 2010.04245](https://arxiv.org/abs/2010.04245) (L2 normalization with learned scale) | precursor of the RMSNorm-based `qk_norm` in `qwen_nano`, `gemma_nano` |
 | 2021-04 | RoPE | RoFormer, arXiv 2104.09864 | `qwen_nano` and every model built on it |
+| 2021-05 | Sandwich normalization | CogView, [arXiv 2105.13290](https://arxiv.org/abs/2105.13290) (LayerNorm); later RMSNorm variant: Gemma 2 (2024-08) | `--norm sandwich`, `gemma_nano` use RMSNorm before and after sublayers |
 | 2021-06 | Parallel attention + FFN block | GPT-J (EleutherAI); PaLM, arXiv 2204.02311 (2022-04) | `gpt_nano --block parallel` |
 | 2022-02 | Expert-choice routing | arXiv 2202.09368 | `deepseek_nano --routing expert` |
 | 2022-03 | NoPE | Haviv et al., arXiv 2203.16634; Kazemnejad et al., arXiv 2305.19466 (2023-05) | `qwen_next_nano --posenc nope` |
@@ -33,7 +37,7 @@ compute — GQA, MLA, sliding windows, linear mixers, sparse selection — and t
 
 | Date | Idea | Paper / origin | Here |
 |---|---|---|---|
-| 2023-02 | QK-norm | *Scaling ViT to 22B*, arXiv 2302.05442 | `qk_norm` in `qwen_nano`, `gemma_nano` |
+| 2023-02 | QK-norm at 22B scale (later adoption) | *Scaling ViT to 22B*, arXiv 2302.05442 (LayerNorm on Q/K) | related variant; this repo uses RMSNorm on Q/K |
 | 2023-05 | Grouped-query attention | arXiv 2305.13245 | `--attention gqa` |
 | 2023-07 | Lightning attention (linear, fixed decay) | TransNormerLLM, arXiv 2307.14995; Lightning Attention-2, arXiv 2401.04658 (2024-01) | `--attention lightning` |
 | 2023-09 | Attention sinks (the diagnosis) | StreamingLLM, arXiv 2309.17453 | `--attention sink`, `swa` + `attn_sink` |
@@ -44,7 +48,7 @@ compute — GQA, MLA, sliding windows, linear mixers, sparse selection — and t
 | 2024-05 | Multi-head latent attention | DeepSeek-V2, arXiv 2405.04434 | `--attention mla`, `deepseek_nano`, `qwen_next_nano --attn mla` |
 | 2024-05 | Cross-layer KV sharing | CLA, arXiv 2405.12981; Gemma 4 (2026-07) | `qwen_next_nano --kv-share` |
 | 2024-05 | Mamba-2 / state-space duality | arXiv 2405.21060 | `--attention mamba2`, `mamba_nano.py` |
-| 2024-08 | Logit softcapping, sandwich norm | Gemma 2, arXiv 2408.00118 | `--attention softcap`, `--logit-softcap`, `--norm sandwich`, `gemma_nano` |
+| 2024-08 | Logit softcapping; RMSNorm sandwich adoption | Gemma 2, arXiv 2408.00118 | `--attention softcap`, `--logit-softcap`, `--norm sandwich`, `gemma_nano` |
 | 2024-08 | Aux-loss-free load balancing | arXiv 2408.15664; DeepSeek-V3 | `deepseek_nano --balance-speed` |
 | 2024-09 | Hyper-connections | ByteDance, arXiv 2409.19606 | precursor of mHC below |
 | 2024-10 | Differential attention | arXiv 2410.05258 | `--attention diff` |
@@ -64,11 +68,11 @@ compute — GQA, MLA, sliding windows, linear mixers, sparse selection — and t
 | 2025-03 | 5:1 local:global, dual RoPE base, QK-norm over softcap | Gemma 3, arXiv 2503.19786 | `gemma_nano.py` |
 | 2025-05 | Per-layer embeddings | Gemma 3n, announced Google I/O 2025-05-20; Gemma 4 report | `qwen_next_nano --ple-dim`, `components.py` |
 | 2025-07 | Short convolutions as a mixer | LFM2, released 2025-07-10, report arXiv 2511.23404 | `--short-conv` (`ShortConv` in the zoo) |
-| 2025-07 | MuonClip in production | Kimi K2, released 2025-07-11, arXiv 2507.20534 | `--optim muon` |
+| 2025-07 | MuonClip in production (related adoption) | Kimi K2, released 2025-07-11, [arXiv 2507.20534](https://arxiv.org/abs/2507.20534) | `--optim muon` implements Muon + auxiliary AdamW; MuonClip's QK clipping is not implemented |
 | 2025-08 | Learned attention sinks, 128-token windows alternating with full | gpt-oss, released 2025-08-05 | `--attention sink`, `swa` + `attn_sink` |
 | 2025-09 | Gated attention, 3:1 Gated DeltaNet hybrid | Qwen3-Next, released 2025-09-12 | `--attention gated`, the hybrid's default layout |
+| 2025-09 | DeepSeek sparse attention, lightning indexer | DeepSeek-V3.2-Exp, [release and technical report, 2025-09-29](https://api-docs.deepseek.com/news/news250929/); later DeepSeek-V3.2 report, arXiv 2512.02556 (2025-12) | `--attention dsa`, `qwen_next_nano --dsa-top-k` |
 | 2025-10 | Kimi Delta Attention, KDA + gated MLA | Kimi Linear, arXiv 2510.26692 | `--attention kda`, `configs/kimi_like.json` |
-| 2025-12 | DeepSeek sparse attention, lightning indexer | DeepSeek-V3.2, arXiv 2512.02556 | `--attention dsa`, `qwen_next_nano --dsa-top-k` |
 | 2025-12 | Mamba-2 + attention + MoE hybrid | Nemotron 3, arXiv 2512.20856 | `qwen_next_nano --linear mamba2` |
 | 2025-12 | Manifold-constrained hyper-connections | mHC, DeepSeek, arXiv 2512.24880 | `--residual mhc`, `components.py` |
 
