@@ -34,6 +34,7 @@ For the same components in publication order, see [TIMELINE.md](./TIMELINE.md).
 | NoPE | `--posenc nope` | `nano/models/qwen_nano.py` |
 | p-RoPE (partial RoPE) | `--posenc prope --rope-fraction 0.5` | `nano/models/qwen_next_nano.py` |
 | mHC hyper-connections | `--residual mhc` | `nano/components.py` |
+| Gated Residual (Qwen3.8-Next) | `--residual gr --gr-branches 4` | `nano/components.py` |
 | Per-layer embeddings | `--ple-dim 16` | `nano/components.py` |
 | Engram conditional memory | `--engram-dim 16 --engram-layer 1` | `nano/components.py` |
 | Mixture-of-Depths | `--mod-capacity 0.5` | `nano/components.py` |
@@ -607,6 +608,29 @@ Sinkhorn-Knopp, so every stream emits exactly as much as it receives and the
 widened pathway still behaves like an identity globally. ~6.7% training
 overhead for four streams; earlier hyper-connection work reached baseline
 quality in roughly half the tokens.
+
+### GR — Gated Residual
+**Paper:** *On the Design of Qwen3.8-Next Architecture* (Alibaba, Aug 2026), arXiv 2608.30320.
+
+**Problem.** The same one mHC answers: a single residual stream makes every
+layer read and write one vector. Widening it to n streams helps, but mHC's
+version needs a learned n×n mixing matrix kept doubly stochastic by Sinkhorn
+iterations, plus a one-hot init and jitter so the streams do not collapse into
+copies of each other.
+
+**Solution.** Keep the n branches, drop the mixing. Qwen's ablation found the
+mixing operator "adds little" once the read and write are expressive enough,
+so GR spends the budget there: each branch is RMS-normalised with its own gain,
+a low-rank bottleneck over all branches produces an elementwise sigmoid gate,
+and the sublayer sees the mean of the gated branches. The output is written
+back with one scalar per branch in (0, 2). The read replaces pre-norm, so a
+GR block has no norm of its own. Ordinary init works: the branches start as
+copies of the embedding and the write scalars separate them from step one.
+Reported loss 1.590 against 1.594 for dynamic mHC and 1.617 for a plain
+residual at 25B-A3B.
+
+Both live in `components.py` as `--residual mhc` and `--residual gr`, so the
+disagreement between the two labs is a one-flag experiment.
 
 ### PLE — Per-Layer Embeddings
 **Paper:** Gemma 4 (Google, 2026), arXiv 2607.02770.
