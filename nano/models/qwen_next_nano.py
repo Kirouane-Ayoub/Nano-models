@@ -44,6 +44,7 @@ Usage:
     python -m nano.models.qwen_next_nano --mtp-weight 0                   # disable multi-token prediction
     python -m nano.models.qwen_next_nano --short-conv 4                   # ShortConv on Q/K/V (Kimi Linear)
     python -m nano.models.qwen_next_nano --ratio 1 --kv-share 1           # last attn layer reuses K/V (Gemma 4)
+    python -m nano.models.qwen_next_nano --config configs/deepseek_v41_ced.json  # causal encoder-decoder KV (V4.1)
     python -m nano.models.qwen_next_nano --posenc nope                    # drop RoPE
     python -m nano.models.qwen_next_nano --norm sandwich                  # post-norm too (Gemma)
     python -m nano.models.qwen_next_nano --engram-dim 16                  # hashed n-gram memory (DeepSeek)
@@ -55,6 +56,8 @@ Usage:
     python -m nano.models.qwen_next_nano --linear mamba2                  # Nemotron 3 layout (Mamba-2 + attention)
     python -m nano.models.qwen_next_nano --linear kda --attn mla          # Kimi Linear's pairing
     python -m nano.models.qwen_next_nano --attn mla --dsa-top-k 64 --index-share 2  # DSA + IndexShare (MiniMax)
+    python -m nano.models.qwen_next_nano --ratio 0 --attn mla --dsa-top-k 8 --candidate-top-k 32 --index-modes full,reindex,reuse,reuse  # V4.1 hierarchy at nano scale
+    python -m nano.models.qwen_next_nano --ratio 0 --kv-sources=-,-,0,1  # two KV owners, two readers
     python -m nano.models.qwen_next_nano --config configs/qwen_flash_next.json  # Qwen3.8-Flash-Next recipe
     python -m nano.models.qwen_next_nano --residual mhc                   # 4 hyper-connected residual streams
     python -m nano.models.qwen_next_nano --ple-dim 16                     # per-layer embeddings (Gemma 4)
@@ -261,11 +264,21 @@ class GatedMLA(nn.Module):
     implementation; it does not establish equivalence to that architecture.
     """
 
-    def __init__(self, cfg, share_indexer_from=None):
+    def __init__(self, cfg, share_indexer_from=None, index_mode=None):
         super().__init__()
         d, self.n_heads, self.head_dim = cfg["emb_dim"], cfg["n_heads"], cfg["head_dim"]
         self.d_out = self.n_heads * self.head_dim
         self.latent_dim = cfg.get("latent_dim", d // 4)
+        # Hierarchical indexer (DeepSeek-V4.1 CSA2): "full" indexes every key and
+        # also emits a wider candidate pool; "reindex" has its own indexer but
+        # selects only inside the nearest earlier full layer's pool; "reuse" takes
+        # that layer's selection as-is (IndexShare). The full layer is always
+        # earlier, so its pool and keep exist by the time this layer runs.
+        # This implementation scores all keys before masking to the pool; it
+        # demonstrates the selection rule without reducing indexer compute.
+        self.index_mode = index_mode or ("reuse" if share_indexer_from is not None else "full")
+        self.candidate_top_k = cfg.get("candidate_top_k", 0)
+        self.last_pool = None  # (B, T_q, T_k) bool candidate pool, full layers only
         # DSA on top: a lightning indexer keeps the top-k keys per query. With
         # IndexShare (MiniMax) one layer owns the indexer and the others in its
         # group reuse the *selection* it made this forward — the owner runs
@@ -273,7 +286,7 @@ class GatedMLA(nn.Module):
         # module is registered (and counted, and optimised) once.
         self.top_k = cfg.get("dsa_top_k", 0)
         self._index_owner = [share_indexer_from] if share_indexer_from is not None else None
-        if self.top_k and self._index_owner is None:
+        if self.top_k and self.index_mode != "reuse":
             self.indexer = LightningIndexer(
                 d, self.latent_dim, cfg.get("index_dim", 32), cfg.get("index_heads", 2)
             )
@@ -318,14 +331,22 @@ class GatedMLA(nn.Module):
         attn = attn.masked_fill(causal, float("-inf"))
         self.aux_index_loss = None
         if self.top_k:
-            if self._index_owner is None:
+            if self.index_mode == "reuse":
+                self.last_keep = self._index_owner[0].last_keep  # decided earlier this forward
+            else:
                 scores = self.indexer.scores(x, latent)
-                self.last_keep = self.indexer.select(scores, causal, self.top_k)
+                forbidden = causal
+                if self.index_mode == "reindex":
+                    pool = self._index_owner[0].last_pool
+                    if pool is not None:  # None = short sequence, the pool is everything
+                        forbidden = forbidden | ~pool
+                        attn = attn.masked_fill(~pool.unsqueeze(1), float("-inf"))
+                self.last_keep = self.indexer.select(scores, forbidden, self.top_k)
+                if self.index_mode == "full" and self.candidate_top_k:
+                    self.last_pool = self.indexer.select(scores, causal, self.candidate_top_k)
                 if self.training:
                     dense = torch.softmax(attn, dim=-1)
-                    self.aux_index_loss = self.indexer.loss(scores, dense, causal)
-            else:
-                self.last_keep = self._index_owner[0].last_keep  # decided earlier this forward
+                    self.aux_index_loss = self.indexer.loss(scores, dense, forbidden)
             if self.last_keep is not None:
                 attn = attn.masked_fill(~self.last_keep.unsqueeze(1), float("-inf"))
         attn = self.dropout(torch.softmax(attn, dim=-1))
@@ -418,7 +439,7 @@ class HybridBlock(nn.Module):
     values or the final output scale. Two extra vectors per layer.
     """
 
-    def __init__(self, cfg, kind, kv_donor=None, index_owner=None):
+    def __init__(self, cfg, kind, kv_donor=None, index_owner=None, index_mode=None):
         super().__init__()
         self.is_attn = kind == "attn"
         self.norm1 = RMSNorm(cfg["emb_dim"])
@@ -426,7 +447,7 @@ class HybridBlock(nn.Module):
             # Gated attention: qwen_nano's GQA + the output gate, or gated MLA.
             gated = {**cfg, "attn_out_gate": True}
             if cfg.get("attn", "gqa") == "mla":
-                self.attn = GatedMLA(cfg, share_indexer_from=index_owner)
+                self.attn = GatedMLA(cfg, share_indexer_from=index_owner, index_mode=index_mode)
             elif cfg.get("attn", "gqa") == "qsa":
                 self.attn = GatedQSA(cfg)
             else:
@@ -531,42 +552,71 @@ class QwenNextNano(nn.Module):
 
         if cfg.get("attn", "gqa") not in ("gqa", "mla", "qsa"):
             raise ValueError(f"attn={cfg['attn']!r} must be 'gqa', 'mla' or 'qsa'")
-        if cfg.get("attn", "gqa") != "gqa" and cfg.get("kv_share", 0):
-            raise ValueError("kv_share is a GQA-only mechanism — use attn=gqa")
+        if cfg.get("attn", "gqa") != "gqa" and (cfg.get("kv_share", 0) or cfg.get("kv_sources")):
+            raise ValueError("KV sharing (kv_share / kv_sources) is a GQA-only mechanism — use attn=gqa")
         if cfg.get("dsa_top_k", 0) and cfg.get("attn", "gqa") != "mla":
             raise ValueError("dsa_top_k needs attn=mla: the lightning indexer scores the MLA latent")
         if cfg.get("index_share", 1) > 1 and not cfg.get("dsa_top_k", 0):
             raise ValueError("index_share groups DSA indexers; set dsa_top_k > 0 as well")
-        # KV sharing: the last `kv_share` attention layers reuse K/V from the most
-        # recent earlier attention layer that computes its own (Gemma 4).
-        attn_positions = [i for i, k in enumerate(self.pattern) if k == "attn"]
-        share_from = (
-            set(attn_positions[len(attn_positions) - cfg.get("kv_share", 0) :])
-            if cfg.get("kv_share", 0)
-            else set()
-        )
-        if share_from and len(share_from) >= len(attn_positions):
-            raise ValueError(
-                f"kv_share={cfg['kv_share']} leaves no donor layer "
-                f"({len(attn_positions)} attention layers exist)"
-            )
+        n_attn = sum(1 for k in self.pattern if k == "attn")
+        modes = cfg.get("index_modes")
+        if modes is not None:
+            if not cfg.get("dsa_top_k", 0):
+                raise ValueError("index_modes configures DSA indexers; set dsa_top_k > 0 as well")
+            if len(modes) != n_attn:
+                raise ValueError(f"index_modes has {len(modes)} entries for {n_attn} attention layers")
+            if modes[0] != "full" or any(m not in ("full", "reindex", "reuse") for m in modes):
+                raise ValueError("index_modes must start with 'full' and use only full/reindex/reuse")
+            if "reindex" in modes and cfg.get("candidate_top_k", 0) < cfg["dsa_top_k"]:
+                raise ValueError("reindex needs candidate_top_k >= dsa_top_k: the pool must hold the top-k")
+        elif cfg.get("dsa_top_k", 0):
+            share = cfg.get("index_share", 1)  # IndexShare as a mode list: full, then reuse
+            modes = ["full" if j % share == 0 else "reuse" for j in range(n_attn)]
+        self.index_modes = modes
+        # KV sharing. `kv_sources[j]` names the attention layer (in attention
+        # order) whose K/V attention layer j reads, or None for its own. Gemma 4's
+        # `kv_share=N` is the special case "the last N read from the last owner";
+        # DeepSeek-V4.1's causal encoder-decoder is 20 decoder layers reading
+        # from four encoder layers. A source must be earlier and own its K/V.
+        n_kv = sum(1 for k in self.pattern if k == "attn")
+        kv_sources, kv_share = cfg.get("kv_sources"), cfg.get("kv_share", 0)
+        if kv_sources is not None and kv_share:
+            raise ValueError("give kv_sources or kv_share, not both")
+        if kv_sources is None and kv_share:
+            if kv_share >= n_kv:
+                raise ValueError(f"kv_share={kv_share} leaves no donor layer ({n_kv} attention layers exist)")
+            kv_sources = [None] * (n_kv - kv_share) + [n_kv - kv_share - 1] * kv_share
+        if kv_sources is not None:
+            if len(kv_sources) != n_kv:
+                raise ValueError(f"kv_sources has {len(kv_sources)} entries for {n_kv} attention layers")
+            for j, src in enumerate(kv_sources):
+                if src is None:
+                    continue
+                if not 0 <= src < j:
+                    raise ValueError(f"kv_sources[{j}]={src} must name an earlier attention layer")
+                if kv_sources[src] is not None:
+                    raise ValueError(f"kv_sources[{j}]={src} names a layer that itself borrows K/V")
+        self.kv_sources = kv_sources
 
         self.blocks = nn.ModuleList()
-        donor = None
-        # IndexShare: attention layers in groups of `index_share`; the first of
-        # each group owns the DSA indexer, the rest reuse its selection.
-        share, index_owner, attn_seen = cfg.get("index_share", 1), None, 0
+        # Indexer hierarchy: every "full" attention layer owns an indexer and a
+        # pool; the "reindex" and "reuse" layers after it point back to it.
+        index_owner, attn_seen, attn_built = None, 0, []
         for i, kind in enumerate(self.pattern):
-            owner = None
-            if kind == "attn" and cfg.get("dsa_top_k", 0) and share > 1 and attn_seen % share:
-                owner = index_owner
-            block = HybridBlock(cfg, kind, kv_donor=donor if i in share_from else None, index_owner=owner)
+            owner = mode = kv_donor = None
             if kind == "attn":
-                if owner is None:
+                if self.index_modes is not None:
+                    mode = self.index_modes[attn_seen]
+                    if mode != "full":
+                        owner = index_owner
+                if self.kv_sources is not None and self.kv_sources[attn_seen] is not None:
+                    kv_donor = attn_built[self.kv_sources[attn_seen]]
+            block = HybridBlock(cfg, kind, kv_donor=kv_donor, index_owner=owner, index_mode=mode)
+            if kind == "attn":
+                if mode in (None, "full"):
                     index_owner = block.attn
                 attn_seen += 1
-                if i not in share_from:
-                    donor = block.attn
+                attn_built.append(block.attn)
             self.blocks.append(block)
         self.norm = RMSNorm(cfg["emb_dim"])
         self.head = nn.Linear(cfg["emb_dim"], cfg["vocab_size"], bias=False)
@@ -891,6 +941,77 @@ def self_check():
             pass
     print(f"  dsa/share ok — top-{cfg_d['dsa_top_k']} indexer on MLA bites, aux loss flows, decode exact; "
           f"index_share=2 → 1 indexer for 2 layers, identical selection")
+
+    # KV source layers (DeepSeek-V4.1's causal encoder-decoder): each attention
+    # layer may name an earlier layer whose K/V it reads instead of its own.
+    # `kv_share` is the special case "the last N borrow from the previous owner";
+    # a source list expresses 20 decoder layers reading from 4 encoder layers.
+    srcs = [None, 0, None, 2]  # 4 attention layers: 1 reads 0's K/V, 3 reads 2's
+    cfg_s, ced = build(hybrid_ratio=1, n_layers=8, kv_sources=srcs)
+    attn_l = [b.attn for b in ced.blocks if b.is_attn]
+    assert [isinstance(a, SharedKVAttention) for a in attn_l] == [False, True, False, True]
+    assert attn_l[1].donor[0] is attn_l[0] and attn_l[3].donor[0] is attn_l[2], "wrong donor wiring"
+    assert ced.own_kv_layers() == 2 and ced.kv_layers() == 4
+    probe = torch.randint(0, cfg_s["vocab_size"], (2, 12))
+    _, own = build(hybrid_ratio=1, n_layers=8)
+    assert not torch.allclose(ced(probe), own(probe)), "kv_sources is a no-op"
+    check_incremental(ced, cfg_s["vocab_size"])
+    a, b = probe.clone(), probe.clone()
+    b[:, 6] = (b[:, 6] + 1) % cfg_s["vocab_size"]
+    torch.testing.assert_close(ced(a)[:, :6], ced(b)[:, :6])
+    for bad in (
+        {"kv_sources": [None, 2, None, None]},  # source is later than the reader
+        {"kv_sources": [None, 0, 1, None]},  # source is itself a borrower
+        {"kv_sources": [None, 0]},  # wrong length
+        {"kv_sources": srcs, "kv_share": 1},  # two ways to say it
+        {"kv_sources": srcs, "attn": "mla"},  # GQA-only mechanism
+    ):
+        try:
+            build(hybrid_ratio=1, n_layers=8, **bad)
+            raise AssertionError(f"{bad} should be refused")
+        except ValueError:
+            pass
+    print("  kv_sources ok — [None, 0, None, 2]: layers 1 and 3 read encoders 0 and 2, 2/4 own K/V, decode exact")
+
+    # Hierarchical indexer (DeepSeek-V4.1's CSA2): attention layers run in one of
+    # three modes. `full` indexes every key, keeps top-k and also emits a wider
+    # candidate pool; `reindex` selects with its own indexer inside the nearest
+    # earlier pool; `reuse` takes that layer's selection outright. Indexer cost
+    # remains context-sized here: this dense simulation masks after scoring.
+    modes = ["full", "reindex", "reuse"]
+    cfg_h, hier = build(attn="mla", hybrid_ratio=1, n_layers=6, dsa_top_k=3, candidate_top_k=6, index_modes=modes)
+    probe = torch.randint(0, cfg_h["vocab_size"], (2, 12))
+    hier.eval()
+    hier(probe)
+    full_l, re_l, reuse_l = [b.attn for b in hier.blocks if b.is_attn]
+    assert hasattr(full_l, "indexer") and hasattr(re_l, "indexer") and not hasattr(reuse_l, "indexer")
+    pool, keep = full_l.last_pool, full_l.last_keep
+    assert pool is not None and (pool.sum(-1) <= 6).all() and (keep.sum(-1) <= 3).all()
+    assert not (keep & ~pool).any(), "full layer's keep must lie inside its own pool"
+    assert not (re_l.last_keep & ~pool).any(), "reindex layer selected outside the candidate pool"
+    assert re_l.last_keep is not keep, "reindex layer must decide for itself"
+    assert reuse_l.last_keep is keep, "reuse layer must take the full layer's selection"
+    check_incremental(hier, cfg_h["vocab_size"])
+    a, b = probe.clone(), probe.clone()
+    b[:, 6] = (b[:, 6] + 1) % cfg_h["vocab_size"]
+    torch.testing.assert_close(hier(a)[:, :6], hier(b)[:, :6])
+    hier.train()
+    _, aux_h = hier(probe)
+    assert torch.isfinite(aux_h)
+    n_idx = sum(1 for m in hier.modules() if isinstance(m, LightningIndexer))
+    assert n_idx == 2, n_idx
+    for bad in (
+        {"index_modes": ["reindex", "full", "reuse"]},  # first must be full
+        {"index_modes": ["full", "reuse"]},  # wrong length
+        {"index_modes": modes, "candidate_top_k": 2},  # pool smaller than top-k
+    ):
+        try:
+            build(attn="mla", hybrid_ratio=1, n_layers=6, dsa_top_k=3, **{"candidate_top_k": 6, **bad})
+            raise AssertionError(f"{bad} should be refused")
+        except ValueError:
+            pass
+    print(f"  hier idx  ok — modes {modes}: pool ≤6 ⊇ keep ≤3, reindex inside pool, reuse identical, "
+          f"{n_idx} indexers for 3 layers, decode exact")
 
     # QSA in the attention slot (Qwen3.8-Flash-Next pairs it with Gated DeltaNet
     # at 3:1). Gated GQA with RoPE plus the block indexer: must bite, decode
@@ -1356,6 +1477,20 @@ def main():
         help="With --attn mla: DSA lightning indexer keeps the top-K keys per query (0 = dense)",
     )
     parser.add_argument(
+        "--index-modes",
+        type=lambda v: v.split(","),
+        default=None,
+        metavar="full,reindex,reuse,...",
+        help="Per-attention-layer indexer mode (DeepSeek-V4.1 CSA2). Overrides --index-share.",
+    )
+    parser.add_argument(
+        "--candidate-top-k",
+        type=int,
+        default=0,
+        metavar="K",
+        help="Pool size a 'full' layer emits for later 'reindex' layers (V4.1: 2048 blocks)",
+    )
+    parser.add_argument(
         "--index-share",
         type=int,
         default=1,
@@ -1408,6 +1543,15 @@ def main():
         default=0,
         metavar="N",
         help="Last N attention layers reuse an earlier layer's K/V (Gemma 4)",
+    )
+    parser.add_argument(
+        "--kv-sources",
+        type=lambda v: [None if t.strip() in ("-", "x", "none") else int(t) for t in v.split(",")],
+        default=None,
+        metavar="-,-,0,1",
+        help="Per attention layer: '-' own K/V, or the index of the earlier attention layer to read "
+        "(use --kv-sources=-,-,0,1 when the list starts with '-'). "
+        "(DeepSeek-V4.1 encoder-decoder). Replaces --kv-share.",
     )
     parser.add_argument(
         "--posenc",
@@ -1536,12 +1680,15 @@ def main():
         "qsa_top_k": args.qsa_top_k,
         "dsa_top_k": args.dsa_top_k,
         "index_share": args.index_share,
+        "index_modes": args.index_modes,
+        "candidate_top_k": args.candidate_top_k,
         "window_size": args.window,
         "hybrid_ratio": args.ratio,
         "mtp_weight": args.mtp_weight,
         "mod_capacity": args.mod_capacity,
         "short_conv": args.short_conv,
         "kv_share": args.kv_share,
+        "kv_sources": args.kv_sources,
         "pos_enc": args.posenc,
         "norm_style": args.norm,
         "logit_softcap": args.logit_softcap,
@@ -1560,12 +1707,15 @@ def main():
         ("qsa_top_k", "--qsa-top-k", args.qsa_top_k),
         ("dsa_top_k", "--dsa-top-k", args.dsa_top_k),
         ("index_share", "--index-share", args.index_share),
+        ("index_modes", "--index-modes", args.index_modes),
+        ("candidate_top_k", "--candidate-top-k", args.candidate_top_k),
         ("window_size", "--window", args.window),
         ("hybrid_ratio", "--ratio", args.ratio),
         ("mtp_weight", "--mtp-weight", args.mtp_weight),
         ("mod_capacity", "--mod-capacity", args.mod_capacity),
         ("short_conv", "--short-conv", args.short_conv),
         ("kv_share", "--kv-share", args.kv_share),
+        ("kv_sources", "--kv-sources", args.kv_sources),
         ("pos_enc", "--posenc", args.posenc),
         ("norm_style", "--norm", args.norm),
         ("logit_softcap", "--logit-softcap", args.logit_softcap),
@@ -1612,6 +1762,7 @@ def main():
         + (f", DSA top-{cfg['dsa_top_k']}" if cfg.get("dsa_top_k", 0) else "")
         + (f", {cfg['qsa_block']}-token blocks top-{cfg['qsa_top_k']}" if cfg.get("attn") == "qsa" else "")
         + (f", indexer shared x{cfg['index_share']}" if cfg.get("index_share", 1) > 1 else "")
+        + (f", indexer modes {'/'.join(cfg['index_modes'])}" if cfg.get("index_modes") else "")
         + ")"
     )
     log(
@@ -1622,7 +1773,12 @@ def main():
         log(f"MTP: weight {cfg['mtp_weight']}, {model.mtp_params():,} training-only params")
     log(
         f"Components: posenc={cfg['pos_enc']}, norm={cfg.get('norm_style', 'pre')}, short_conv={cfg['short_conv'] or 'off'}, "
-        f"kv_share={cfg['kv_share'] or 'off'} ({model.own_kv_layers()} layers own their KV), "
+        + (
+            f"kv_sources={[('-' if v is None else v) for v in cfg['kv_sources']]} "
+            if cfg.get("kv_sources")
+            else f"kv_share={cfg['kv_share'] or 'off'} "
+        )
+        + f"({model.own_kv_layers()} layers own their KV), "
         f"residual={cfg['residual']}"
         + (f" x{model.mhc_streams} streams" if model.mhc_streams else "")
         + (f", ple={cfg['ple_dim']}d" if model.ple is not None else "")
