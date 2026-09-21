@@ -108,9 +108,13 @@ class Muon(torch.optim.Optimizer):
 
 
 def _is_block_matrix(name, p):
-    """2-D, and not an embedding or LM head. Those two are tied in every model
-    here and behave like lookup tables, which Muon's per-row scaling gets wrong."""
-    return p.ndim == 2 and not any(k in name for k in ("emb", "head", "table"))
+    """Block matrices, excluding lookup tables and normalization gains.
+
+    GR packs independent per-branch RMSNorm gains into a 2-D tensor; its
+    shape does not make it a matrix projection suitable for Muon.
+    """
+    return (p.ndim == 2 and name.rsplit(".", 1)[-1] != "gain"
+            and not any(k in name for k in ("emb", "head", "table")))
 
 
 def build_optimizer(model, settings, optimizer_state=None):
@@ -272,6 +276,22 @@ def _self_test():
     adam.step()
     restored_adam = build_optimizer(copy.deepcopy(adam_model), settings.copy(), copy.deepcopy(adam.state_dict()))
     assert type(restored_adam) is torch.optim.AdamW, "saved AdamW state must override Muon selection"
+    # GR's packed normalization gains stay on AdamW, including when wrapped.
+    # Compare their actual update with standalone AdamW, not just group labels.
+    from nano.components import GatedResidual
+
+    gr = nn.Sequential(GatedResidual(16))
+    gr_opt = build_optimizer(gr, settings)
+    muon_ids = {id(p) for g in gr_opt.param_groups if g["use_muon"] for p in g["params"]}
+    assert muon_ids == {id(gr[0].W_d.weight), id(gr[0].W_u.weight), id(gr[0].W_w.weight)}
+    gain_ref = nn.Parameter(gr[0].gain.detach().clone())
+    ref_opt = torch.optim.AdamW([gain_ref], lr=settings["learning_rate"], weight_decay=settings["weight_decay"])
+    grad = torch.randn_like(gain_ref)
+    gr[0].gain.grad, gain_ref.grad = grad.clone(), grad.clone()
+    gr_opt.step()
+    ref_opt.step()
+    torch.testing.assert_close(gr[0].gain, gain_ref)
+    print("  GR gains      ok — projections on Muon, normalization gains match AdamW update")
     print("optim self-test passed")
 
 
