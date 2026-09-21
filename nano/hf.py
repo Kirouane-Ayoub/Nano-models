@@ -134,6 +134,15 @@ class NanoForCausalLM(PreTrainedModel):
     # ... and so it is expected to be absent on load, not reported as missing.
     _keys_to_ignore_on_load_missing = ["model.head.weight"]
 
+    @classmethod
+    def from_pretrained(cls, *args, **kwargs):
+        # HF loads tensors directly, bypassing DSA's PyTorch load hook.
+        # Match only the old attention-local names, not existing indexer keys.
+        kwargs.setdefault("key_mapping", {
+            r"\.attn\.(W_iq|W_ik|W_iw)\.weight$": r".attn.indexer.\1.weight",
+        })
+        return super().from_pretrained(*args, **kwargs)
+
     def __init__(self, config):
         super().__init__(config)
         cls, _, _ = ARCHITECTURES[config.arch]
@@ -356,6 +365,29 @@ def _self_check():
         torch.testing.assert_close(again.model.engram.mult, hf.model.engram.mult)
         torch.testing.assert_close(again(input_ids=ids).logits, expected)
     print("  engram                      ok — hash mapping and active memory survive reload")
+
+    # DSA checkpoints from before the indexer extraction must preserve routing
+    # through both native strict loading and HF's direct tensor-loading path.
+    cfg = build_nano_cfg("gpt", vocab_size=V, drop_rate=0.0, attention="dsa", top_k=4)
+    hf = NanoForCausalLM(NanoConfig(arch="gpt", nano=cfg)).eval()
+    with torch.no_grad():
+        expected = hf(input_ids=ids).logits
+        current = hf.state_dict()
+        legacy = {k.replace(".attn.indexer.", ".attn."): v for k, v in current.items()}
+        native = NanoForCausalLM(hf.config).eval()
+        native.load_state_dict(legacy, strict=True)
+        for key, value in current.items():
+            torch.testing.assert_close(native.state_dict()[key], value)
+        torch.testing.assert_close(native(input_ids=ids).logits, expected)
+        for state in (legacy, current):
+            with tempfile.TemporaryDirectory() as d:
+                hf.save_pretrained(d, state_dict=state)
+                again, info = NanoForCausalLM.from_pretrained(d, output_loading_info=True)
+                assert not info["missing_keys"] and not info["unexpected_keys"], info
+                for key, value in current.items():
+                    torch.testing.assert_close(again.state_dict()[key], value)
+                torch.testing.assert_close(again(input_ids=ids).logits, expected)
+    print("  DSA checkpoints             ok — legacy/current keys preserve weights and sparse logits")
 
     print("hf adapter self-check passed")
 
