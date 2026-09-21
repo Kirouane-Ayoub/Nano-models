@@ -1,5 +1,5 @@
 {
-  "_comment": "Qwen3.8-Flash-Next's recipe at nano scale: 3 Gated DeltaNet : 1 Qwen Sparse Attention, n-gram (Engram) memory after block 1, MTP. The real model routes its FFN through a 512-expert MoE; this hybrid has a dense SwiGLU, so that part is not represented.",
+  "_comment": "Qwen3.8-Flash-Next's recipe at nano scale: 3 Gated DeltaNet : 1 Qwen Sparse Attention, n-gram (Engram) memory after block 1, Gated Residual with 4 branches, MTP. The real model routes its FFN through a 512-expert MoE; this hybrid has a dense SwiGLU, so that part is not represented.",
   "size": "nano",
   "seed": 42,
   "model": {
@@ -10,7 +10,9 @@
     "qsa_top_k": 8,
     "engram_dim": 16,
     "engram_layer": 1,
-    "mtp_weight": 0.3
+    "mtp_weight": 0.3,
+    "residual": "gr",
+    "gr_branches": 4
   },
   "train": {
     "num_epochs": 40,
