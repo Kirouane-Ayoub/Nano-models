@@ -36,6 +36,7 @@ independent — read the ones you need.
 | MoE + shared expert | `num_experts` in config | `nano/models/deepseek_nano.py` |
 | Aux-loss-free balancing | `--balance-speed 1e-3` | `nano/models/deepseek_nano.py` |
 | Sigmoid routing | `--router sigmoid` | `nano/models/deepseek_nano.py` |
+| Expert-choice routing | `--routing expert` | `nano/models/deepseek_nano.py` |
 | LatentMoE | `--moe-latent-dim D` | `nano/models/deepseek_nano.py` |
 
 ---
@@ -388,6 +389,27 @@ built into the scoring. DeepSeek-V3 made this switch alongside aux-loss-free
 balancing, and the two are usually adopted together. In this repo it is one
 method on the router with the same output shape and sum as softmax.
 
+### Expert-choice routing
+**Paper:** *Mixture-of-Experts with Expert Choice Routing* (Google, 2022), arXiv 2202.09368.
+
+**Problem.** When tokens pick experts, nothing stops every token from picking
+the same two. Load balancing then has to be enforced from outside — an
+auxiliary loss, or DeepSeek-V3's selection bias.
+
+**Solution.** Turn the choice around: each expert picks its top `capacity`
+tokens, with `capacity = N·k / E` so the total work matches token choice.
+Every expert processes exactly the same number of tokens by construction, and
+a token can be taken by several experts or by none (the residual carries it).
+No balancing machinery at all.
+
+**The catch, and why decoders did not adopt it.** The top-k runs over the
+token axis, across the whole sequence. Whether expert e takes token t depends
+on how strongly later tokens compete for e, so the routing reads the future.
+Harmless in an encoder, disqualifying in an autoregressive LM: the self-check
+asserts the leak rather than hiding it. This is why DeepSeek kept token choice
+and fixed balance with the bias instead. Read it as the contrast, not a
+recommendation.
+
 ### Shared expert
 **Paper:** DeepSeek-V2 / V3.
 
@@ -564,5 +586,6 @@ directly whether it was doing its job.
 | **Looped KV cache** | A weight-shared core applied *r* times needs *r* KV caches. With one, iteration 3 of the current token attends to iteration 1's keys of earlier tokens; prefill and one-token decode then disagree by ~1e-1 while training is unaffected. `looped_nano` keeps a cache slot per iteration, and its self-check asserts the incremental test *fails* when the slots are shared. |
 | **SWA cache trimmed before attending** | The sliding-window cache was cut to the window *before* the attention step. A cached prefill longer than the window then gave its early queries nothing but future keys: all-masked rows, softmax of −∞, NaN. Every decode step after the prefill still matched the full forward exactly, so the zoo test passed. It surfaced only when SWA went into the hybrid model, where the NaN prefill output is the next layer's input. The zoo test now compares the prefill output too. |
 | **Trimmed cache that still holds the prefill** | Sliding-window caches were trimmed with a bare slice, `cache[:, :, -w:]`. The shape said w tokens; the storage still held the entire prefill, because a slice keeps its base tensor alive. Every shape and equivalence test passed. Only asserting on `untyped_storage().nbytes()` catches it, and `.clone()` on the slice fixes it. Same fix in the zoo's SWA and in `gemma_nano`. |
+| **Expert choice is non-causal** | Expert-choice routing picks each expert's top tokens over the whole sequence, so which experts process token t depends on tokens after t. A decoder trained with it reads the future through its routing and the loss looks *better*, not broken. The MoE self-check asserts the leak exists, so nobody mistakes the flag for a free balancing fix. |
 | **fp32 buffers in a half-precision matmul** | `module.to(torch.float16)` casts parameters and buffers, but not tensors *computed* from them. Lightning's decay mask came from an fp32 `arange`, stayed fp32, and the `(QKᵀ ⊙ decay) @ V` matmul raised a dtype mismatch. Invisible under autocast, which the training path always uses; only explicit `.to(dtype)` inference hit it. Every zoo entry now passes an fp16/bf16 forward without autocast. |
 | **Init RNG shifts** | Comparing "same model with and without component X" is invalid if X adds modules: it changes how much RNG the weight init consumes, so every weight differs. Detach the component from one model instead. |
