@@ -4,7 +4,7 @@ Minimal, from-scratch PyTorch implementations of modern LLM architectures, built
 
 The goal is not to be fast or competitive — it's to make each architectural idea (attention variant, normalization, position encoding, MoE routing, …) easy to read end-to-end in one file.
 
-**[docs/ARCHITECTURES.md](./docs/ARCHITECTURES.md)** is the guide to every component: the problem it was invented to solve, how it solves it, its paper, and the implementation gotchas that aren't in any paper. **[docs/ROADMAP.md](./docs/ROADMAP.md)** is what's open next and what blocks it.
+**[docs/ARCHITECTURES.md](./docs/ARCHITECTURES.md)** is the guide to every component: the problem it was invented to solve, how it solves it, its paper, and the implementation gotchas that aren't in any paper. **[docs/TIMELINE.md](./docs/TIMELINE.md)** puts every component in publication order with its paper. **[docs/ROADMAP.md](./docs/ROADMAP.md)** is what's open next and what blocks it.
 
 ---
 
@@ -342,6 +342,7 @@ nano-models/
 │       └── looped_nano.py      # Huginn / Ouro depth recurrence
 ├── configs/                # worked example configs
 ├── docs/ARCHITECTURES.md   # every component: problem, solution, paper
+├── docs/TIMELINE.md        # the same components in publication order
 └── the-verdict.txt         # tiny training corpus (downloaded on first run)
 ```
 
