@@ -68,6 +68,7 @@ There is no pytest suite. Each file self-tests:
 
 ```bash
 python -m nano.attention_zoo                  # all attention variants (~1 min)
+python -m nano.models.gpt_nano --self-check           # block wiring, cached decode
 python -m nano.models.qwen_next_nano --self-check     # hybrid components, init properties
 python -m nano.models.qwen_next_nano --train-check    # what only gradients reveal (~30s)
 python -m nano.models.deepseek_nano --self-check      # MoE routing and load balancing
