@@ -18,6 +18,7 @@ Supported types:
     - ssmax:    GQA with logits scaled by s·log(n), Scalable Softmax (2025)
     - swa:      Sliding Window Attention (Mistral, Gemma)
     - moba:     Mixture of Block Attention — own block + top-k past blocks by mean key (Moonshot)
+    - qsa:      Qwen Sparse Attention — trained indexer over 4-token micro-blocks (Qwen3.8-Flash-Next)
     - deltanet: Gated DeltaNet linear attention (Qwen3-Next)
     - kda:      Kimi Delta Attention — DeltaNet with per-channel decay (Kimi Linear)
     - mamba2:   Mamba-2 SSD state space, scalar decay per head (Nemotron 3); Mamba-3 flags
@@ -308,6 +309,124 @@ class MixtureOfBlockAttention(GroupedQueryAttention):
         k = self.W_key(x).view(B, T, self.n_kv_groups, self.head_dim).transpose(1, 2)
         pos = torch.arange(T, device=x.device)
         return ~self._mask(q, k.repeat_interleave(self.group_size, dim=1), pos, pos)
+
+
+def qsa_select(iq, iw, ik, q_pos, k_pos, block, top_k):
+    """QSA's block selection, shared by the zoo entry and the hybrid's slot.
+
+    iq (B, T_q, heads, dim), iw (B, T_q, heads): indexer queries and head weights.
+    ik (B, T_k, dim): one index key per key position. Returns
+      allowed   (B, T_q, T_k) bool — keys the query may read (before causality)
+      scores    (B, T_q, n_blocks)  — indexer score per block
+      candidate (T_q, n_blocks) bool — closed blocks before the query's own
+      kb        (T_k,)               — block id of each key
+    Own partial block is always allowed; ties break towards recent blocks so a
+    prefill and a one-token decode pick the same blocks."""
+    B, T_q = iq.shape[:2]
+    kb, qb = k_pos // block, q_pos // block
+    n_blocks = int(kb.max()) + 1
+    sums = ik.new_zeros(B, n_blocks, ik.shape[-1]).index_add_(1, kb, ik)
+    counts = torch.bincount(kb, minlength=n_blocks).clamp(min=1).to(sums.dtype)
+    bkeys = F.normalize(sums / counts[:, None], dim=-1)  # mean index key per block, unit norm
+    scores = (F.relu(torch.einsum("bthd,bnd->bthn", iq, bkeys)) * iw.unsqueeze(-1)).sum(dim=2)
+    blocks = torch.arange(n_blocks, device=iq.device)
+    candidate = blocks.unsqueeze(0) < qb.unsqueeze(-1)
+    selected = torch.zeros_like(scores, dtype=torch.bool)
+    k_sel = min(top_k, n_blocks)
+    if k_sel > 0:
+        ranked = (scores + blocks * 1e-6).masked_fill(~candidate, float("-inf"))
+        selected.scatter_(-1, ranked.topk(k_sel, dim=-1).indices, True)
+        selected &= candidate
+    selected |= blocks.unsqueeze(0) == qb.unsqueeze(-1)
+    return selected.gather(-1, kb.expand(B, T_q, -1)), scores, candidate, kb
+
+
+def qsa_index_loss(scores, candidate, dense, kb):
+    """DSA's indexer objective at block granularity: cross-entropy between the
+    indexer's block distribution and the dense attention summed per block.
+    `dense` is (B, T_q, T_k), head-averaged, already causal. Rows with no closed
+    block yet carry no signal and are skipped. Returns (loss, target)."""
+    B, T_q, n_blocks = scores.shape
+    with torch.no_grad():
+        target = dense.new_zeros(B, T_q, n_blocks).index_add_(2, kb, dense)
+        target = target.masked_fill(~candidate, 0.0)
+        rows = candidate.any(-1)
+    log_p = torch.log_softmax(scores.masked_fill(~candidate, float("-inf")), dim=-1)
+    ce = -(target * log_p.masked_fill(~candidate, 0.0)).sum(-1)
+    loss = ce[:, rows].mean() if rows.any() else scores.sum() * 0.0
+    return loss, target
+
+
+@register("qsa", "Qwen Sparse Attention — trained indexer over 4-token micro-blocks, attends uncompressed K/V (Qwen3.8-Flash-Next)")
+class QwenSparseAttention(GroupedQueryAttention):
+    """Block-sparse attention with a *trained* block indexer (Qwen3.8-Flash-Next,
+    Aug 2026). Sits exactly between two neighbours in this zoo:
+
+      - like MoBA, it selects whole blocks (4 tokens) and always keeps the
+        query's own partial block, so the diagonal is never unreachable;
+      - like DSA, the block score comes from a lightning indexer — a few ReLU
+        heads against a per-block key — trained against the dense attention,
+        not from the raw mean key.
+
+    The block key is the mean of the *index* keys in the block (equivalently
+    W_ik of the mean token, since W_ik is linear), L2-normalised. What is
+    attended is the original, uncompressed K/V of the selected positions: the
+    compression is on the index only. That is the deliberate difference from
+    CSA, which compresses what is attended too. Qwen ships 512 blocks (2,048
+    tokens) per query at 1M context with 4 indexer heads of dim 128.
+
+    ponytail: the indexer keys are not RoPE'd (this zoo has no RoPE), the
+    per-head indexer weights come free with `LightningIndexer` (Qwen's score is
+    an unweighted sum), and scores are dense-then-masked, so no speedup. The
+    indexer objective is DSA's, with the attention target summed per block.
+    """
+
+    def __init__(self, cfg):
+        super().__init__(cfg)
+        d = cfg["emb_dim"]
+        self.block = cfg.get("qsa_block", 4)
+        self.top_k = cfg.get("qsa_top_k", 512)
+        self.indexer = LightningIndexer(d, d, cfg.get("index_dim", 32), cfg.get("index_heads", 2))
+        self.register_buffer("cache_ik", None, persistent=False)
+        self.index_loss = None
+        self._iq = self._iw = self._ik = self.last_mask = None
+
+    def forward(self, x, use_cache=False):
+        B, T, _ = x.shape
+        ik = self.indexer.W_ik(x)  # (B, T, index_dim): one index key per token
+        if use_cache:
+            ik = ik if self.cache_ik is None else torch.cat([self.cache_ik, ik], dim=1)
+            self.cache_ik = ik
+        self._ik = ik
+        self._iq = self.indexer.W_iq(x).view(B, T, self.indexer.index_heads, self.indexer.index_dim)
+        self._iw = self.indexer.W_iw(x)  # (B, T, heads)
+        return super().forward(x, use_cache=use_cache)
+
+    def _mask(self, q, k, q_pos, k_pos):
+        hd = q.shape[-1]
+        causal = q_pos.unsqueeze(-1) < k_pos.unsqueeze(0)
+        allowed, scores, candidate, kb = qsa_select(
+            self._iq, self._iw, self._ik, q_pos, k_pos, self.block, self.top_k
+        )
+        self.index_loss = None
+        if self.training and self.top_k:
+            dense = torch.softmax(
+                ((q @ k.transpose(-2, -1)) / hd**0.5).masked_fill(causal, float("-inf")), dim=-1
+            ).mean(dim=1)
+            self.index_loss, self.last_block_target = qsa_index_loss(scores, candidate, dense, kb)
+        self.last_block_scores, self.last_candidate = scores, candidate
+        self.last_mask = causal | ~allowed.unsqueeze(1)  # (B, 1, T_q, T_k)
+        return self.last_mask
+
+    def allowed_keys(self, x):
+        """(B, H, T, T) bool: the keys each query reads on a plain forward."""
+        self(x)
+        return ~self.last_mask.expand(-1, self.n_heads, -1, -1)
+
+    def reset_cache(self):
+        super().reset_cache()
+        self.cache_ik = None
+        self.index_loss = None
 
 
 @register("gated", "Gated Attention — GQA + output gate, no attention sinks (Qwen3-Next, Qwen3.5)")
@@ -1597,6 +1716,64 @@ def _self_test():
         poked[:, cut:] += 10.0
         torch.testing.assert_close(m(poked)[:, :cut], out[:, :cut], atol=1e-5, rtol=1e-5)
     print(f"  moba      ok — all blocks == gqa, k=0 sees own block only, k=1 adds exactly one {blk}-key block")
+
+    # QSA (Qwen3.8-Flash-Next): MoBA-shaped selection of 4-token micro-blocks,
+    # but scored by a DSA-style trained indexer over *mean index keys*, and the
+    # attention itself reads the original uncompressed K/V. Anchors: every
+    # block selected == gqa; k=0 leaves only the current partial block; k=1 adds
+    # exactly one closed block; the indexer's aux loss trains it; chunked decode
+    # across block boundaries is exact and a future edit moves nothing.
+    ref = get_attention("gqa", cfg).eval()
+    qb = 4
+    for k, extra in ((100, None), (0, 0), (1, 1)):
+        m = get_attention("qsa", {**cfg, "qsa_block": qb, "qsa_top_k": k}).eval()
+        m.load_state_dict(ref.state_dict(), strict=False)
+        out = m(x)
+        assert torch.isfinite(out).all()
+        if extra is None:
+            torch.testing.assert_close(out, ref(x), atol=1e-5, rtol=1e-5)
+            continue
+        assert not torch.allclose(out, ref(x), atol=1e-3), f"qsa k={k} equals full attention"
+        pos = torch.arange(T)
+        want = (pos % qb) + 1 + extra * qb * (pos // qb > 0)  # tail so far + k closed blocks
+        torch.testing.assert_close(m.allowed_keys(x).sum(-1), want.expand(B, m.n_heads, T))
+        m.reset_cache()
+        chunks, start = [], 0
+        for end in (3, 17, 33, T):
+            chunks.append(m(x[:, start:end], use_cache=True))
+            start = end
+        torch.testing.assert_close(torch.cat(chunks, dim=1), out, atol=1e-4, rtol=1e-4)
+        poked = x.clone()
+        poked[:, 19:] += 10.0
+        torch.testing.assert_close(m(poked)[:, :19], out[:, :19], atol=1e-5, rtol=1e-5)
+    # The indexer is trained against the dense attention, aggregated per block, and
+    # must learn to *rank* blocks the way attention does. Unit-scale random input
+    # gives a nearly flat attention, so use scaled input for a peaked target.
+    m = get_attention("qsa", {**cfg, "qsa_block": qb, "qsa_top_k": 2}).train()
+    big = x * 20
+
+    def block_recall():
+        with torch.no_grad():
+            m(big)
+        cand, sc, tgt = m.last_candidate, m.last_block_scores, m.last_block_target
+        rows = cand.sum(-1) >= 3  # queries with more candidate blocks than k
+        true_top = tgt[:, rows].masked_fill(~cand[rows], -1.0).topk(2, -1).indices
+        idx_top = sc[:, rows].masked_fill(~cand[rows], float("-inf")).topk(2, -1).indices
+        return (true_top.unsqueeze(-1) == idx_top.unsqueeze(-2)).any(-1).float().mean().item()
+
+    before = block_recall()
+    opt = torch.optim.AdamW(m.indexer.parameters(), lr=1e-2)
+    for _ in range(200):
+        m(big)
+        loss = collect_aux_loss(m)
+        assert loss is not None and torch.isfinite(loss)
+        opt.zero_grad()
+        loss.backward()
+        opt.step()
+    after = block_recall()
+    assert after > before + 0.1, f"QSA indexer did not learn to rank blocks: {before:.0%} -> {after:.0%}"
+    print(f"  qsa       ok — all blocks == gqa, k=0 tail only, k=1 adds one {qb}-token block, "
+          f"indexer block recall@2 {before:.0%} -> {after:.0%}")
 
     # Explicit low-precision inference must also work without autocast. Check
     # prefill plus decode against an fp32 reference, and exercise norm gradients.
