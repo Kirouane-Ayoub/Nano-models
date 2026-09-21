@@ -18,6 +18,7 @@ The goal is not to be fast or competitive — it's to make each architectural id
 | Qwen-Next Nano | [`nano/models/qwen_next_nano.py`](./nano/models/qwen_next_nano.py) | nano (5M) → large (350M) | Hybrid 3:1 linear/full attention (Qwen3-Next, Qwen3.5, Kimi Linear), gated attention, Gated DeltaNet or KDA, multi-token prediction, mHC hyper-connections, per-layer embeddings. Only 1-in-4 layers holds a KV cache. |
 | Looped Nano | [`nano/models/looped_nano.py`](./nano/models/looped_nano.py) | nano (5M) → large (350M) | Depth recurrence (Huginn, Ouro): prelude → weight-shared core looped *r* times → coda. Input injection, sampled depth with truncated backprop, one KV cache per iteration. Compute per token is a test-time choice. |
 | Gemma Nano | [`nano/models/gemma_nano.py`](./nano/models/gemma_nano.py) | nano (3.5M) → large (350M) | Gemma 3/4 dense recipe: 5:1 local:global sliding-window layout with dual RoPE base (10k/1M) and p-RoPE, K reused as V on global layers, sandwich norm, QK-norm, GeGLU, (1+w) RMSNorm, tied √d-scaled embeddings, final logit softcap. |
+| Mamba Nano | [`nano/models/mamba_nano.py`](./nano/models/mamba_nano.py) | nano (3.3M) → large (160M) | Pure state-space LM: Mamba-2 selective SSM blocks, no attention, no KV cache, no positional encoding. Constant memory per token. Mamba-3 dials: exponential-trapezoidal discretisation, complex state. |
 
 Shared building blocks live in [`nano/attention_zoo.py`](./nano/attention_zoo.py): `mha`, `gqa`, `gated`, `mla`, `swa`, `deltanet`, `kda`, `dsa`, `csa`, `hca`, all with the same `(cfg) → forward(x, use_cache)` interface and a KV cache.
 
@@ -42,6 +43,7 @@ python -m nano.models.qwen_nano
 python -m nano.models.deepseek_nano
 python -m nano.models.qwen_next_nano
 python -m nano.models.gemma_nano
+python -m nano.models.mamba_nano
 
 # Pick a size and (for GPT) an attention variant
 python -m nano.models.gpt_nano --size small --attention gqa --epochs 5
@@ -79,6 +81,8 @@ python -m nano.models.looped_nano --self-check      # per-iteration KV cache, ca
 python -m nano.models.looped_nano --train-check     # truncated backprop, depth extrapolation
 python -m nano.models.gemma_nano --self-check       # window boundary, dual RoPE, K-as-V, softcap
 python -m nano.models.gemma_nano --train-check      # overfits, (1+w) norms move
+python -m nano.models.mamba_nano --self-check       # constant-memory state, no attention, Mamba-3 dials
+python -m nano.models.mamba_nano --train-check      # overfits, Δ stays selective
 python -m nano.hf                                   # HF adapter vs the native loop
 ```
 
