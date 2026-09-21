@@ -297,8 +297,9 @@ the residual stream to the top, and the deeper the model the more chances
 that has to happen.
 
 **Solution.** Normalise the output too: `x + RMSNorm(attn(RMSNorm(x)))`, same
-for the FFN. Every contribution to the residual is capped at unit scale
-before it is added. Two extra vectors per layer, no change to the cache or
+for the FFN. Each contribution is RMS-normalised before applying a learned
+per-channel scale and adding it to the residual; this is not a hard cap on
+individual values or the final output scale. Two extra vectors per layer, no change to the cache or
 the mixer, and it is what let Gemma go deeper at a fixed width. The
 trade-off is one more reduction per sublayer on the critical path.
 

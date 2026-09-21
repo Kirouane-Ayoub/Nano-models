@@ -316,8 +316,9 @@ class HybridBlock(nn.Module):
     sublayer's *output* before it joins the residual. Pre-norm keeps the input
     to a sublayer well-scaled but says nothing about what comes out; a single
     attention layer can emit a spike that dominates the residual stream from
-    then on. The post-norm caps every contribution to unit scale, which is what
-    let Gemma train deeper at a fixed width. Two extra vectors per layer.
+    then on. The post-norm RMS-normalises each contribution, then applies a
+    learned per-channel scale; it does not impose a hard cap on individual
+    values or the final output scale. Two extra vectors per layer.
     """
 
     def __init__(self, cfg, kind, kv_donor=None):
