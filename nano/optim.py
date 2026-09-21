@@ -26,6 +26,8 @@ import math
 import torch
 import torch.nn as nn
 
+from nano.accel import log
+
 
 def zeropower_via_newtonschulz5(G, steps=5, eps=1e-7):
     """Approximate polar factor UVᵀ of G by a quintic Newton-Schulz iteration.
@@ -120,8 +122,10 @@ def build_optimizer(model, settings, optimizer_state=None):
     lr, wd = settings["learning_rate"], settings["weight_decay"]
     kind = settings.get("optimizer", "adamw")
     if optimizer_state is not None:
-        kind = "muon" if any("use_muon" in g for g in optimizer_state["param_groups"]) else "adamw"
-        settings["optimizer"] = kind
+        saved = "muon" if any("use_muon" in g for g in optimizer_state["param_groups"]) else "adamw"
+        if saved != kind:
+            log(f"  Resuming a {saved} checkpoint: ignoring optimizer={kind!r}, the saved state wins")
+        kind = settings["optimizer"] = saved
     if kind != "muon":
         optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=wd)
         if optimizer_state is not None:
@@ -250,6 +254,18 @@ def _self_test():
 
     # 6. The default is untouched: adamw gives a plain torch AdamW.
     assert type(build_optimizer(Toy(), {**settings, "optimizer": "adamw"})) is torch.optim.AdamW
+
+    # 7. On resume the checkpoint decides the optimizer type, whatever the flags
+    #    say — loading Muon groups into AdamW (or the reverse) would fail on the
+    #    group layout, and a run resumed without --optim must not silently switch.
+    adam_state = build_optimizer(Toy(), {**settings, "optimizer": "adamw"}).state_dict()
+    want_muon = {**settings, "optimizer": "muon"}
+    assert type(build_optimizer(Toy(), want_muon, adam_state)) is torch.optim.AdamW
+    assert want_muon["optimizer"] == "adamw", "settings should record what was actually built"
+    want_adam = {**settings, "optimizer": "adamw"}
+    assert isinstance(build_optimizer(Toy(), want_adam, state), Muon)
+    assert want_adam["optimizer"] == "muon"
+    print("  resume        ok — saved optimizer type wins over the requested one, and says so")
     adam_model = Toy()
     adam = build_optimizer(adam_model, {**settings, "optimizer": "adamw"})
     adam_model(x).square().mean().backward()
