@@ -61,6 +61,8 @@ from nano.models.deepseek_nano import DeepSeekNano
 from nano.models.deepseek_nano import MODEL_SIZES as DEEPSEEK_SIZES
 from nano.models.gpt_nano import MODEL_SIZES as GPT_SIZES
 from nano.models.gpt_nano import GPTNano
+from nano.models.gemma_nano import MODEL_SIZES as GEMMA_SIZES
+from nano.models.gemma_nano import GemmaNano
 from nano.models.looped_nano import LoopedNano
 from nano.models.qwen_nano import MODEL_SIZES as QWEN_SIZES
 from nano.models.qwen_nano import QwenNano, compute_rope_params
@@ -72,6 +74,7 @@ ARCHITECTURES = {
     "gpt": (GPTNano, GPT_SIZES, {}),
     "qwen": (QwenNano, QWEN_SIZES, {}),
     "looped": (LoopedNano, QWEN_SIZES, {"loops": 4, "loop_sigma": 0.5, "loop_bptt": 0}),
+    "gemma": (GemmaNano, GEMMA_SIZES, {}),  # local/global, dual RoPE, K-as-V — all in the sizes
     "deepseek": (DeepSeekNano, DEEPSEEK_SIZES, {"moe_latent_dim": 0, "balance_speed": 1e-3}),
     "qwen_next": (
         QwenNextNano,
@@ -163,7 +166,10 @@ class NanoForCausalLM(PreTrainedModel):
         self.model.head.weight = self.model.tok_emb.weight
 
         cfg = self.config.nano
-        if hasattr(self.model, "cos") and "head_dim" in cfg:
+        if hasattr(self.model, "build_rope_tables"):
+            # Gemma owns two tables plus p-RoPE; it knows how to rebuild them.
+            self.model.build_rope_tables(self.model.tok_emb.weight.device)
+        elif hasattr(self.model, "cos") and "head_dim" in cfg:
             device = self.model.tok_emb.weight.device
             if isinstance(self.model, QwenNextNano):
                 cos, sin = build_rope_tables(cfg)
@@ -244,6 +250,7 @@ def _self_check():
         ("qwen_next", {}),
         ("qwen_next", {"mtp_weight": 0.3}),  # aux loss path
         ("looped", {}),  # weight-shared depth, per-iteration KV cache
+        ("gemma", {}),  # two RoPE tables rebuilt by the wrapper, tied scaled embedding
         ("gpt", {"attention": "dsa", "top_k": 4}),  # module-stashed aux loss
     ):
         cfg = build_nano_cfg(arch, "nano", vocab_size=V, drop_rate=0.0, **extra)

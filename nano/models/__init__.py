@@ -5,4 +5,5 @@ qwen_nano       Qwen3
 deepseek_nano   DeepSeek-V3 (MLA + MoE)
 qwen_next_nano  Qwen3-Next / Kimi Linear / DeepSeek-V4 / Gemma 4 components
 looped_nano     Huginn / Ouro depth recurrence (weight-shared core, looped r times)
+gemma_nano      Gemma 3 / Gemma 4 (5:1 local:global, dual RoPE, sandwich norm, K-as-V)
 """
