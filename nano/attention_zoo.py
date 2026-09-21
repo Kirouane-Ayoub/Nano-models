@@ -1233,9 +1233,13 @@ class LightningIndexer(nn.Module):
             return None
         tie_break = torch.arange(T_k, device=scores.device) * 1e-6
         ranked = (scores + tie_break).masked_fill(causal, float("-inf"))
-        return torch.zeros_like(scores, dtype=torch.bool).scatter_(
+        keep = torch.zeros_like(scores, dtype=torch.bool).scatter_(
             -1, ranked.topk(top_k, dim=-1).indices, True
         )
+        # A row with fewer than top_k allowed keys would otherwise "keep" -inf
+        # picks. Harmless for attention (the mask hides them) but wrong for any
+        # caller that reads the keep-mask as a set — the hierarchical indexer does.
+        return keep & ~causal
 
     @staticmethod
     def loss(scores, dense, causal):
