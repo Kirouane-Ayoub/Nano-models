@@ -45,6 +45,8 @@ Usage:
     python -m nano.models.qwen_next_nano --short-conv 4                   # ShortConv on Q/K/V (Kimi Linear)
     python -m nano.models.qwen_next_nano --ratio 1 --kv-share 1           # last attn layer reuses K/V (Gemma 4)
     python -m nano.models.qwen_next_nano --posenc nope                    # drop RoPE
+    python -m nano.models.qwen_next_nano --posenc prope --rope-fraction 0.5  # partial RoPE (Gemma 4)
+    python -m nano.models.qwen_next_nano --linear swa --ratio 5 --window 128  # Gemma 4 local:global layout
     python -m nano.models.qwen_next_nano --residual mhc                   # 4 hyper-connected residual streams
     python -m nano.models.qwen_next_nano --ple-dim 16                     # per-layer embeddings (Gemma 4)
     python -m nano.models.qwen_next_nano --self-check                     # no training, just asserts
@@ -69,7 +71,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from nano import config, data
-from nano.attention_zoo import GatedDeltaNet, KimiDeltaAttention
+from nano.attention_zoo import GatedDeltaNet, KimiDeltaAttention, SlidingWindowAttention
 from nano.accel import current_device, is_main_process, log
 from nano.models.qwen_nano import (
     RMSNorm,
@@ -130,7 +132,10 @@ MODEL_SIZES = {
 }
 # fmt: on
 
-LINEAR_MIXERS = {"deltanet": GatedDeltaNet, "kda": KimiDeltaAttention}
+# What fills the cheap slot between full-attention layers. "swa" is not linear
+# attention — it is a windowed softmax with a bounded cache — but it takes the
+# same position in the pattern: Gemma 4 runs 5 local : 1 global, gpt-oss 1 : 1.
+LINEAR_MIXERS = {"deltanet": GatedDeltaNet, "kda": KimiDeltaAttention, "swa": SlidingWindowAttention}
 
 
 def build_layer_pattern(n_layers, ratio):
@@ -455,6 +460,16 @@ class QwenNextNano(nn.Module):
         self.needs_targets = self.mtp is not None  # tells qwen_nano.train to pass y
 
         cos, sin = compute_rope_params(cfg["head_dim"], cfg["rope_base"], cfg["context_length"])
+        if cfg.get("pos_enc") == "prope":
+            # p-RoPE (Gemma 4): only the highest-frequency `rope_fraction` of the
+            # pairs stay rotary. The low-frequency pairs get cos=1, sin=0, so the
+            # same apply_rope leaves them untouched — they become NoPE channels
+            # that carry content, while the fast pairs still carry position.
+            half = cfg["head_dim"] // 2
+            cut = int(cfg.get("rope_fraction", 0.5) * half)
+            for start in (cut, half + cut):
+                cos[:, start : start + half - cut] = 1.0
+                sin[:, start : start + half - cut] = 0.0
         self.register_buffer("cos", cos, persistent=False)
         self.register_buffer("sin", sin, persistent=False)
 
@@ -618,6 +633,33 @@ def self_check():
     assert not torch.allclose(nope(probe), rope(probe)), "NoPE is a no-op"
     check_incremental(nope, cfg_np["vocab_size"])
     print("  nope      ok — RoPE skipped, param count unchanged")
+
+    # p-RoPE: rotate only the highest-frequency fraction of the pairs. The two
+    # ends are exact anchors — fraction 1 is rope, fraction 0 is nope — and the
+    # middle must differ from both while still decoding incrementally.
+    _, p_full = build(pos_enc="prope", rope_fraction=1.0)
+    _, p_none = build(pos_enc="prope", rope_fraction=0.0)
+    cfg_h, p_half = build(pos_enc="prope", rope_fraction=0.5)
+    torch.testing.assert_close(p_full(probe), rope(probe))
+    torch.testing.assert_close(p_none(probe), nope(probe))
+    assert not torch.allclose(p_half(probe), rope(probe)), "p-RoPE 0.5 equals rope"
+    assert not torch.allclose(p_half(probe), nope(probe)), "p-RoPE 0.5 equals nope"
+    half = cfg_h["head_dim"] // 2
+    cut = int(0.5 * half)
+    assert (p_half.cos[:, cut:half] == 1).all() and (p_half.sin[:, cut:half] == 0).all(), (
+        "low-frequency pairs should be left unrotated"
+    )
+    check_incremental(p_half, cfg_h["vocab_size"])
+    print(f"  prope     ok — {cut}/{half} pairs rotated, fraction 1→rope and 0→nope exactly")
+
+    # SWA in the cheap slot — Gemma 4's 5:1 local:global and gpt-oss's 1:1
+    # layouts. Not linear attention, but it fills the same layer position. The
+    # window must bite, and the trimmed cache must still decode incrementally.
+    cfg_w, narrow = build(linear_attn="swa", window_size=2, hybrid_ratio=1)
+    _, wide = build(linear_attn="swa", window_size=64, hybrid_ratio=1)
+    assert not torch.allclose(narrow(probe), wide(probe)), "window size has no effect"
+    check_incremental(narrow, cfg_w["vocab_size"])
+    print(f"  swa slot  ok — L=swa(window {cfg_w['window_size']}) A=gated, incremental decode exact")
 
     # mHC: the manifold constraint must hold exactly, n=1 must degenerate to a
     # plain residual, and the identity init must start out as one.
@@ -856,7 +898,14 @@ def main():
         type=str,
         default="deltanet",
         choices=list(LINEAR_MIXERS),
-        help="Linear-attention mixer for the non-attention layers",
+        help="Mixer for the cheap layers: linear attention, or swa for a local:global layout",
+    )
+    parser.add_argument(
+        "--window",
+        type=int,
+        default=None,
+        metavar="W",
+        help="With --linear swa: sliding-window size in tokens (default context_length // 2)",
     )
     parser.add_argument(
         "--ratio",
@@ -888,8 +937,15 @@ def main():
         "--posenc",
         type=str,
         default="rope",
-        choices=["rope", "nope"],
-        help="Positional encoding on the attention layers",
+        choices=["rope", "nope", "prope"],
+        help="Positional encoding on the attention layers (prope = partial RoPE, Gemma 4)",
+    )
+    parser.add_argument(
+        "--rope-fraction",
+        type=float,
+        default=0.5,
+        metavar="F",
+        help="With --posenc prope: fraction of rotary pairs kept, highest frequencies first",
     )
     parser.add_argument(
         "--residual",
@@ -966,11 +1022,13 @@ def main():
     cfg = {
         **MODEL_SIZES[size],
         "linear_attn": args.linear,
+        "window_size": args.window,
         "hybrid_ratio": args.ratio,
         "mtp_weight": args.mtp_weight,
         "short_conv": args.short_conv,
         "kv_share": args.kv_share,
         "pos_enc": args.posenc,
+        "rope_fraction": args.rope_fraction,
         "residual": args.residual,
         "mhc_streams": args.mhc_streams,
         "ple_dim": args.ple_dim,
@@ -978,11 +1036,13 @@ def main():
     cfg.update(file_cfg.get("model", {}))
     for key, flag, value in (
         ("linear_attn", "--linear", args.linear),
+        ("window_size", "--window", args.window),
         ("hybrid_ratio", "--ratio", args.ratio),
         ("mtp_weight", "--mtp-weight", args.mtp_weight),
         ("short_conv", "--short-conv", args.short_conv),
         ("kv_share", "--kv-share", args.kv_share),
         ("pos_enc", "--posenc", args.posenc),
+        ("rope_fraction", "--rope-fraction", args.rope_fraction),
         ("residual", "--residual", args.residual),
         ("mhc_streams", "--mhc-streams", args.mhc_streams),
         ("ple_dim", "--ple-dim", args.ple_dim),
