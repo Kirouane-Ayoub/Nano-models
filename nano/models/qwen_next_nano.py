@@ -54,6 +54,7 @@ Usage:
     python -m nano.models.qwen_next_nano --linear swa --ratio 5 --window 128  # Gemma 4 local:global layout
     python -m nano.models.qwen_next_nano --linear mamba2                  # Nemotron 3 layout (Mamba-2 + attention)
     python -m nano.models.qwen_next_nano --linear kda --attn mla          # Kimi Linear's pairing
+    python -m nano.models.qwen_next_nano --attn mla --dsa-top-k 64 --index-share 2  # DSA + IndexShare (MiniMax)
     python -m nano.models.qwen_next_nano --residual mhc                   # 4 hyper-connected residual streams
     python -m nano.models.qwen_next_nano --ple-dim 16                     # per-layer embeddings (Gemma 4)
     python -m nano.models.qwen_next_nano --self-check                     # no training, just asserts
@@ -78,7 +79,13 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from nano import config, data
-from nano.attention_zoo import GatedDeltaNet, KimiDeltaAttention, Mamba2, SlidingWindowAttention
+from nano.attention_zoo import (
+    GatedDeltaNet,
+    KimiDeltaAttention,
+    LightningIndexer,
+    Mamba2,
+    SlidingWindowAttention,
+)
 from nano.components import DepthRouter, Engram, HyperConnections, PerLayerEmbeddings, sinkhorn
 from nano.accel import current_device, is_main_process, log
 from nano.models.qwen_nano import (
@@ -251,11 +258,24 @@ class GatedMLA(nn.Module):
     implementation; it does not establish equivalence to that architecture.
     """
 
-    def __init__(self, cfg):
+    def __init__(self, cfg, share_indexer_from=None):
         super().__init__()
         d, self.n_heads, self.head_dim = cfg["emb_dim"], cfg["n_heads"], cfg["head_dim"]
         self.d_out = self.n_heads * self.head_dim
         self.latent_dim = cfg.get("latent_dim", d // 4)
+        # DSA on top: a lightning indexer keeps the top-k keys per query. With
+        # IndexShare (MiniMax) one layer owns the indexer and the others in its
+        # group reuse the *selection* it made this forward — the owner runs
+        # first, being the earlier layer. Held in a plain list so the shared
+        # module is registered (and counted, and optimised) once.
+        self.top_k = cfg.get("dsa_top_k", 0)
+        self._index_owner = [share_indexer_from] if share_indexer_from is not None else None
+        if self.top_k and self._index_owner is None:
+            self.indexer = LightningIndexer(
+                d, self.latent_dim, cfg.get("index_dim", 32), cfg.get("index_heads", 2)
+            )
+        self.last_keep = None  # (B, T_q, T_k) bool from the last forward, or None if dense
+        self.aux_index_loss = None  # training only; collected by the model into its aux
         self.W_query = nn.Linear(d, self.d_out, bias=False)
         self.W_DKV = nn.Linear(d, self.latent_dim, bias=False)
         self.W_UK = nn.Linear(self.latent_dim, self.d_out, bias=False)
@@ -291,7 +311,20 @@ class GatedMLA(nn.Module):
         attn = (q @ k.transpose(-2, -1)) / (hd**0.5)
         q_pos = torch.arange(start, start + T, device=x.device)
         k_pos = torch.arange(T_k, device=x.device)
-        attn = attn.masked_fill(q_pos.unsqueeze(-1) < k_pos.unsqueeze(0), float("-inf"))
+        causal = q_pos.unsqueeze(-1) < k_pos.unsqueeze(0)
+        attn = attn.masked_fill(causal, float("-inf"))
+        self.aux_index_loss = None
+        if self.top_k:
+            if self._index_owner is None:
+                scores = self.indexer.scores(x, latent)
+                self.last_keep = self.indexer.select(scores, causal, self.top_k)
+                if self.training:
+                    dense = torch.softmax(attn, dim=-1)
+                    self.aux_index_loss = self.indexer.loss(scores, dense, causal)
+            else:
+                self.last_keep = self._index_owner[0].last_keep  # decided earlier this forward
+            if self.last_keep is not None:
+                attn = attn.masked_fill(~self.last_keep.unsqueeze(1), float("-inf"))
         attn = self.dropout(torch.softmax(attn, dim=-1))
         out = (attn @ v).transpose(1, 2).reshape(B, T, self.d_out)
         out = out * torch.sigmoid(self.out_gate(x))  # gate before the projection, as in GQA
@@ -320,7 +353,7 @@ class HybridBlock(nn.Module):
     values or the final output scale. Two extra vectors per layer.
     """
 
-    def __init__(self, cfg, kind, kv_donor=None):
+    def __init__(self, cfg, kind, kv_donor=None, index_owner=None):
         super().__init__()
         self.is_attn = kind == "attn"
         self.norm1 = RMSNorm(cfg["emb_dim"])
@@ -328,7 +361,7 @@ class HybridBlock(nn.Module):
             # Gated attention: qwen_nano's GQA + the output gate, or gated MLA.
             gated = {**cfg, "attn_out_gate": True}
             if cfg.get("attn", "gqa") == "mla":
-                self.attn = GatedMLA(cfg)
+                self.attn = GatedMLA(cfg, share_indexer_from=index_owner)
             else:
                 self.attn = (
                     SharedKVAttention(gated, kv_donor)
@@ -433,6 +466,10 @@ class QwenNextNano(nn.Module):
             raise ValueError(f"attn={cfg['attn']!r} must be 'gqa' or 'mla'")
         if cfg.get("attn", "gqa") == "mla" and cfg.get("kv_share", 0):
             raise ValueError("kv_share reuses another layer's K/V; MLA caches a latent instead — use attn=gqa")
+        if cfg.get("dsa_top_k", 0) and cfg.get("attn", "gqa") != "mla":
+            raise ValueError("dsa_top_k needs attn=mla: the lightning indexer scores the MLA latent")
+        if cfg.get("index_share", 1) > 1 and not cfg.get("dsa_top_k", 0):
+            raise ValueError("index_share groups DSA indexers; set dsa_top_k > 0 as well")
         # KV sharing: the last `kv_share` attention layers reuse K/V from the most
         # recent earlier attention layer that computes its own (Gemma 4).
         attn_positions = [i for i, k in enumerate(self.pattern) if k == "attn"]
@@ -449,10 +486,20 @@ class QwenNextNano(nn.Module):
 
         self.blocks = nn.ModuleList()
         donor = None
+        # IndexShare: attention layers in groups of `index_share`; the first of
+        # each group owns the DSA indexer, the rest reuse its selection.
+        share, index_owner, attn_seen = cfg.get("index_share", 1), None, 0
         for i, kind in enumerate(self.pattern):
-            block = HybridBlock(cfg, kind, kv_donor=donor if i in share_from else None)
-            if kind == "attn" and i not in share_from:
-                donor = block.attn
+            owner = None
+            if kind == "attn" and cfg.get("dsa_top_k", 0) and share > 1 and attn_seen % share:
+                owner = index_owner
+            block = HybridBlock(cfg, kind, kv_donor=donor if i in share_from else None, index_owner=owner)
+            if kind == "attn":
+                if owner is None:
+                    index_owner = block.attn
+                attn_seen += 1
+                if i not in share_from:
+                    donor = block.attn
             self.blocks.append(block)
         self.norm = RMSNorm(cfg["emb_dim"])
         self.head = nn.Linear(cfg["emb_dim"], cfg["vocab_size"], bias=False)
@@ -510,6 +557,12 @@ class QwenNextNano(nn.Module):
             nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
     def forward(self, idx, targets=None, use_cache=False):
+        # Clear last step's indexer losses first: a module that does not run this
+        # forward (the MTP block in eval) would otherwise hand back a stale one
+        # and an eval forward would return a tuple.
+        for m in self.modules():
+            if isinstance(m, GatedMLA):
+                m.aux_index_loss = None
         x = self.drop(self.tok_emb(idx))
         if self.mhc_streams:
             # Fan out into [x, 0, ..., 0] and sum back at the end. Streams must
@@ -537,6 +590,14 @@ class QwenNextNano(nn.Module):
         aux = [r.aux for r in (self.mod.values() if self.mod is not None else ()) if r.aux is not None]
         if targets is not None and self.mtp is not None:
             aux.append(self._mtp_loss(x, targets))
+        # DSA indexer objectives, after MTP so its block's indexer is included.
+        # Stored under a name collect_aux_loss() does not scan, so the HF wrapper
+        # cannot add them a second time.
+        aux += [
+            m.aux_index_loss
+            for m in self.modules()
+            if isinstance(m, GatedMLA) and m.aux_index_loss is not None
+        ]
         return (logits, sum(aux)) if aux else logits
 
     def _into_stream0(self, sig):
@@ -711,6 +772,58 @@ def self_check():
         check_incremental(m, cfg_c["vocab_size"])
     print(f"  mla       ok — gated MLA in the attention slot, cache {g_bytes} → {m_bytes} B/token, "
           f"decode exact, causal, kv_share refused")
+
+    # DSA on the hybrid's MLA: a lightning indexer picks top-k keys per query and
+    # is trained against the dense attention (aux loss). Then IndexShare: one
+    # indexer per group of attention layers, its selection reused by the group.
+    cfg_d, dsa_m = build(attn="mla", hybrid_ratio=1, dsa_top_k=4)  # L A L A: 2 attn layers, 2 indexers
+    probe = torch.randint(0, cfg_d["vocab_size"], (2, 12))
+    dsa_m.train()
+    out = dsa_m(probe)
+    assert isinstance(out, tuple) and torch.isfinite(out[1]) and out[1].requires_grad, "indexer aux loss missing"
+    dsa_m.eval()
+    sparse = dsa_m(probe)
+    assert not isinstance(sparse, tuple)
+    attn_layers = [b.attn for b in dsa_m.blocks if b.is_attn]
+    for layer in attn_layers:
+        layer.top_k = 10**6  # dense: selection off
+    assert not torch.allclose(dsa_m(probe), sparse), "top-k selection does not bite"
+    for layer in attn_layers:
+        layer.top_k = 4
+    check_incremental(dsa_m, cfg_d["vocab_size"])
+    a, b = probe.clone(), probe.clone()
+    b[:, 6] = (b[:, 6] + 1) % cfg_d["vocab_size"]
+    torch.testing.assert_close(dsa_m(a)[:, :6], dsa_m(b)[:, :6])
+    n_indexers = sum(1 for m in dsa_m.modules() if isinstance(m, LightningIndexer))
+    assert n_indexers == 2, n_indexers
+
+    cfg_s, shared = build(attn="mla", hybrid_ratio=1, dsa_top_k=4, index_share=2)
+    assert sum(1 for m in shared.modules() if isinstance(m, LightningIndexer)) == 1, "group should own one indexer"
+    assert dsa_m.count_params() - shared.count_params() == sum(
+        p.numel() for p in attn_layers[0].indexer.parameters()
+    ), "sharing should save exactly one indexer"
+    shared.eval()
+    shared(probe)
+    owner, sharer = [b.attn for b in shared.blocks if b.is_attn]
+    assert owner.last_keep is not None and sharer.last_keep is owner.last_keep, "sharer must reuse the owner's selection"
+    check_incremental(shared, cfg_s["vocab_size"])
+    torch.testing.assert_close(shared(a)[:, :6], shared(b)[:, :6])
+    # Train with MTP (its block's indexer sets a loss), then eval without it: the
+    # eval forward must return plain logits, not a tuple carrying a stale loss.
+    _, dsa_mtp = build(attn="mla", hybrid_ratio=1, dsa_top_k=4, mtp_weight=0.3)
+    dsa_mtp.train()
+    _, aux_train = dsa_mtp(probe, targets=torch.roll(probe, -1, 1))
+    assert torch.isfinite(aux_train)
+    dsa_mtp.eval()
+    assert not isinstance(dsa_mtp(probe), tuple), "stale indexer loss leaked into an eval forward"
+    for bad in ({"index_share": 2}, {"attn": "gqa", "dsa_top_k": 4}):
+        try:
+            build(**bad)
+            raise AssertionError(f"{bad} should be refused")
+        except ValueError:
+            pass
+    print(f"  dsa/share ok — top-{cfg_d['dsa_top_k']} indexer on MLA bites, aux loss flows, decode exact; "
+          f"index_share=2 → 1 indexer for 2 layers, identical selection")
 
     # NoPE: no rotation applied, everything else identical.
     cfg_np, nope = build(pos_enc="nope")
@@ -1142,6 +1255,20 @@ def main():
         help="Full-attention slot: gated GQA (Qwen3-Next) or gated MLA (Kimi Linear)",
     )
     parser.add_argument(
+        "--dsa-top-k",
+        type=int,
+        default=0,
+        metavar="K",
+        help="With --attn mla: DSA lightning indexer keeps the top-K keys per query (0 = dense)",
+    )
+    parser.add_argument(
+        "--index-share",
+        type=int,
+        default=1,
+        metavar="N",
+        help="With --dsa-top-k: one indexer per N attention layers, selection shared (MiniMax IndexShare)",
+    )
+    parser.add_argument(
         "--linear",
         type=str,
         default="deltanet",
@@ -1311,6 +1438,8 @@ def main():
         **MODEL_SIZES[size],
         "linear_attn": args.linear,
         "attn": args.attn,
+        "dsa_top_k": args.dsa_top_k,
+        "index_share": args.index_share,
         "window_size": args.window,
         "hybrid_ratio": args.ratio,
         "mtp_weight": args.mtp_weight,
@@ -1331,6 +1460,8 @@ def main():
     for key, flag, value in (
         ("linear_attn", "--linear", args.linear),
         ("attn", "--attn", args.attn),
+        ("dsa_top_k", "--dsa-top-k", args.dsa_top_k),
+        ("index_share", "--index-share", args.index_share),
         ("window_size", "--window", args.window),
         ("hybrid_ratio", "--ratio", args.ratio),
         ("mtp_weight", "--mtp-weight", args.mtp_weight),
@@ -1379,7 +1510,10 @@ def main():
 
     log(
         f"\nLayout: {' '.join('A' if k == 'attn' else 'L' for k in model.pattern)}"
-        f"  (L = {cfg['linear_attn']}, A = gated {cfg.get('attn', 'gqa').upper()})"
+        f"  (L = {cfg['linear_attn']}, A = gated {cfg.get('attn', 'gqa').upper()}"
+        + (f", DSA top-{cfg['dsa_top_k']}" if cfg.get("dsa_top_k", 0) else "")
+        + (f", indexer shared x{cfg['index_share']}" if cfg.get("index_share", 1) > 1 else "")
+        + ")"
     )
     log(
         f"KV-cached layers: {model.own_kv_layers()}/{cfg['n_layers']} "
