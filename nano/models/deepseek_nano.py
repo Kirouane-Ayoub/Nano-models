@@ -38,6 +38,7 @@ import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 
 from nano import config, data
+from nano.optim import build_optimizer
 
 from nano.accel import (
     accelerator,
@@ -661,11 +662,7 @@ def train(
     train_sampler=None,
 ):
 
-    optimizer = torch.optim.AdamW(
-        model.parameters(), lr=settings["learning_rate"], weight_decay=settings["weight_decay"]
-    )
-    if optimizer_state is not None:
-        optimizer.load_state_dict(optimizer_state)
+    optimizer = build_optimizer(model, settings, optimizer_state)
 
     acc = accelerator(
         mixed_precision=precision_for(settings.get("use_amp", False), device.type),
@@ -728,7 +725,7 @@ def train(
                 global_step, settings["warmup_steps"], max_steps, settings["learning_rate"], min_lr
             )
             for pg in optimizer.param_groups:
-                pg["lr"] = lr
+                pg["lr"] = lr * pg.get("lr_scale", 1.0)
 
             x, y = x.to(device), y.to(device)
             logits = model(x)

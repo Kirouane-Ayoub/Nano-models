@@ -39,6 +39,7 @@ import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 
 from nano import config, data
+from nano.optim import build_optimizer
 
 from nano.accel import (
     accelerator,
@@ -101,6 +102,8 @@ MODEL_SIZES = {
 # fmt: on
 
 TRAIN_SETTINGS = {
+    "optimizer": "adamw",  # or "muon": block matrices on Muon at muon_lr, the rest on AdamW
+    "muon_lr": 0.02,
     "learning_rate": 3e-4,
     "num_epochs": 20,
     "batch_size": 8,
@@ -532,11 +535,7 @@ def train(
         mixed_precision=precision_for(settings.get("use_amp", False), device.type),
         gradient_accumulation_steps=settings.get("grad_accum_steps", 1),
     )
-    optimizer = torch.optim.AdamW(
-        model.parameters(), lr=settings["learning_rate"], weight_decay=settings["weight_decay"]
-    )
-    if optimizer_state is not None:
-        optimizer.load_state_dict(optimizer_state)
+    optimizer = build_optimizer(model, settings, optimizer_state)
 
     model, optimizer, train_loader, val_loader = acc.prepare(
         model, optimizer, train_loader, val_loader
@@ -588,7 +587,7 @@ def train(
                 global_step, settings["warmup_steps"], max_steps, settings["learning_rate"], min_lr
             )
             for pg in optimizer.param_groups:
-                pg["lr"] = lr
+                pg["lr"] = lr * pg.get("lr_scale", 1.0)  # Muon groups run at a multiple of the base lr
 
             # Models with an auxiliary loss (e.g. MTP in qwen_next_nano) take the
             # targets and return it alongside the logits — it has to be computed
