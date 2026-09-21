@@ -1077,6 +1077,63 @@ class LightningAttention(nn.Module):
 # ──────────────────────────────────────────────
 
 
+class LightningIndexer(nn.Module):
+    """DSA's token selector, on its own so MLA layers anywhere can carry one —
+    or share one (MiniMax IndexShare). score(q, k) = Σ_h w_h · ReLU(q_h · k) with
+    a handful of low-dimensional heads; cheap enough that DeepSeek runs it in
+    FP8. `select` keeps the top-k per query with a recency tie-break (see the
+    docstring in `select`), `loss` trains it against the dense attention it
+    serves, because top-k passes no gradient."""
+
+    def __init__(self, d, latent_dim, index_dim=32, index_heads=2):
+        super().__init__()
+        self.index_dim, self.index_heads = index_dim, index_heads
+        self.W_iq = nn.Linear(d, index_heads * index_dim, bias=False)
+        self.W_ik = nn.Linear(latent_dim, index_dim, bias=False)
+        self.W_iw = nn.Linear(d, index_heads, bias=False)
+
+    def scores(self, x, latent):
+        """(B, T_q, T_k): how much each query wants each (latent) key."""
+        B, T, _ = x.shape
+        iq = self.W_iq(x).view(B, T, self.index_heads, self.index_dim)
+        ik = self.W_ik(latent)  # (B, T_k, index_dim)
+        w = self.W_iw(x)  # (B, T, index_heads)
+        return (F.relu(torch.einsum("bthd,bsd->bths", iq, ik)) * w.unsqueeze(-1)).sum(dim=2)
+
+    @staticmethod
+    def select(scores, causal, top_k):
+        """(B, T_q, T_k) bool keep-mask of the top-k scored keys per query, or
+        None when there are ≤ top_k keys (dense is exact then).
+
+        The ReLU makes exact-zero scores the common case, so top-k ties are the
+        norm — and torch.topk breaks ties by memory order, which differs
+        between a prefill over T queries and a one-token decode step. Recency is
+        the tie-break: later tokens win, in both regimes."""
+        T_k = scores.shape[-1]
+        if T_k <= top_k:
+            return None
+        tie_break = torch.arange(T_k, device=scores.device) * 1e-6
+        ranked = (scores + tie_break).masked_fill(causal, float("-inf"))
+        return torch.zeros_like(scores, dtype=torch.bool).scatter_(
+            -1, ranked.topk(top_k, dim=-1).indices, True
+        )
+
+    @staticmethod
+    def loss(scores, dense, causal):
+        """Teach the indexer to rank tokens the way attention actually weights
+        them: KL(attention || indexer), attention detached as the target.
+
+        Written as a cross-entropy — KL minus the target's entropy, which is
+        constant with respect to the indexer, so the gradients are identical.
+        Doing it this way sidesteps the 0*log(0) in the KL: the attention target
+        is exactly zero at every masked position, and F.kl_div returns NaN there.
+        Masking log_p to 0 on those positions keeps the products well-defined.
+        """
+        target = dense.mean(dim=1).detach()  # average over heads
+        log_p = torch.log_softmax(scores.masked_fill(causal, float("-inf")), dim=-1)
+        return -(target * log_p.masked_fill(causal, 0.0)).sum(dim=-1).mean()
+
+
 @register("dsa", "DeepSeek Sparse Attention — MLA + lightning indexer top-k (DeepSeek-V3.2)")
 class DeepSeekSparseAttention(nn.Module):
     """MLA plus a lightning indexer that picks which tokens to attend to
@@ -1120,9 +1177,7 @@ class DeepSeekSparseAttention(nn.Module):
         self.W_UV = nn.Linear(self.latent_dim, d, bias=cfg["qkv_bias"])
 
         # Lightning indexer — deliberately tiny next to the attention itself
-        self.W_iq = nn.Linear(d, self.index_heads * self.index_dim, bias=False)
-        self.W_ik = nn.Linear(self.latent_dim, self.index_dim, bias=False)
-        self.W_iw = nn.Linear(d, self.index_heads, bias=False)
+        self.indexer = LightningIndexer(d, self.latent_dim, self.index_dim, self.index_heads)
 
         self.out_proj = nn.Linear(d, d)
         self.dropout = nn.Dropout(cfg["drop_rate"])
@@ -1130,6 +1185,19 @@ class DeepSeekSparseAttention(nn.Module):
         self.register_buffer("cache_latent", None, persistent=False)
         self.cache_pos = 0
         self.index_loss = None
+
+    def _load_from_state_dict(
+        self, state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs
+    ):
+        # Before LightningIndexer was extracted these projections lived here.
+        # Respect the prefix so this also works when loading a whole GPT.
+        for name in ("W_iq", "W_ik", "W_iw"):
+            old, new = prefix + name + ".weight", prefix + "indexer." + name + ".weight"
+            if old in state_dict and new not in state_dict:
+                state_dict[new] = state_dict.pop(old)
+        super()._load_from_state_dict(
+            state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs
+        )
 
     def forward(self, x, use_cache=False):
         B, T, _ = x.shape
@@ -1150,13 +1218,7 @@ class DeepSeekSparseAttention(nn.Module):
         k = self.W_UK(latent).view(B, T_k, self.n_heads, self.head_dim).transpose(1, 2)
         v = self.W_UV(latent).view(B, T_k, self.n_heads, self.head_dim).transpose(1, 2)
 
-        # Lightning indexer: score = sum_h w_h * ReLU(q_h . k_index)
-        iq = self.W_iq(x).view(B, T, self.index_heads, self.index_dim)
-        ik = self.W_ik(latent)  # (B, T_k, index_dim)
-        w = self.W_iw(x)  # (B, T, index_heads)
-        idx_scores = (F.relu(torch.einsum("bthd,bsd->bths", iq, ik)) * w.unsqueeze(-1)).sum(
-            dim=2
-        )  # (B, T, T_k)
+        idx_scores = self.indexer.scores(x, latent)  # (B, T, T_k)
 
         device = x.device
         q_pos = (
@@ -1173,39 +1235,15 @@ class DeepSeekSparseAttention(nn.Module):
         dense = torch.softmax(attn, dim=-1)
 
         # Keep the top-k tokens the indexer scored highest. Shorter than k → dense.
-        if T_k > self.top_k:
-            # The ReLU in the indexer makes exact-zero scores the common case, so
-            # top-k ties are the norm rather than an edge case — and torch.topk
-            # breaks ties by memory order, which differs between a prefill over T
-            # queries and a one-token decode step. Without a deterministic rule
-            # cached generation silently selects different tokens from uncached.
-            # Recency is the tie-break: later tokens win.
-            tie_break = torch.arange(T_k, device=device) * 1e-6
-            scores = (idx_scores + tie_break).masked_fill(causal, float("-inf"))
-            keep = torch.zeros_like(scores, dtype=torch.bool).scatter_(
-                -1, scores.topk(self.top_k, dim=-1).indices, True
-            )
+        keep = self.indexer.select(idx_scores, causal, self.top_k)
+        if keep is not None:
             attn = attn.masked_fill(~keep.unsqueeze(1), float("-inf"))
 
         probs = self.dropout(torch.softmax(attn, dim=-1))
-        self.index_loss = self._index_loss(idx_scores, dense, causal)
+        self.index_loss = self.indexer.loss(idx_scores, dense, causal)
 
         out = (probs @ v).transpose(1, 2).contiguous().view(B, T, self.d_out)
         return self.out_proj(out)
-
-    def _index_loss(self, idx_scores, dense, causal):
-        """Teach the indexer to rank tokens the way attention actually weights
-        them: KL(attention || indexer), attention detached as the target.
-
-        Written as a cross-entropy — KL minus the target's entropy, which is
-        constant with respect to the indexer, so the gradients are identical.
-        Doing it this way sidesteps the 0*log(0) in the KL: the attention target
-        is exactly zero at every masked position, and F.kl_div returns NaN there.
-        Masking log_p to 0 on those positions keeps the products well-defined.
-        """
-        target = dense.mean(dim=1).detach()  # average over heads
-        log_p = torch.log_softmax(idx_scores.masked_fill(causal, float("-inf")), dim=-1)
-        return -(target * log_p.masked_fill(causal, 0.0)).sum(dim=-1).mean()
 
     def reset_cache(self):
         self.cache_latent = None
@@ -1710,11 +1748,11 @@ def _self_test():
                 ((q @ k.transpose(-2, -1)) / ((d // 4) ** 0.5)).masked_fill(causal, float("-inf")),
                 -1,
             ).mean(1)
-            iq = attn.W_iq(x).view(B, T, attn.index_heads, attn.index_dim)
+            iq = attn.indexer.W_iq(x).view(B, T, attn.indexer.index_heads, attn.indexer.index_dim)
             sc = (
                 (
-                    F.relu(torch.einsum("bthd,bsd->bths", iq, attn.W_ik(lat)))
-                    * attn.W_iw(x).unsqueeze(-1)
+                    F.relu(torch.einsum("bthd,bsd->bths", iq, attn.indexer.W_ik(lat)))
+                    * attn.indexer.W_iw(x).unsqueeze(-1)
                 )
                 .sum(2)
                 .masked_fill(causal, float("-inf"))
@@ -1736,7 +1774,7 @@ def _self_test():
     assert used <= attn.top_k, f"attended to {used} tokens, top_k={attn.top_k}"
 
     before = _recall()
-    opt = torch.optim.AdamW([attn.W_iq.weight, attn.W_ik.weight, attn.W_iw.weight], lr=1e-2)
+    opt = torch.optim.AdamW(attn.indexer.parameters(), lr=1e-2)
     for _ in range(300):  # train ONLY the indexer
         attn(x)
         loss = collect_aux_loss(attn)
