@@ -24,12 +24,14 @@ independent — read the ones you need.
 | ShortConv | `--short-conv 4` | `nano/attention_zoo.py` |
 | KV sharing | `--kv-share N` | `nano/models/qwen_next_nano.py` |
 | Sandwich norm | `--norm sandwich` | `nano/models/qwen_next_nano.py` |
+| Final logit softcap | `--logit-softcap 30` | `nano/models/qwen_next_nano.py` |
 | NoPE | `--posenc nope` | `nano/models/qwen_nano.py` |
 | p-RoPE (partial RoPE) | `--posenc prope --rope-fraction 0.5` | `nano/models/qwen_next_nano.py` |
 | mHC hyper-connections | `--residual mhc` | `nano/models/qwen_next_nano.py` |
 | Per-layer embeddings | `--ple-dim 16` | `nano/models/qwen_next_nano.py` |
 | Multi-token prediction | `--mtp-weight 0.3` | `nano/models/qwen_next_nano.py` |
 | Looped depth (Huginn/Ouro) | `--loops 4 --loop-bptt K` | `nano/models/looped_nano.py` |
+| Gemma 3/4 recipe (whole model) | `python -m nano.models.gemma_nano` | `nano/models/gemma_nano.py` |
 | MoE + shared expert | `num_experts` in config | `nano/models/deepseek_nano.py` |
 | Aux-loss-free balancing | `--balance-speed 1e-3` | `nano/models/deepseek_nano.py` |
 | Sigmoid routing | `--router sigmoid` | `nano/models/deepseek_nano.py` |
@@ -111,6 +113,11 @@ instead of running away. Gemma 2 uses c=50 on attention logits and c=30 on the
 final vocabulary logits. Gemma 3 removed the attention cap and used QK-norm
 instead, which bounds the dot product at the source. Zero parameters, one line,
 and a good example of two fixes for the same failure at different points.
+
+The same cap on the *final* logits (`--logit-softcap 30` in the hybrid model)
+survived into Gemma 3 and 4. Nothing else bounds the LM head, and a confident
+model otherwise drifts towards one-hot outputs whose gradient has vanished.
+In this repo the MTP head shares the cap, since it shares the head.
 
 ### Scalable Softmax
 **Paper:** *Scalable-Softmax Is Superior for Attention* (Nakanishi, 2025), arXiv 2501.19399.
@@ -478,6 +485,28 @@ transfer. And *one KV cache per iteration*: see § 6.
 Implemented in `nano/models/looped_nano.py` on qwen_nano's blocks. The adapter
 is initialised to `[I | I]`, so an iteration begins as `core(s + e)`. The exit
 gate is not implemented; `loops` is a fixed dial.
+
+### The Gemma recipe
+**Papers:** Gemma 2 (2024), arXiv 2408.00118; Gemma 3 (2025), arXiv 2503.19786;
+Gemma 4 (2026), arXiv 2607.02770.
+
+Gemma is the counter-example to everything above: a dense transformer with no
+new mixer, made competitive by a stack of small decisions. `gemma_nano.py`
+puts them in one file. Most are documented on their own elsewhere in this
+guide (sandwich norm, QK-norm, p-RoPE, K-as-V, logit softcap, SWA); four are
+specific to Gemma:
+
+- **5:1 local:global with dual RoPE base.** Local layers see ≤ w tokens back
+  and use base 10k; global layers must resolve the whole context and use 1M.
+  Gemma 4 applies p-RoPE (25% of pairs) on the global layers only and makes
+  the final layer always global.
+- **GeGLU.** The gated FFN with GELU in place of SiLU. Same shape as SwiGLU;
+  Gemma has simply never changed it.
+- **(1 + w) RMSNorm.** Scale written as `1 + w`, w zero-init. Weight decay
+  then pulls the norm towards identity rather than towards zero output.
+- **Tied embeddings scaled by √d.** One matrix for input and output, and the
+  input side multiplied by √d so tokens enter at residual-stream scale. With
+  a 262k vocabulary the tying is a large share of the parameter budget.
 
 ### MTP — Multi-Token Prediction
 **Paper:** *Better & Faster Large Language Models via Multi-token Prediction*
