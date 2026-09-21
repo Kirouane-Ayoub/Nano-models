@@ -48,6 +48,7 @@ Usage:
     python -m nano.models.qwen_next_nano --norm sandwich                  # post-norm too (Gemma)
     python -m nano.models.qwen_next_nano --engram-dim 16                  # hashed n-gram memory (DeepSeek)
     python -m nano.models.qwen_next_nano --mod-capacity 0.5               # Mixture-of-Depths on odd blocks
+    python -m nano.models.qwen_next_nano --optim muon                     # Muon on block matrices (Kimi K2)
     python -m nano.models.qwen_next_nano --logit-softcap 30               # bound the LM head (Gemma 2)
     python -m nano.models.qwen_next_nano --posenc prope --rope-fraction 0.5  # partial RoPE (Gemma 4)
     python -m nano.models.qwen_next_nano --linear swa --ratio 5 --window 128  # Gemma 4 local:global layout
@@ -1137,6 +1138,10 @@ def main():
     parser.add_argument("--batch-size", type=int, default=None)
     parser.add_argument("--grad-accum", type=int, default=1)
     parser.add_argument("--no-amp", action="store_true", help="Disable mixed precision")
+    parser.add_argument(
+        "--optim", type=str, default=None, choices=["adamw", "muon"],
+        help="adamw (default) or muon: Newton-Schulz orthogonalised momentum on block matrices (Kimi K2)",
+    )
     parser.add_argument("--ckpt-freq", type=int, default=500)
     parser.add_argument("--resume", type=str, default=None, help="Checkpoint to resume from")
     parser.add_argument("--prompt", type=str, default="Once upon a time")
@@ -1176,6 +1181,7 @@ def main():
     ov(settings, "grad_accum_steps", "--grad-accum", args.grad_accum)
     ov(settings, "use_amp", "--no-amp", not args.no_amp)
     ov(settings, "ckpt_freq", "--ckpt-freq", args.ckpt_freq)
+    ov(settings, "optimizer", "--optim", args.optim)
 
     cfg = {
         **MODEL_SIZES[size],
