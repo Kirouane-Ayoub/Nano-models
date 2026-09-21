@@ -24,7 +24,7 @@ Anything path-based resolves against `config.ROOT` (the repo root), so
 Two jobs, deliberately kept apart:
 
 - **Reading.** `nano/models/gpt_nano.py`, `nano/models/qwen_nano.py`, `nano/models/deepseek_nano.py`,
-  `nano/models/gemma_nano.py`,
+  `nano/models/gemma_nano.py`, `nano/models/mamba_nano.py`,
   `nano/models/qwen_next_nano.py` each teach one architecture end to end.
 - **Experimenting.** `nano/attention_zoo.py` plus the component flags on
   `nano/models/qwen_next_nano.py` let you swap pieces without touching the teaching files.
@@ -73,6 +73,7 @@ python -m nano.models.qwen_next_nano --self-check     # hybrid components, init 
 python -m nano.models.qwen_next_nano --train-check    # what only gradients reveal (~30s)
 python -m nano.models.deepseek_nano --self-check      # MoE routing and load balancing
 python -m nano.models.gemma_nano --self-check         # window boundary, dual RoPE, K-as-V, softcap
+python -m nano.models.mamba_nano --self-check         # constant-memory state, no attention, Mamba-3 dials
 ```
 
 **Run the relevant ones after any change to a model or the zoo.** They are fast
