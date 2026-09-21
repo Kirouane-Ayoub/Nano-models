@@ -18,6 +18,7 @@ independent — read the ones you need.
 | MHA, GQA, gated, sink, kv1, diff, softcap, ssmax, MLA, SWA | `--attention <name>` | `nano/attention_zoo.py` |
 | Gated DeltaNet, KDA | `--attention deltanet\|kda`, `--linear` | `nano/attention_zoo.py` |
 | Lightning Attention | `--attention lightning` | `nano/attention_zoo.py` |
+| Mamba-2 (+ Mamba-3 flags) | `--attention mamba2`, `--linear mamba2`, `mamba_trapezoidal`, `mamba_complex` | `nano/attention_zoo.py` |
 | DSA, CSA, HCA | `--attention dsa\|csa\|hca` | `nano/attention_zoo.py` |
 | Hybrid linear:full ratio | `--ratio N` | `nano/models/qwen_next_nano.py` |
 | Local:global (SWA) layout | `--linear swa --ratio 5 --window 128` | `nano/models/qwen_next_nano.py` |
@@ -34,6 +35,7 @@ independent — read the ones you need.
 | Parallel block (GPT-J/PaLM) | `--block parallel` | `nano/models/gpt_nano.py` |
 | Looped depth (Huginn/Ouro) | `--loops 4 --loop-bptt K` | `nano/models/looped_nano.py` |
 | Gemma 3/4 recipe (whole model) | `python -m nano.models.gemma_nano` | `nano/models/gemma_nano.py` |
+| Mamba-2/3 pure SSM (whole model) | `python -m nano.models.mamba_nano` | `nano/models/mamba_nano.py` |
 | MoE + shared expert | `num_experts` in config | `nano/models/deepseek_nano.py` |
 | Aux-loss-free balancing | `--balance-speed 1e-3` | `nano/models/deepseek_nano.py` |
 | Sigmoid routing | `--router sigmoid` | `nano/models/deepseek_nano.py` |
@@ -252,6 +254,35 @@ RMSNorm on the output does the normalising and a sigmoid gate lets a head
 switch off. Ling 2.5 pairs it with MLA on the full-attention layers where
 Qwen3.5 pairs DeltaNet with gated attention. MiniMax dropped it again in M2 for
 plain GQA — the trade-off is not settled.
+
+### Mamba-2 and Mamba-3
+**Papers:** *Transformers are SSMs* / Mamba-2 (Dao & Gu, 2024), arXiv 2405.21060;
+Mamba-3 (Mar 2026), arXiv 2603.15569. Nemotron 3 (NVIDIA) ships Mamba-2.
+
+**Problem.** Linear attention with a fixed decay (Lightning) cannot decide
+*when* to forget; DeltaNet can, but its delta-rule write is the expensive
+part.
+
+**Solution.** A selective state space: each head holds a (head_dim × state)
+matrix, and every token emits its own step size Δ. Decay is exp(Δ·A) with
+A < 0 learned per head, so a large Δ wipes the state and a small one lets it
+pass through untouched. The write is a plain outer product Δ·x⊗B, the read
+is S·C. Written out for a whole sequence this is a masked (T×T) matrix
+product — the "structured state-space duality" — which is why it trains like
+attention and decodes like an RNN. Nemotron 3 puts these where Qwen3-Next
+puts DeltaNet, next to attention and MoE.
+
+**Mamba-3** changes the discretisation. The input term becomes a trapezoid
+over t and t−1 with a learned mixing weight, higher-order in Δ, and since that
+already mixes adjacent tokens the short conv goes. A complex-valued state,
+implemented as rotating B and C by an angle that accumulates with Δ, gives
+the SSM the state-tracking ability (parity, modular counting) that a real
+diagonal recurrence lacks. Both are flags here; both add carried state, which
+the self-test checks under one-token decode.
+
+`mamba_nano.py` stacks the mixer alone — norm and SSM, no FFN, no attention,
+no positional encoding — and checks the property no attention model has: the
+recurrent state after 40 tokens is the same size as after one.
 
 ### ShortConv
 **Paper:** Kimi Linear (2025), LFM2.5; *Dynamic Short Convolutions Improve
