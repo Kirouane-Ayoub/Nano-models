@@ -381,7 +381,7 @@ class MoEFeedForward(nn.Module):
             return p / p.sum(dim=-1, keepdim=True)
         return torch.softmax(picked, dim=-1)
 
-    def expert_choice(self, scores):
+    def expert_choice(self, affinities):
         """Expert-choice routing (Zhou et al., 2022): each expert takes its top
         `capacity` tokens instead of each token taking its top-k experts.
 
@@ -396,11 +396,12 @@ class MoEFeedForward(nn.Module):
         strongly the tokens after t want it, so routing leaks the future. Fine
         for an encoder, and the reason decoder LLMs kept token choice and fixed
         balance the DeepSeek-V3 way instead. The self-check asserts the leak.
-        Returns (E, capacity) token indices into the flattened sequence.
+        Takes softmax/sigmoid affinities, not raw logits, and returns
+        (E, capacity) token indices into the flattened sequence.
         """
-        n_tokens = scores.shape[0]
+        n_tokens = affinities.shape[0]
         capacity = -(-n_tokens * self.num_experts_per_tok // self.num_experts)
-        return torch.topk(scores.t(), min(capacity, n_tokens), dim=-1).indices
+        return torch.topk(affinities.t(), min(capacity, n_tokens), dim=-1).indices
 
     def _forward_expert_choice(self, x_flat, scores):
         weights = (
@@ -409,7 +410,7 @@ class MoEFeedForward(nn.Module):
             else torch.softmax(scores, dim=-1)
         )  # (N, E): the pair weight is the token's own affinity for the expert
         out_flat = torch.zeros_like(x_flat)
-        for eid, idx in enumerate(self.expert_choice(scores)):
+        for eid, idx in enumerate(self.expert_choice(weights)):
             expert_out = self.experts[eid](x_flat.index_select(0, idx))
             out_flat.index_add_(
                 0, idx, (expert_out * weights[idx, eid].unsqueeze(-1)).to(out_flat.dtype)
@@ -840,7 +841,8 @@ def self_check():
     ec = MoEFeedForward({**base, "balance_speed": 0.0, "router_choice": "expert"}).eval()
     ec.load_state_dict(full.state_dict())
     with torch.no_grad():
-        assign = ec.expert_choice(ec.gate(x).reshape(-1, base["num_experts"]))  # (E, capacity)
+        affinities = ec.gate(x).reshape(-1, base["num_experts"]).softmax(dim=-1)
+        assign = ec.expert_choice(affinities)  # (E, capacity)
         cap = -(-B * T * base["num_experts_per_tok"] // base["num_experts"])
         assert assign.shape == (base["num_experts"], cap), assign.shape
         # Every expert holds exactly `cap` tokens (the shape), and the total number
@@ -859,6 +861,23 @@ def self_check():
         f"  expert_choice ok — every expert takes exactly {cap} tokens, {unrouted}/{B * T} tokens "
         f"get none (residual only); non-causal, as documented"
     )
+
+    # Across tokens, raw logits and softmax affinities can rank differently.
+    # Expert 0 must take token 1, despite token 0 having the larger raw logit.
+    ranked = MoEFeedForward({
+        **base, "num_experts": 2, "num_experts_per_tok": 1,
+        "router_choice": "expert", "router_score": "softmax",
+    }).eval()
+    ranked.experts = nn.ModuleList([nn.Identity(), nn.Identity()])
+    scores = torch.tensor([[10.0, 100.0], [9.0, 0.0]])
+    tokens = torch.randn(2, base["emb_dim"])
+    weights = scores.softmax(dim=-1)
+    expected = tokens * torch.stack([weights[0, 1], weights[1, 0]]).unsqueeze(-1)
+    torch.testing.assert_close(ranked._forward_expert_choice(tokens, scores), expected)
+    # A constant shift per token leaves softmax affinities and routing unchanged.
+    shifted = scores + torch.tensor([[-100.0], [0.0]])
+    torch.testing.assert_close(ranked._forward_expert_choice(tokens, shifted), expected)
+    print("  expert_rank ok — selects by affinity, invariant to per-token logit shifts")
 
     # The balancing bias must steer selection without touching gate weights.
     moe = MoEFeedForward({**base, "balance_speed": 1e-3}).eval()
