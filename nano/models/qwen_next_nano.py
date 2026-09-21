@@ -138,6 +138,22 @@ MODEL_SIZES = {
 LINEAR_MIXERS = {"deltanet": GatedDeltaNet, "kda": KimiDeltaAttention, "swa": SlidingWindowAttention}
 
 
+def build_rope_tables(cfg):
+    """Build positional tables for construction and checkpoint restoration."""
+    cos, sin = compute_rope_params(cfg["head_dim"], cfg["rope_base"], cfg["context_length"])
+    if cfg.get("pos_enc") == "prope":
+        # p-RoPE (Gemma 4): only the highest-frequency `rope_fraction` of the
+        # pairs stay rotary. The low-frequency pairs get cos=1, sin=0, so the
+        # same apply_rope leaves them untouched — they become NoPE channels
+        # that carry content, while the fast pairs still carry position.
+        half = cfg["head_dim"] // 2
+        cut = int(cfg.get("rope_fraction", 0.5) * half)
+        for start in (cut, half + cut):
+            cos[:, start : start + half - cut] = 1.0
+            sin[:, start : start + half - cut] = 0.0
+    return cos, sin
+
+
 def build_layer_pattern(n_layers, ratio):
     """`ratio` linear layers followed by 1 attention layer, repeated.
 
@@ -459,17 +475,7 @@ class QwenNextNano(nn.Module):
         self.mtp = MTPHead(cfg) if self.mtp_weight > 0 else None
         self.needs_targets = self.mtp is not None  # tells qwen_nano.train to pass y
 
-        cos, sin = compute_rope_params(cfg["head_dim"], cfg["rope_base"], cfg["context_length"])
-        if cfg.get("pos_enc") == "prope":
-            # p-RoPE (Gemma 4): only the highest-frequency `rope_fraction` of the
-            # pairs stay rotary. The low-frequency pairs get cos=1, sin=0, so the
-            # same apply_rope leaves them untouched — they become NoPE channels
-            # that carry content, while the fast pairs still carry position.
-            half = cfg["head_dim"] // 2
-            cut = int(cfg.get("rope_fraction", 0.5) * half)
-            for start in (cut, half + cut):
-                cos[:, start : start + half - cut] = 1.0
-                sin[:, start : start + half - cut] = 0.0
+        cos, sin = build_rope_tables(cfg)
         self.register_buffer("cos", cos, persistent=False)
         self.register_buffer("sin", sin, persistent=False)
 
@@ -655,6 +661,11 @@ def self_check():
     # SWA in the cheap slot — Gemma 4's 5:1 local:global and gpt-oss's 1:1
     # layouts. Not linear attention, but it fills the same layer position. The
     # window must bite, and the trimmed cache must still decode incrementally.
+    cfg_default, default_window = build(linear_attn="swa", window_size=None)
+    for block in default_window.blocks:
+        if not block.is_attn:
+            assert block.attn.window_size == cfg_default["context_length"] // 2
+    check_incremental(default_window, cfg_default["vocab_size"])
     cfg_w, narrow = build(linear_attn="swa", window_size=2, hybrid_ratio=1)
     _, wide = build(linear_attn="swa", window_size=64, hybrid_ratio=1)
     assert not torch.allclose(narrow(probe), wide(probe)), "window size has no effect"
