@@ -46,6 +46,7 @@ Usage:
     python -m nano.models.qwen_next_nano --ratio 1 --kv-share 1           # last attn layer reuses K/V (Gemma 4)
     python -m nano.models.qwen_next_nano --posenc nope                    # drop RoPE
     python -m nano.models.qwen_next_nano --norm sandwich                  # post-norm too (Gemma)
+    python -m nano.models.qwen_next_nano --logit-softcap 30               # bound the LM head (Gemma 2)
     python -m nano.models.qwen_next_nano --posenc prope --rope-fraction 0.5  # partial RoPE (Gemma 4)
     python -m nano.models.qwen_next_nano --linear swa --ratio 5 --window 128  # Gemma 4 local:global layout
     python -m nano.models.qwen_next_nano --residual mhc                   # 4 hyper-connected residual streams
@@ -486,6 +487,7 @@ class QwenNextNano(nn.Module):
         self.ple = PerLayerEmbeddings(cfg, cfg["n_layers"]) if cfg.get("ple_dim", 0) else None
 
         self.mtp_weight = cfg.get("mtp_weight", 0.0)
+        self.logit_softcap = cfg.get("logit_softcap", 0.0)  # 0 = off; Gemma 2 uses 30
         self.mtp = MTPHead(cfg) if self.mtp_weight > 0 else None
         self.needs_targets = self.mtp is not None  # tells qwen_nano.train to pass y
 
@@ -523,10 +525,21 @@ class QwenNextNano(nn.Module):
                 )
         if self.mhc_streams:
             x = x.sum(dim=2)
-        logits = self.head(self.norm(x))
+        logits = self._logits(x)
         if targets is None or self.mtp is None:
             return logits
         return logits, self._mtp_loss(x, targets)
+
+    def _logits(self, x):
+        """Final norm, LM head, and the optional Gemma 2 softcap: c·tanh(z/c)
+        keeps every logit inside (−c, c). Without it nothing bounds the head's
+        output, and a confident model drifts towards one-hot distributions with
+        vanishing gradient. Gemma 2 uses c=30. The MTP head goes through here
+        too, so both heads see the same bound."""
+        logits = self.head(self.norm(x))
+        if self.logit_softcap:
+            logits = self.logit_softcap * torch.tanh(logits / self.logit_softcap)
+        return logits
 
     def _mtp_loss(self, x, targets):
         """targets[:, i] is token t_{i+1}, so the MTP head sees h_i + Emb(t_{i+1})
@@ -535,7 +548,7 @@ class QwenNextNano(nn.Module):
         h = x[:, :-1]
         next_emb = self.tok_emb(targets[:, :-1])
         z = self.mtp(h, next_emb, self.cos, self.sin)
-        logits = self.head(self.norm(z))
+        logits = self._logits(z)
         loss = nn.functional.cross_entropy(logits.flatten(0, 1), targets[:, 1:].flatten())
         return self.mtp_weight * loss
 
@@ -698,6 +711,20 @@ def self_check():
     cfg_sh, sandwich_hc = build(norm_style="sandwich", residual="mhc", mhc_streams=2)
     check_incremental(sandwich_hc, cfg_sh["vocab_size"])
     print(f"  sandwich  ok — +{extra:,} params (2 norms × {cfg_sw['n_layers']} layers), decode exact, works under mHC")
+
+    # Final logit softcap (Gemma 2, c=30): logits become c·tanh(z/c) exactly, so
+    # they are bounded by c and strictly smaller in magnitude than the raw ones.
+    # A cap on the head must also cover the MTP head, which shares it.
+    _, plain = build()
+    cfg_lc, capped = build(logit_softcap=0.5)
+    z, zc = plain(probe), capped(probe)
+    torch.testing.assert_close(zc, 0.5 * torch.tanh(z / 0.5))
+    assert zc.abs().max() < 0.5 and zc.abs().max() < z.abs().max(), "logit softcap did not bite"
+    check_incremental(capped, cfg_lc["vocab_size"])
+    _, capped_mtp = build(logit_softcap=0.5, mtp_weight=0.3)
+    _, mtp_loss = capped_mtp(probe, targets=torch.roll(probe, -1, 1))
+    assert torch.isfinite(mtp_loss), "MTP loss not finite under logit softcap"
+    print(f"  logitcap  ok — |logits| {z.abs().max():.2f} -> {zc.abs().max():.2f} at c=0.5, MTP head capped too")
 
     # mHC: the manifold constraint must hold exactly, n=1 must degenerate to a
     # plain residual, and the identity init must start out as one.
@@ -986,6 +1013,13 @@ def main():
         help="With --posenc prope: fraction of rotary pairs kept, highest frequencies first",
     )
     parser.add_argument(
+        "--logit-softcap",
+        type=float,
+        default=0.0,
+        metavar="C",
+        help="Cap final logits to c·tanh(z/c); Gemma 2 uses 30 (default off)",
+    )
+    parser.add_argument(
         "--norm",
         type=str,
         default="pre",
@@ -1074,6 +1108,7 @@ def main():
         "kv_share": args.kv_share,
         "pos_enc": args.posenc,
         "norm_style": args.norm,
+        "logit_softcap": args.logit_softcap,
         "rope_fraction": args.rope_fraction,
         "residual": args.residual,
         "mhc_streams": args.mhc_streams,
@@ -1089,6 +1124,7 @@ def main():
         ("kv_share", "--kv-share", args.kv_share),
         ("pos_enc", "--posenc", args.posenc),
         ("norm_style", "--norm", args.norm),
+        ("logit_softcap", "--logit-softcap", args.logit_softcap),
         ("rope_fraction", "--rope-fraction", args.rope_fraction),
         ("residual", "--residual", args.residual),
         ("mhc_streams", "--mhc-streams", args.mhc_streams),
