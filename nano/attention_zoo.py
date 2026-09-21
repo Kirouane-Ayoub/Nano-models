@@ -17,6 +17,7 @@ Supported types:
     - softcap:  GQA with c·tanh(s/c) logit softcapping (Gemma 2/3)
     - ssmax:    GQA with logits scaled by s·log(n), Scalable Softmax (2025)
     - swa:      Sliding Window Attention (Mistral, Gemma)
+    - moba:     Mixture of Block Attention — own block + top-k past blocks by mean key (Moonshot)
     - deltanet: Gated DeltaNet linear attention (Qwen3-Next)
     - kda:      Kimi Delta Attention — DeltaNet with per-channel decay (Kimi Linear)
     - mamba2:   Mamba-2 SSD state space, scalar decay per head (Nemotron 3); Mamba-3 flags
@@ -221,8 +222,7 @@ class GroupedQueryAttention(nn.Module):
             log_n = torch.log((q_pos + 1).float()).view(1, 1, T_q, 1)
             scale = self.ssmax_s.view(1, -1, 1, 1) * log_n
             attn = attn * scale.to(attn.dtype)
-        mask = q_pos.unsqueeze(-1) < k_pos.unsqueeze(0)
-        attn = attn.masked_fill(mask, float("-inf"))
+        attn = attn.masked_fill(self._mask(q, k, q_pos, k_pos), float("-inf"))
 
         if self.sink is not None:
             sink = self.sink.view(1, -1, 1, 1).expand(B, -1, T_q, 1)
@@ -235,9 +235,79 @@ class GroupedQueryAttention(nn.Module):
             out = out * torch.sigmoid(self.out_gate(x))
         return self.out_proj(out)
 
+    def _mask(self, q, k, q_pos, k_pos):
+        """True where attention is forbidden. Plain causal here; subclasses that
+        select *which* past keys to read (MoBA) OR their own constraint in.
+        q, k are (B, H, T, hd) with k already expanded to the query heads."""
+        return q_pos.unsqueeze(-1) < k_pos.unsqueeze(0)
+
     def reset_cache(self):
         self.cache_k = self.cache_v = None
         self.cache_pos = 0
+
+
+@register("moba", "MoBA — Mixture of Block Attention: own block + top-k past blocks by mean key (Moonshot, 2025)")
+class MixtureOfBlockAttention(GroupedQueryAttention):
+    """Block-sparse attention with learned-free routing (Moonshot, Feb 2025,
+    arXiv 2502.13189). Keys are cut into blocks of `moba_block` tokens. For each
+    query, every *closed* past block is scored by q · mean(keys in block), the
+    top `moba_top_k` blocks are kept, and the query attends over those plus its
+    own block (causally). Everything else is masked.
+
+    Why it is interesting next to DSA: no indexer to train. The block mean is a
+    free summary, so the routing needs no auxiliary loss and cannot drift from
+    the attention it serves. The price is granularity — a whole block is in or
+    out — and the MoE-style "some blocks get everyone" imbalance the paper
+    accepts. Kimi K2 uses it for its long-context variants.
+
+    Two exact anchors define the mechanism, and the self-test pins both: with
+    every block selected this *is* GQA; with none selected a query still reads
+    its own block. The second matters more than it looks — drop the own block
+    and a query's row can be entirely masked, so softmax returns NaN. The
+    own-block check pins the routing rule directly; assert_close also rejects
+    NaNs by default, even when both compared outputs contain them.
+
+    ponytail: dense scores masked to the selection, so O(T²) compute; the
+    speedup needs a gather. Same trade every sparse entry in this zoo makes.
+    """
+
+    def __init__(self, cfg):
+        super().__init__(cfg)
+        self.block = cfg.get("moba_block", 64)
+        self.top_k = cfg.get("moba_top_k", 3)
+
+    def _allowed(self, q, k, q_pos, k_pos):
+        """(B, H, T_q, T_k) bool: which keys each query may read, before causality."""
+        B, H, T_q, hd = q.shape
+        kb, qb = k_pos // self.block, q_pos // self.block
+        n_blocks = int(kb.max()) + 1
+        # Mean key per block. Closed blocks give the same mean in prefill and
+        # decode, which is what keeps cached generation identical.
+        sums = k.new_zeros(B, H, n_blocks, hd).index_add_(2, kb, k)
+        counts = torch.bincount(kb, minlength=n_blocks).clamp(min=1).to(k.dtype)
+        score = q @ (sums / counts[:, None]).transpose(-1, -2)  # (B, H, T_q, n_blocks)
+        blocks = torch.arange(n_blocks, device=q.device)
+        candidate = blocks.unsqueeze(0) < qb.unsqueeze(-1)  # strictly earlier blocks only
+        selected = torch.zeros_like(score, dtype=torch.bool)
+        k_sel = min(self.top_k, n_blocks)
+        if k_sel > 0:
+            picks = score.masked_fill(~candidate, float("-inf")).topk(k_sel, dim=-1).indices
+            selected.scatter_(-1, picks, True)
+            selected &= candidate  # a -inf pick is not a selection
+        selected |= blocks.unsqueeze(0) == qb.unsqueeze(-1)  # own block, always
+        return selected.gather(-1, kb.expand(B, H, T_q, -1))
+
+    def _mask(self, q, k, q_pos, k_pos):
+        return super()._mask(q, k, q_pos, k_pos) | ~self._allowed(q, k, q_pos, k_pos)
+
+    def allowed_keys(self, x):
+        """(B, H, T, T) bool: the keys each query actually reads on a plain
+        forward — block selection *and* causality. For inspection and tests."""
+        B, T, _ = x.shape
+        q = self.W_query(x).view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
+        k = self.W_key(x).view(B, T, self.n_kv_groups, self.head_dim).transpose(1, 2)
+        pos = torch.arange(T, device=x.device)
+        return ~self._mask(q, k.repeat_interleave(self.group_size, dim=1), pos, pos)
 
 
 @register("gated", "Gated Attention — GQA + output gate, no attention sinks (Qwen3-Next, Qwen3.5)")
@@ -1395,6 +1465,12 @@ def _self_test():
         attn(x[:, :prefill], use_cache=True)
         step = torch.cat([attn(x[:, t : t + 1], use_cache=True) for t in range(prefill, T)], dim=1)
         torch.testing.assert_close(step, full[:, prefill:], atol=1e-4, rtol=1e-4)
+    # ...and its rolling window must hold kernel-1 tokens of *memory*, not a
+    # view into the whole padded prefill. Bytes, not shapes (see swa store).
+    conv = ShortConv(d, kernel=4).eval()
+    conv(x, use_cache=True)
+    held = conv.conv_state.untyped_storage().nbytes() // (B * d * conv.conv_state.element_size())
+    assert conv.conv_state.shape[-1] == 3 and held == 3, f"conv window holds {held} tokens of memory"
     print("  shortconv ok — rolling conv state keeps incremental decode exact")
 
     # Attention sinks: with the sink logit driven high every head should drain
@@ -1448,6 +1524,41 @@ def _self_test():
     # Mamba-3 drops the short conv: the trapezoid already mixes x_t with x_{t-1}.
     assert get_attention("mamba2", {**cfg, "mamba_trapezoidal": True}).conv is None
     print("  mamba2    ok — trapezoidal and complex flags bite, carried state keeps decode exact")
+
+    # MoBA: keys in blocks, each query attends to its own block plus the top-k
+    # past blocks by mean-key score. Three exact anchors: every block selected
+    # equals gqa; k=0 leaves exactly the current block (the diagonal must stay
+    # reachable — an empty row would emit NaN); k=1
+    # adds exactly one full block for every query that has a past block.
+    ref = get_attention("gqa", cfg).eval()
+    blk = 8
+    for k, extra in ((100, None), (0, 0), (1, 1)):
+        m = get_attention("moba", {**cfg, "moba_block": blk, "moba_top_k": k}).eval()
+        m.load_state_dict(ref.state_dict())
+        out = m(x)
+        assert torch.isfinite(out).all(), f"moba k={k} produced non-finite output"
+        if extra is None:
+            torch.testing.assert_close(out, ref(x), atol=1e-5, rtol=1e-5)
+            continue
+        assert not torch.allclose(out, ref(x), atol=1e-3), f"moba k={k} equals full attention"
+        pos = torch.arange(T)
+        allowed = m.allowed_keys(x)  # (B, H, T, T) bool
+        want = (pos % blk) + 1 + extra * blk * (pos // blk > 0)  # own block so far + k past blocks
+        torch.testing.assert_close(allowed.sum(-1), want.expand(B, m.n_heads, T))
+        # Use several blocks and cross block boundaries in cached chunks; the
+        # registry test's default 64-token block is longer than its sequence.
+        m.reset_cache()
+        chunks = []
+        start = 0
+        for end in (3, 17, 33, T):
+            chunks.append(m(x[:, start:end], use_cache=True))
+            start = end
+        torch.testing.assert_close(torch.cat(chunks, dim=1), out, atol=1e-4, rtol=1e-4)
+        poked = x.clone()
+        cut = 19  # inside a block, so its mean changes too
+        poked[:, cut:] += 10.0
+        torch.testing.assert_close(m(poked)[:, :cut], out[:, :cut], atol=1e-5, rtol=1e-5)
+    print(f"  moba      ok — all blocks == gqa, k=0 sees own block only, k=1 adds exactly one {blk}-key block")
 
     # Explicit low-precision inference must also work without autocast. Check
     # prefill plus decode against an fp32 reference, and exercise norm gradients.
