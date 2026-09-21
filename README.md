@@ -46,6 +46,7 @@ python -m nano.models.gemma_nano
 # Pick a size and (for GPT) an attention variant
 python -m nano.models.gpt_nano --size small --attention gqa --epochs 5
 python -m nano.models.gpt_nano --attention all         # benchmark all ten attention types
+python -m nano.models.gpt_nano --block parallel        # GPT-J / PaLM parallel block
 
 # Swap components on the hybrid model
 python -m nano.models.qwen_next_nano --linear kda --short-conv 4 --residual mhc
@@ -70,6 +71,7 @@ Every file self-tests — no pytest, no CI:
 
 ```bash
 python -m nano.attention_zoo                        # all ten attention variants
+python -m nano.models.gpt_nano --self-check         # block wiring, cached decode
 python -m nano.models.qwen_next_nano --self-check   # hybrid components
 python -m nano.models.qwen_next_nano --train-check  # what only gradients reveal
 python -m nano.models.deepseek_nano --self-check    # MoE routing and load balancing
