@@ -1,0 +1,19 @@
+{
+  "_comment": "DeepSeek-V4.1-Flash's causal encoder-decoder layout at nano scale: an all-attention stack (ratio 0) whose second half reads K/V from named first-half layers, plus Engram memory and MTP. V4.1 pairs this with the hierarchical DSA indexer on MLA (--index-modes); that needs attn=mla, which cannot share K/V here, so this preset shows the encoder-decoder half.",
+  "size": "nano",
+  "seed": 42,
+  "model": {
+    "n_layers": 8,
+    "hybrid_ratio": 0,
+    "attn": "gqa",
+    "kv_sources": [null, null, null, null, 0, 1, 2, 3],
+    "engram_dim": 16,
+    "engram_layer": 1,
+    "mtp_weight": 0.3
+  },
+  "train": {
+    "num_epochs": 40,
+    "batch_size": 8,
+    "learning_rate": 0.0003
+  }
+}
