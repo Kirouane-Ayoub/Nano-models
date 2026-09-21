@@ -19,6 +19,7 @@ Supported types:
     - swa:      Sliding Window Attention (Mistral, Gemma)
     - deltanet: Gated DeltaNet linear attention (Qwen3-Next)
     - kda:      Kimi Delta Attention — DeltaNet with per-channel decay (Kimi Linear)
+    - mamba2:   Mamba-2 SSD state space, scalar decay per head (Nemotron 3); Mamba-3 flags
     - lightning: Lightning Attention — linear attention, fixed per-head decay (MiniMax-01, Ling 2.5)
     - dsa:      DeepSeek Sparse Attention — MLA + lightning indexer (DeepSeek-V3.2)
     - csa:      Compressed Sparse Attention — compress 4:1, then top-k (DeepSeek-V4)
@@ -620,7 +621,8 @@ class ShortConv(nn.Module):
             pad = u.new_zeros(u.shape[0], u.shape[1], self.kernel - 1)
         u = torch.cat([pad, u], dim=-1)
         if use_cache:
-            self.conv_state = u[..., -(self.kernel - 1) :]
+            # Copy the window so its storage does not retain the full prefill.
+            self.conv_state = u[..., u.shape[-1] - (self.kernel - 1) :].clone()
         return F.silu(self.conv(u)).transpose(1, 2)
 
     def reset_cache(self):
@@ -766,6 +768,166 @@ class KimiDeltaAttention(GatedDeltaNet):
         alpha_log = -self.A_log.exp().view(1, 1, -1) * F.softplus(self.W_alpha(x) + self.dt_bias)
         alpha = alpha_log.exp().view(B, T, self.n_heads, self.head_dim)
         return alpha.transpose(1, 2).unsqueeze(-1)
+
+
+# ──────────────────────────────────────────────
+# Mamba-2 (SSD) with Mamba-3 flags
+# ──────────────────────────────────────────────
+
+
+def _rotate_pairs(v, theta):
+    """Rotate the N/2 (v1, v2) pairs of v (..., N) by theta (..., N/2)."""
+    v1, v2 = v.chunk(2, dim=-1)
+    cos, sin = torch.cos(theta), torch.sin(theta)
+    return torch.cat([v1 * cos - v2 * sin, v1 * sin + v2 * cos], dim=-1)
+
+
+@register("mamba2", "Mamba-2 SSD — selective state space, scalar decay per head (Mamba-2, Nemotron 3); Mamba-3 flags")
+class Mamba2(nn.Module):
+    """Selective state-space layer in the SSD form (Dao & Gu, 2024), with Mamba-3's
+    two main changes (Mar 2026, arXiv 2603.15569) behind flags.
+
+    Each head keeps a (head_dim × state) matrix S. Per token the input projects
+    to x (what to write), B (where in the state to write it), C (what to read),
+    a step size Δ, and a gate z:
+
+        a_t = exp(Δ_t · A)           scalar decay per head, A < 0 learned
+        S_t = a_t · S_{t-1} + Δ_t · x_t ⊗ B_t
+        y_t = S_t · C_t + D · x_t     then y · silu(z), RMSNorm, out_proj
+
+    Same family as DeltaNet (a state instead of a KV cache) but the write is a
+    plain outer product, not a delta rule, and the forgetting is *selective*:
+    Δ_t is input-dependent, so a token can choose to reset (large Δ) or pass
+    through (Δ→0). Nemotron 3 interleaves these with attention and MoE.
+
+    Mamba-3 flags:
+      - `mamba_trapezoidal`: exponential-trapezoidal discretisation. The input
+        term becomes (1−λ_t)·Δ_t x_t⊗B_t + λ_t·a_t·Δ_{t-1} x_{t-1}⊗B_{t-1} with
+        a learned, data-dependent λ_t. Higher-order in Δ, and because it already
+        mixes t with t−1 the short conv is dropped. Carries the previous input
+        term as extra state.
+      - `mamba_complex`: complex-valued state. Equivalent to rotating B_t and
+        C_t by an angle that accumulates with Δ (θ_t = Σ_{s≤t} Δ_s · ω), i.e.
+        data-dependent RoPE inside the state, which is what lets an SSM track
+        parity-like state. Carries the accumulated Δ as extra state.
+      - MIMO is not implemented (ponytail: the SISO recurrence above is the
+        teaching point; MIMO is a throughput change).
+
+    ponytail: training runs the dense (T×T) SSD form with a decay matrix
+    L[i,j] = exp(Σ_{k=j+1..i} Δ_k A); cached decode runs the recurrence one
+    token at a time. The chunked kernel that makes Mamba-2 fast is a CUDA
+    concern. State-space math is done in fp32 whatever autocast says.
+    """
+
+    def __init__(self, cfg):
+        super().__init__()
+        d = cfg["emb_dim"]
+        self.n_heads = cfg["n_heads"]
+        self.head_dim = d // self.n_heads
+        self.state = cfg.get("mamba_state", 16)
+        self.trapezoidal = bool(cfg.get("mamba_trapezoidal", False))
+        self.complex = bool(cfg.get("mamba_complex", False))
+        H, N = self.n_heads, self.state
+        assert N % 2 == 0, "mamba_state must be even (complex state rotates pairs)"
+
+        # x, z, B, C, Δ in one projection
+        self.W_in = nn.Linear(d, 2 * d + 2 * N + H, bias=False)
+        self.dt_bias = nn.Parameter(torch.log(torch.expm1(torch.linspace(0.01, 0.1, H))))
+        self.A_log = nn.Parameter(torch.log(torch.arange(1, H + 1).float()))
+        self.D = nn.Parameter(torch.ones(H))
+        self.conv = None if self.trapezoidal else ShortConv(d + 2 * N, cfg.get("mamba_conv", 4))
+        self.lam_proj = nn.Linear(d, H, bias=False) if self.trapezoidal else None
+        if self.trapezoidal:
+            nn.init.zeros_(self.lam_proj.weight)  # λ = 0.5: the classic trapezoid
+        self.omega = nn.Parameter(1.0 / (10.0 ** (torch.arange(0, N, 2).float() / N)).repeat(H, 1)) if self.complex else None
+        self.norm = nn.RMSNorm(d)
+        self.out_proj = nn.Linear(d, d, bias=False)
+
+        # Recurrent state under use_cache
+        for name in ("S", "I_prev", "dt_acc"):
+            self.register_buffer(name, None, persistent=False)
+
+    def _split(self, x, use_cache):
+        d, N, H = self.head_dim * self.n_heads, self.state, self.n_heads
+        proj = self.W_in(x)
+        xBC, z, dt_raw = proj.split([d + 2 * N, d, H], dim=-1)
+        if self.conv is not None:
+            xBC = self.conv(xBC, use_cache=use_cache)
+        # Keep the convolution in the projection dtype; upcast its output and
+        # the remaining inputs for the state-space calculation afterwards.
+        xBC, z, dt_raw = xBC.float(), z.float(), dt_raw.float()
+        xs, Bm, Cm = xBC.split([d, N, N], dim=-1)
+        dt = F.softplus(dt_raw + self.dt_bias)  # (B, T, H)
+        B_, T = x.shape[:2]
+        xh = xs.view(B_, T, H, self.head_dim)
+        lam = torch.sigmoid(self.lam_proj(x).float()) if self.trapezoidal else None
+        return xh, Bm, Cm, dt, z, lam
+
+    def _rotated(self, Bm, Cm, theta):
+        """Expand B, C to per-head and, with the complex flag, rotate by theta."""
+        H = self.n_heads
+        Bh = Bm.unsqueeze(-2).expand(*Bm.shape[:-1], H, self.state)
+        Ch = Cm.unsqueeze(-2).expand(*Cm.shape[:-1], H, self.state)
+        if theta is None:
+            return Bh, Ch
+        return _rotate_pairs(Bh, theta), _rotate_pairs(Ch, theta)
+
+    def forward(self, x, use_cache=False):
+        B_, T, d = x.shape
+        H, P, N = self.n_heads, self.head_dim, self.state
+        xh, Bm, Cm, dt, z, lam = self._split(x, use_cache)
+        A = -torch.exp(self.A_log)  # (H,)
+        a = torch.exp(dt * A)  # (B, T, H)
+
+        if use_cache:
+            S = self.S if self.S is not None else xh.new_zeros(B_, H, P, N)
+            I_prev = self.I_prev if self.I_prev is not None else xh.new_zeros(B_, H, P, N)
+            acc = self.dt_acc if self.dt_acc is not None else dt.new_zeros(B_, H)
+            ys = []
+            for t in range(T):
+                theta = None
+                if self.complex:
+                    acc = acc + dt[:, t]
+                    theta = acc.unsqueeze(-1) * self.omega
+                Bh, Ch = self._rotated(Bm[:, t], Cm[:, t], theta)
+                I_t = dt[:, t, :, None, None] * xh[:, t, :, :, None] * Bh[:, :, None, :]
+                write = I_t
+                if self.trapezoidal:
+                    l_t = lam[:, t, :, None, None]
+                    write = (1 - l_t) * I_t + l_t * a[:, t, :, None, None] * I_prev
+                    I_prev = I_t
+                S = a[:, t, :, None, None] * S + write
+                ys.append(torch.einsum("bhpn,bhn->bhp", S, Ch) + self.D[:, None] * xh[:, t])
+            self.S, self.I_prev, self.dt_acc = S, I_prev, acc
+            y = torch.stack(ys, dim=1)  # (B, T, H, P)
+        else:
+            theta = torch.cumsum(dt, dim=1).unsqueeze(-1) * self.omega if self.complex else None
+            Bh, Ch = self._rotated(Bm, Cm, theta)  # (B, T, H, N)
+            I = dt[..., None, None] * xh[..., :, None] * Bh[..., None, :]  # (B, T, H, P, N)
+            if self.trapezoidal:
+                I_prev = torch.cat([torch.zeros_like(I[:, :1]), I[:, :-1]], dim=1)
+                l = lam[..., None, None]
+                I = (1 - l) * I + l * a[..., None, None] * I_prev
+            # L[i, j] = Π_{k=j+1..i} a_k = exp(cum_i − cum_j), zero above the diagonal
+            cum = torch.cumsum(dt * A, dim=1)  # (B, T, H), non-increasing
+            diff = cum.unsqueeze(2) - cum.unsqueeze(1)  # (B, T_i, T_j, H)
+            future = torch.arange(T, device=x.device).unsqueeze(-1) < torch.arange(T, device=x.device)
+            L = torch.exp(diff.masked_fill(future[None, :, :, None], float("-inf")))
+            y = torch.einsum("bijh,bjhpn,bihn->bihp", L, I, Ch) + self.D[:, None] * xh
+
+        y = y.reshape(B_, T, d) * F.silu(z)
+        y = F.rms_norm(y, (d,), self.norm.weight.float(), self.norm.eps)
+        return self.out_proj(y.to(x.dtype))
+
+    def step_sizes(self, x):
+        """Δ per token and head, (B, T, H) — the selectivity signal. For analysis;
+        a Δ that has collapsed to a constant means the layer is a linear RNN."""
+        return self._split(x, use_cache=False)[3]
+
+    def reset_cache(self):
+        self.S = self.I_prev = self.dt_acc = None
+        if self.conv is not None:
+            self.conv.reset_cache()
 
 
 # ──────────────────────────────────────────────
@@ -1267,9 +1429,29 @@ def _self_test():
     torch.testing.assert_close(attn(poked)[:, -1], attn(x)[:, -1], atol=1e-5, rtol=1e-5)
     print("  lightning ok — per-head decay bites, infinite slope forgets the past")
 
+    # Mamba-2 (SSD): the registry loop already checks shape, prefill+decode and
+    # causality. The Mamba-3 pieces are flags; each must change the output and
+    # keep incremental decode exact, since both add carried state (the previous
+    # input for the trapezoid, the accumulated angle for the complex state).
+    base_m = get_attention("mamba2", cfg).eval()
+    assert base_m.conv is not None, "Mamba-2 keeps the short conv"
+    for flag in ("mamba_trapezoidal", "mamba_complex"):
+        m = get_attention("mamba2", {**cfg, flag: True}).eval()
+        m.load_state_dict(base_m.state_dict(), strict=False)
+        assert not torch.allclose(m(x), base_m(x), atol=1e-4), f"{flag} is a no-op"
+        m.reset_cache()
+        pre = m(x[:, :prefill], use_cache=True)
+        step = torch.cat([m(x[:, t : t + 1], use_cache=True) for t in range(prefill, T)], dim=1)
+        full = m(x)
+        torch.testing.assert_close(pre, full[:, :prefill], atol=1e-4, rtol=1e-4)
+        torch.testing.assert_close(step, full[:, prefill:], atol=1e-4, rtol=1e-4)
+    # Mamba-3 drops the short conv: the trapezoid already mixes x_t with x_{t-1}.
+    assert get_attention("mamba2", {**cfg, "mamba_trapezoidal": True}).conv is None
+    print("  mamba2    ok — trapezoidal and complex flags bite, carried state keeps decode exact")
+
     # Explicit low-precision inference must also work without autocast. Check
     # prefill plus decode against an fp32 reference, and exercise norm gradients.
-    for name in ("lightning", "ssmax"):
+    for name in ("lightning", "ssmax", "mamba2"):
         for dtype, tol in ((torch.float16, 3e-3), (torch.bfloat16, 3e-2)):
             reference = get_attention(name, cfg).eval()
             attn = get_attention(name, cfg).eval().to(dtype=dtype)
@@ -1308,14 +1490,19 @@ def _self_test():
     # Softcapping: c·tanh(s/c) on the logits. With a huge cap it must equal
     # plain gqa on the same weights; with a small one it must flatten attention.
     ref = get_attention("gqa", cfg).eval()
-    # tanh(z)≈z−z³/3, so the residual error is logits³/(3c²): c=1e9 keeps it
-    # under 1e-9 even for logits in the thousands.
+    # tanh(z)≈z−z³/3, so the cubic error is logits³/(3c²) — negligible at c=1e9.
+    # What is not negligible in fp32 is rounding z/c itself: a relative 6e-8 of
+    # a logit in the thousands, amplified by softmax. So compare in float64,
+    # where the identity holds to 1e-5 regardless of the random weights.
     loose = get_attention("softcap", {**cfg, "attn_softcap": 1e9}).eval()
     tight = get_attention("softcap", {**cfg, "attn_softcap": 0.5}).eval()
     loose.load_state_dict(ref.state_dict())
     tight.load_state_dict(ref.state_dict())
     big = x * 20  # large logits, so the cap has something to cap
-    torch.testing.assert_close(loose(big), ref(big), atol=1e-5, rtol=1e-5)
+    torch.testing.assert_close(
+        loose.double()(big.double()), ref.double()(big.double()), atol=1e-5, rtol=1e-5
+    )
+    ref.float(), loose.float()
     assert not torch.allclose(tight(big), ref(big), atol=1e-2), "cap of 0.5 did nothing"
     print("  softcap   ok — exact at cap→∞, bites at cap=0.5")
 
