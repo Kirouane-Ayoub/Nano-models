@@ -60,6 +60,7 @@ Usage:
     python -m nano.models.qwen_next_nano --ratio 0 --kv-sources=-,-,0,1  # two KV owners, two readers
     python -m nano.models.qwen_next_nano --config configs/qwen_flash_next.json  # Qwen3.8-Flash-Next recipe
     python -m nano.models.qwen_next_nano --residual mhc                   # 4 hyper-connected residual streams
+    python -m nano.models.qwen_next_nano --residual gr                    # 4 gated residual branches (Qwen3.8-Next)
     python -m nano.models.qwen_next_nano --ple-dim 16                     # per-layer embeddings (Gemma 4)
     python -m nano.models.qwen_next_nano --self-check                     # no training, just asserts
     python -m nano.models.qwen_next_nano --train-check                    # overfit to assert MTP/mHC learn
@@ -92,7 +93,14 @@ from nano.attention_zoo import (
     qsa_index_loss,
     qsa_select,
 )
-from nano.components import DepthRouter, Engram, HyperConnections, PerLayerEmbeddings, sinkhorn
+from nano.components import (
+    DepthRouter,
+    Engram,
+    GatedResidual,
+    HyperConnections,
+    PerLayerEmbeddings,
+    sinkhorn,
+)
 from nano.accel import current_device, is_main_process, log
 from nano.models.qwen_nano import (
     RMSNorm,
@@ -466,14 +474,18 @@ class HybridBlock(nn.Module):
         self.post1 = RMSNorm(cfg["emb_dim"]) if sandwich else nn.Identity()
         self.post2 = RMSNorm(cfg["emb_dim"]) if sandwich else nn.Identity()
 
-        # Residual style: one stream, or n hyper-connected streams.
+        # Residual style: one stream, n hyper-connected streams, or n gated branches.
+        self.hc_attn = self.hc_ff = self.gr_attn = self.gr_ff = None
         if cfg.get("residual", "plain") == "mhc":
             n, iters = cfg.get("mhc_streams", 4), cfg.get("mhc_iters", 12)
             init, noise = cfg.get("mhc_init", 8.0), cfg.get("mhc_noise", 0.02)
             self.hc_attn = HyperConnections(n, iters, init, noise)
             self.hc_ff = HyperConnections(n, iters, init, noise)
-        else:
-            self.hc_attn = self.hc_ff = None
+        elif cfg.get("residual", "plain") == "gr":
+            n, rank = cfg.get("gr_branches", 4), cfg.get("gr_rank", 0) or None
+            self.gr_attn = GatedResidual(cfg["emb_dim"], n, rank)
+            self.gr_ff = GatedResidual(cfg["emb_dim"], n, rank)
+            self.norm1 = self.norm2 = None  # GR's per-branch RMSNorm *is* the pre-norm
 
     def _mix(self, h, cos, sin, use_cache):
         out = (
@@ -484,6 +496,10 @@ class HybridBlock(nn.Module):
         return self.post1(out)
 
     def forward(self, x, cos, sin, use_cache=False):
+        if self.gr_attn is not None:
+            # x is (B, T, n, d); GR normalises the branches itself, hence no norm1/norm2.
+            x = self.gr_attn(x, lambda h: self._mix(h, cos, sin, use_cache))
+            return self.gr_ff(x, lambda h: self.post2(self.ff(h)))
         if self.hc_attn is None:
             x = x + self._mix(self.norm1(x), cos, sin, use_cache)
             return x + self.post2(self.ff(self.norm2(x)))
@@ -545,7 +561,14 @@ class QwenNextNano(nn.Module):
         )
         self.cfg = cfg
         self.pattern = build_layer_pattern(cfg["n_layers"], cfg["hybrid_ratio"])
-        self.mhc_streams = cfg.get("mhc_streams", 4) if cfg.get("residual") == "mhc" else 0
+        self.residual = cfg.get("residual", "plain")
+        if self.residual not in ("plain", "mhc", "gr"):
+            raise ValueError(f"residual={self.residual!r} must be plain, mhc or gr")
+        if self.residual == "gr" and cfg.get("gr_branches", 4) < 1:
+            raise ValueError("gr_branches must be >= 1")
+        # Width of the residual pathway: 0 = one plain stream (B, T, d); otherwise
+        # (B, T, n, d) for mHC's streams or GR's branches.
+        self.n_streams = {"mhc": cfg.get("mhc_streams", 4), "gr": cfg.get("gr_branches", 4)}.get(self.residual, 0)
 
         self.tok_emb = nn.Embedding(cfg["vocab_size"], cfg["emb_dim"])
         self.drop = nn.Dropout(cfg["drop_rate"])
@@ -681,28 +704,33 @@ class QwenNextNano(nn.Module):
             if hasattr(m, "aux_index_loss"):
                 m.aux_index_loss = None
         x = self.drop(self.tok_emb(idx))
-        if self.mhc_streams:
+        if self.residual == "mhc":
             # Fan out into [x, 0, ..., 0] and sum back at the end. Streams must
             # start distinguishable — see HyperConnections.
-            x = F.pad(x.unsqueeze(2), (0, 0, 0, self.mhc_streams - 1))
+            x = F.pad(x.unsqueeze(2), (0, 0, 0, self.n_streams - 1))
+        elif self.residual == "gr":
+            # n identical copies; GR's per-branch write scalars tell them apart.
+            x = x.unsqueeze(2).expand(-1, -1, self.n_streams, -1)
         ple = self.ple.lookup(idx) if self.ple is not None else None
         for i, block in enumerate(self.blocks):
             router = self.mod[str(i)] if self.mod is not None and str(i) in self.mod else None
             if router is None:
                 x = block(x, self.cos, self.sin, use_cache=use_cache)
             else:
-                g = router.gate(x[:, :, 0] if self.mhc_streams else x)
-                if self.mhc_streams:
+                g = router.gate(x[:, :, 0] if self.n_streams else x)
+                if self.n_streams:
                     g = g.unsqueeze(-1)
                 # x + g·(block(x) − x): the block for routed tokens, identity otherwise
                 x = x + g * (block(x, self.cos, self.sin, use_cache=use_cache) - x)
             if ple is not None:
                 x = x + self._into_stream0(self.ple.layer_signal(ple, i))
             if self.engram is not None and i == self.engram_layer:
-                h = x[:, :, 0] if self.mhc_streams else x
+                h = x[:, :, 0] if self.n_streams else x
                 x = x + self._into_stream0(self.engram(h, idx, use_cache=use_cache))
-        if self.mhc_streams:
+        if self.residual == "mhc":
             x = x.sum(dim=2)
+        elif self.residual == "gr":
+            x = x.mean(dim=2)  # branches start identical; the mean is the natural read-out
         logits = self._logits(x)
         aux = [r.aux for r in (self.mod.values() if self.mod is not None else ()) if r.aux is not None]
         if targets is not None and self.mtp is not None:
@@ -720,8 +748,8 @@ class QwenNextNano(nn.Module):
     def _into_stream0(self, sig):
         """With hyper-connections a (B, T, d) signal goes into stream 0, the one
         the blocks actually read from at init. Without them it is just added."""
-        if self.mhc_streams:
-            return F.pad(sig.unsqueeze(2), (0, 0, 0, self.mhc_streams - 1))
+        if self.n_streams:
+            return F.pad(sig.unsqueeze(2), (0, 0, 0, self.n_streams - 1))
         return sig
 
     def _logits(self, x):
@@ -1106,6 +1134,63 @@ def self_check():
     assert torch.isfinite(mtp_loss), "MTP loss not finite under logit softcap"
     print(f"  logitcap  ok — |logits| {z.abs().max():.2f} -> {zc.abs().max():.2f} at c=0.5, MTP head capped too")
 
+    # Gated Residual (Qwen3.8-Next): n identical branches; each sublayer reads
+    # the mean of per-channel sigmoid-gated, per-branch-normalised branches (so
+    # GR *replaces* pre-norm), and writes its output back with one scalar per
+    # branch in (0, 2). No n×n mixing matrix — that is the ablated-away part
+    # of mHC. Standard init, no special symmetry breaking needed.
+    cfg_gr, gr = build(residual="gr", gr_branches=4)
+    blk = gr.blocks[0]
+    assert blk.norm1 is None and blk.norm2 is None, "GR replaces pre-norm; the block must not norm twice"
+    d, n = cfg_gr["emb_dim"], 4
+    R = torch.randn(2, 5, n, d)
+    x_read, R_hat, G = blk.gr_attn.read(R)
+    assert G.shape == (2, 5, n, d) and (G > 0).all() and (G < 1).all(), "read gate must be per-channel sigmoid"
+    # Data dependence: a different input must give a different gate. (At the 0.02
+    # init the gate logits are ~1e-3, so the gate sits near 0.5 everywhere — the
+    # variation is real but tiny, which is why this is not a variance threshold.)
+    _, _, G_other = blk.gr_attn.read(R + torch.randn_like(R))
+    assert not torch.allclose(G, G_other, atol=1e-7), "read gate does not depend on the data"
+    torch.testing.assert_close(x_read, (G * R_hat).mean(dim=2))
+    s_w = blk.gr_attn.write_scale(R_hat)
+    assert s_w.shape == (2, 5, n) and (s_w > 0).all() and (s_w < 2).all(), "write scale is one scalar per branch in (0, 2)"
+    rank = d // 8
+    want = 2 * (n * d * rank) + n * d + (n * d) * n  # W_d, W_u, per-branch gains, W_w
+    assert sum(p.numel() for p in blk.gr_attn.parameters()) == want
+    probe = torch.randint(0, cfg_gr["vocab_size"], (2, 12))
+    _, plain_gr = build(residual="plain")
+    assert not torch.allclose(gr(probe), plain_gr(probe)), "GR is a no-op"
+    check_incremental(gr, cfg_gr["vocab_size"])
+    a, b = probe.clone(), probe.clone()
+    b[:, 6] = (b[:, 6] + 1) % cfg_gr["vocab_size"]
+    torch.testing.assert_close(gr(a)[:, :6], gr(b)[:, :6])
+    cfg_gx, gr_x = build(residual="gr", gr_branches=2, engram_dim=8, mod_capacity=0.5, norm_style="sandwich")
+    check_incremental(gr_x, cfg_gx["vocab_size"])
+    try:
+        build(residual="gr", gr_branches=0)
+        raise AssertionError("gr_branches=0 should be refused")
+    except ValueError:
+        pass
+    print(f"  gr        ok — {n} branches, per-channel read gate, per-branch write scale in (0,2), "
+          f"{want:,} params/unit, replaces pre-norm, decode exact, works with engram/mod/sandwich")
+
+    # Explicit half precision must preserve the GR read on large residuals.
+    # Compare identical rounded weights/inputs with FP32, and exercise backward.
+    import copy
+
+    for dtype in (torch.float16, torch.bfloat16):
+        unit = copy.deepcopy(blk.gr_attn).to(dtype)
+        reference = copy.deepcopy(unit).float()
+        large = (torch.randn(2, 5, n, d) * 300).to(dtype).requires_grad_()
+        actual = unit.read(large)[0]
+        expected = reference.read(large.detach().float())[0]
+        assert actual.dtype == dtype and actual.float().norm() > 0
+        torch.testing.assert_close(actual.float(), expected, atol=5e-3, rtol=2e-2)
+        unit(large, lambda h: h).float().square().mean().backward()
+        assert torch.isfinite(large.grad).all()
+        assert all(p.grad is not None and torch.isfinite(p.grad).all() for p in unit.parameters())
+    print("  gr dtype  ok — large fp16/bf16 residuals match FP32 reads, gradients finite")
+
     # mHC: the manifold constraint must hold exactly, n=1 must degenerate to a
     # plain residual, and the identity init must start out as one.
     cfg_hc, mhc = build(residual="mhc", mhc_streams=4, mhc_noise=0.0)
@@ -1427,7 +1512,7 @@ def train_check():
 
     model.eval()
     with torch.no_grad():
-        h = F.pad(model.drop(model.tok_emb(x)).unsqueeze(2), (0, 0, 0, model.mhc_streams - 1))
+        h = F.pad(model.drop(model.tok_emb(x)).unsqueeze(2), (0, 0, 0, model.n_streams - 1))
         for b in model.blocks:
             h = b(h, model.cos, model.sin)
     norms = h.norm(dim=-1).mean(dim=(0, 1))
@@ -1585,8 +1670,16 @@ def main():
         "--residual",
         type=str,
         default="plain",
-        choices=["plain", "mhc"],
-        help="Residual style: single stream, or manifold-constrained hyper-connections",
+        choices=["plain", "mhc", "gr"],
+        help="Residual style: single stream, manifold-constrained hyper-connections (DeepSeek V4), "
+        "or gated residual branches (Qwen3.8-Next)",
+    )
+    parser.add_argument(
+        "--gr-branches",
+        type=int,
+        default=4,
+        metavar="N",
+        help="Residual branches for --residual gr (Qwen3.8-Next uses 4)",
     )
     parser.add_argument(
         "--mhc-streams",
@@ -1695,6 +1788,7 @@ def main():
         "rope_fraction": args.rope_fraction,
         "residual": args.residual,
         "mhc_streams": args.mhc_streams,
+        "gr_branches": args.gr_branches,
         "ple_dim": args.ple_dim,
         "engram_dim": args.engram_dim,
         "engram_layer": args.engram_layer,
@@ -1722,6 +1816,7 @@ def main():
         ("rope_fraction", "--rope-fraction", args.rope_fraction),
         ("residual", "--residual", args.residual),
         ("mhc_streams", "--mhc-streams", args.mhc_streams),
+        ("gr_branches", "--gr-branches", args.gr_branches),
         ("ple_dim", "--ple-dim", args.ple_dim),
         ("engram_dim", "--engram-dim", args.engram_dim),
         ("engram_layer", "--engram-layer", args.engram_layer),
@@ -1780,7 +1875,7 @@ def main():
         )
         + f"({model.own_kv_layers()} layers own their KV), "
         f"residual={cfg['residual']}"
-        + (f" x{model.mhc_streams} streams" if model.mhc_streams else "")
+        + (f" x{model.n_streams} {'branches' if model.residual == 'gr' else 'streams'}" if model.n_streams else "")
         + (f", ple={cfg['ple_dim']}d" if model.ple is not None else "")
         + (f", engram={cfg['engram_dim']}d after block {model.engram_layer}" if model.engram is not None else "")
         + (f", mod={cfg['mod_capacity']} on blocks {sorted(int(i) for i in model.mod)}" if model.mod is not None else "")
