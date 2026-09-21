@@ -64,6 +64,8 @@ from nano.models.gpt_nano import GPTNano
 from nano.models.gemma_nano import MODEL_SIZES as GEMMA_SIZES
 from nano.models.gemma_nano import GemmaNano
 from nano.models.looped_nano import LoopedNano
+from nano.models.mamba_nano import MODEL_SIZES as MAMBA_SIZES
+from nano.models.mamba_nano import MambaNano
 from nano.models.qwen_nano import MODEL_SIZES as QWEN_SIZES
 from nano.models.qwen_nano import QwenNano, compute_rope_params
 from nano.models.qwen_next_nano import MODEL_SIZES as QWEN_NEXT_SIZES
@@ -75,6 +77,7 @@ ARCHITECTURES = {
     "qwen": (QwenNano, QWEN_SIZES, {}),
     "looped": (LoopedNano, QWEN_SIZES, {"loops": 4, "loop_sigma": 0.5, "loop_bptt": 0}),
     "gemma": (GemmaNano, GEMMA_SIZES, {}),  # local/global, dual RoPE, K-as-V — all in the sizes
+    "mamba": (MambaNano, MAMBA_SIZES, {"mamba_trapezoidal": False, "mamba_complex": False}),
     "deepseek": (DeepSeekNano, DEEPSEEK_SIZES, {"moe_latent_dim": 0, "balance_speed": 1e-3}),
     "qwen_next": (
         QwenNextNano,
@@ -251,6 +254,8 @@ def _self_check():
         ("qwen_next", {"mtp_weight": 0.3}),  # aux loss path
         ("looped", {}),  # weight-shared depth, per-iteration KV cache
         ("gemma", {}),  # two RoPE tables rebuilt by the wrapper, tied scaled embedding
+        ("mamba", {}),  # no attention, no cos/sin — nothing for the wrapper to rebuild
+        ("mamba", {"mamba_trapezoidal": True, "mamba_complex": True}),  # Mamba-3 dials
         ("gpt", {"attention": "dsa", "top_k": 4}),  # module-stashed aux loss
     ):
         cfg = build_nano_cfg(arch, "nano", vocab_size=V, drop_rate=0.0, **extra)
