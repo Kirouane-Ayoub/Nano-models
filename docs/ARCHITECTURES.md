@@ -29,6 +29,7 @@ independent — read the ones you need.
 | p-RoPE (partial RoPE) | `--posenc prope --rope-fraction 0.5` | `nano/models/qwen_next_nano.py` |
 | mHC hyper-connections | `--residual mhc` | `nano/models/qwen_next_nano.py` |
 | Per-layer embeddings | `--ple-dim 16` | `nano/models/qwen_next_nano.py` |
+| Engram conditional memory | `--engram-dim 16 --engram-layer 1` | `nano/models/qwen_next_nano.py` |
 | Multi-token prediction | `--mtp-weight 0.3` | `nano/models/qwen_next_nano.py` |
 | Parallel block (GPT-J/PaLM) | `--block parallel` | `nano/models/gpt_nano.py` |
 | Looped depth (Huginn/Ouro) | `--loops 4 --loop-bptt K` | `nano/models/looped_nano.py` |
@@ -474,6 +475,28 @@ current token. The PLE dimension is small and the table is never multiplied
 against anything large, so it's close to pure storage — it can live in slower
 memory. This is how Gemma 4 E2B carries 5.1B parameters while activating 2.3B:
 separating stored knowledge from active compute by a different route than MoE.
+
+### Engram — conditional memory
+**Paper:** *Conditional Memory via Scalable Lookup* (DeepSeek, Jan 2026), arXiv 2601.07372.
+
+**Problem.** A transformer recomputes static facts at every position.
+"New York" is followed by the same handful of tokens every time, yet attention
+and the FFN re-derive that from scratch. MoE adds parameters but still spends
+compute to reach them.
+
+**Solution.** A lookup table keyed by the last n tokens. Hash the suffix
+n-gram (n = 2, 3) into a row of a prime-sized embedding table, several heads
+per n-gram so one collision does not dominate, concatenate, project to the
+hidden size, gate, add to the residual after an early layer. Constant cost
+per token and, like PLE, pure memory that can live off the accelerator.
+DeepSeek's "sparsity allocation law": spend 20–25% of a sparse budget here,
+the rest on MoE. Not in DeepSeek-V4, which chose CSA/HCA and mHC instead, so
+read it as a live research direction rather than a shipped default.
+
+Causal by construction because the n-gram ends at t. What breaks is cached
+decode: the module must remember the previous n−1 token ids or the n-gram at
+the new token is wrong while everything else looks fine. The projection is
+zero-initialised so a model with Engram starts exactly as one without.
 
 ### KV sharing (cross-layer attention)
 **Paper:** Gemma 4 (Google, 2026).
