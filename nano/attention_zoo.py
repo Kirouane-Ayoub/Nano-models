@@ -11,9 +11,12 @@ Supported types:
     - gqa:      Grouped-Query Attention (Llama 3, Qwen 3)
     - gated:    GQA + sigmoid output gate (Qwen3-Next, Qwen3.5)
     - mla:      Multi-Head Latent Attention (DeepSeek)
+    - sink:     GQA + learned per-head sink logit (gpt-oss)
+    - kv1:      GQA reusing K as V, half the KV cache (Gemma 4)
     - swa:      Sliding Window Attention (Mistral, Gemma)
     - deltanet: Gated DeltaNet linear attention (Qwen3-Next)
     - kda:      Kimi Delta Attention — DeltaNet with per-channel decay (Kimi Linear)
+    - lightning: Lightning Attention — linear attention, fixed per-head decay (MiniMax-01, Ling 2.5)
     - dsa:      DeepSeek Sparse Attention — MLA + lightning indexer (DeepSeek-V3.2)
     - csa:      Compressed Sparse Attention — compress 4:1, then top-k (DeepSeek-V4)
     - hca:      Heavily Compressed Attention — compress 128:1, attend densely (DeepSeek-V4)
@@ -149,11 +152,18 @@ class GroupedQueryAttention(nn.Module):
 
         self.W_query = nn.Linear(d, d, bias=cfg["qkv_bias"])
         self.W_key = nn.Linear(d, self.n_kv_groups * self.head_dim, bias=cfg["qkv_bias"])
-        self.W_value = nn.Linear(d, self.n_kv_groups * self.head_dim, bias=cfg["qkv_bias"])
+        # Optional: reuse K as V — see KAsVAttention below
+        self.W_value = (
+            None
+            if cfg.get("k_as_v")
+            else nn.Linear(d, self.n_kv_groups * self.head_dim, bias=cfg["qkv_bias"])
+        )
         self.out_proj = nn.Linear(d, d, bias=False)
         self.dropout = nn.Dropout(cfg["drop_rate"])
         # Optional output gate — see GatedAttention below
         self.out_gate = nn.Linear(d, d, bias=False) if cfg.get("attn_out_gate") else None
+        # Optional per-head sink logit — see SinkAttention below
+        self.sink = nn.Parameter(torch.zeros(self.n_heads)) if cfg.get("attn_sink") else None
 
         self.register_buffer("cache_k", None, persistent=False)
         self.register_buffer("cache_v", None, persistent=False)
@@ -164,7 +174,11 @@ class GroupedQueryAttention(nn.Module):
 
         q = self.W_query(x).view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
         k_new = self.W_key(x).view(B, T, self.n_kv_groups, self.head_dim).transpose(1, 2)
-        v_new = self.W_value(x).view(B, T, self.n_kv_groups, self.head_dim).transpose(1, 2)
+        v_new = (
+            k_new
+            if self.W_value is None
+            else self.W_value(x).view(B, T, self.n_kv_groups, self.head_dim).transpose(1, 2)
+        )
 
         if use_cache:
             if self.cache_k is None:
@@ -194,7 +208,12 @@ class GroupedQueryAttention(nn.Module):
         mask = q_pos.unsqueeze(-1) < k_pos.unsqueeze(0)
         attn = attn.masked_fill(mask, float("-inf"))
 
-        attn = self.dropout(torch.softmax(attn, dim=-1))
+        if self.sink is not None:
+            sink = self.sink.view(1, -1, 1, 1).expand(B, -1, T_q, 1)
+            attn = torch.softmax(torch.cat([attn, sink], dim=-1), dim=-1)[..., :-1]
+        else:
+            attn = torch.softmax(attn, dim=-1)
+        attn = self.dropout(attn)
         out = (attn @ v).transpose(1, 2).contiguous().view(B, T_q, self.d_out)
         if self.out_gate is not None:
             out = out * torch.sigmoid(self.out_gate(x))
@@ -218,6 +237,43 @@ class GatedAttention(GroupedQueryAttention):
 
     def __init__(self, cfg):
         super().__init__({**cfg, "attn_out_gate": True})
+
+
+@register("sink", "Attention sinks — GQA + learned per-head sink logit (gpt-oss)")
+class SinkAttention(GroupedQueryAttention):
+    """GQA plus a learned scalar per head that competes in the softmax (gpt-oss).
+
+    Same problem Gated Attention solves — softmax must put its mass somewhere —
+    but fixed on the input side instead of the output side. The logit row
+    becomes [s_1 .. s_T, sink]; softmax runs over all T+1, and the sink's
+    column is dropped before multiplying by V. A head with nothing to retrieve
+    pushes its mass onto the sink and emits ~0, without needing token 0 as a
+    dumping ground. One parameter per head. gpt-oss pairs it with alternating
+    128-token sliding-window and full layers.
+    """
+
+    def __init__(self, cfg):
+        super().__init__({**cfg, "attn_sink": True})
+
+
+@register("kv1", "K-as-V — GQA that reuses keys as values, half the KV cache (Gemma 4)")
+class KAsVAttention(GroupedQueryAttention):
+    """GQA with no value projection: V is K (Gemma 4, global layers).
+
+    GQA shrinks the cache by sharing heads; this halves what is left by
+    storing one tensor per token instead of two. The head can still read
+    whatever the key encodes — it just cannot store a *different* thing for
+    retrieval than for matching. Gemma 4 uses it only on the sparse global
+    layers, where the cache is the cost that matters, and keeps separate V
+    on the sliding-window layers.
+
+    ponytail: cache_v still holds a second reference to K rather than being
+    dropped, so the code path stays identical to GQA. The memory saving is
+    real in an engine that caches once; here it is a params saving only.
+    """
+
+    def __init__(self, cfg):
+        super().__init__({**cfg, "k_as_v": True})
 
 
 # ──────────────────────────────────────────────
@@ -558,6 +614,74 @@ class KimiDeltaAttention(GatedDeltaNet):
         alpha_log = -self.A_log.exp().view(1, 1, -1) * F.softplus(self.W_alpha(x) + self.dt_bias)
         alpha = alpha_log.exp().view(B, T, self.n_heads, self.head_dim)
         return alpha.transpose(1, 2).unsqueeze(-1)
+
+
+# ──────────────────────────────────────────────
+# Lightning Attention — linear attention with fixed decay
+# ──────────────────────────────────────────────
+
+
+@register("lightning", "Lightning Attention — linear attention, fixed per-head decay (TransNormerLLM, MiniMax-01, Ling 2.5)")
+class LightningAttention(nn.Module):
+    """Linear attention with a *fixed* per-head exponential decay and no softmax.
+
+    Same family as DeltaNet — a (head_dim × head_dim) state per head instead of a
+    KV cache — but the older, simpler branch of it: no delta rule, no learned
+    gate. Each head forgets at a constant rate λ_h = exp(-2^(-8(h+1)/H)), the
+    ALiBi power-law slopes, so head 0 is a short buffer and head H-1 remembers
+    ~everything. Out_t = Σ_j λ^(t-j) (q_t·k_j) v_j. Q and K go through SiLU so
+    the kernel stays positive; the missing softmax normaliser is replaced by an
+    RMSNorm on the output, and a sigmoid gate (TransNormerLLM's GLA) lets a head
+    switch itself off.
+
+    ponytail: the training path is the dense (T×T) decay-masked form and the
+    cached path is a per-token recurrence. The paper's point — an O(n) blockwise
+    kernel that avoids the cumsum — is a CUDA concern; the two forms here are
+    exactly equal, which is what the self-test asserts.
+    """
+
+    def __init__(self, cfg):
+        super().__init__()
+        d = cfg["emb_dim"]
+        self.n_heads = cfg["n_heads"]
+        self.head_dim = d // self.n_heads
+        self.W_qkv = nn.Linear(d, 3 * d, bias=cfg["qkv_bias"])
+        self.W_gate = nn.Linear(d, d, bias=False)
+        self.norm = nn.RMSNorm(d)
+        self.out_proj = nn.Linear(d, d, bias=False)
+        slope = 2.0 ** (-8.0 * torch.arange(1, self.n_heads + 1) / self.n_heads)
+        self.register_buffer("slope", slope, persistent=False)
+        self.register_buffer("state", None, persistent=False)
+
+    def forward(self, x, use_cache=False):
+        B, T, d = x.shape
+        H, hd = self.n_heads, self.head_dim
+        q, k, v = self.W_qkv(x).view(B, T, 3, H, hd).permute(2, 0, 3, 1, 4)  # (B, H, T, hd)
+        q, k = F.silu(q), F.silu(k)
+
+        if use_cache:
+            S = self.state if self.state is not None else q.new_zeros(B, H, hd, hd)
+            lam = torch.exp(-self.slope).view(1, H, 1, 1)
+            outs = []
+            for t in range(T):
+                S = lam * S + k[:, :, t : t + 1].transpose(-1, -2) @ v[:, :, t : t + 1]
+                outs.append(q[:, :, t : t + 1] @ S)
+            self.state = S
+            out = torch.cat(outs, dim=2)
+        else:
+            pos = torch.arange(T, device=x.device)
+            diff = (pos.unsqueeze(-1) - pos.unsqueeze(0)).float()  # (T, T), i - j
+            decay = torch.exp(-self.slope.view(H, 1, 1) * diff.clamp(min=0))
+            decay = decay.masked_fill(diff < 0, 0.0)  # causal
+            out = ((q @ k.transpose(-1, -2)) * decay) @ v
+
+        out = out.transpose(1, 2).reshape(B, T, d)
+        # fp32 for the norm, as the repo's RMSNorm does; avoids the autocast dtype warning
+        out = self.norm(out.float()) * torch.sigmoid(self.W_gate(x))
+        return self.out_proj(out)
+
+    def reset_cache(self):
+        self.state = None
 
 
 # ──────────────────────────────────────────────
@@ -949,6 +1073,38 @@ def _self_test():
         step = torch.cat([attn(x[:, t : t + 1], use_cache=True) for t in range(prefill, T)], dim=1)
         torch.testing.assert_close(step, full[:, prefill:], atol=1e-4, rtol=1e-4)
     print("  shortconv ok — rolling conv state keeps incremental decode exact")
+
+    # Attention sinks: with the sink logit driven high every head should drain
+    # its mass into the sink and emit ~0. A sink that is appended but never
+    # reached by softmax would leave the output untouched.
+    attn = get_attention("sink", cfg).eval()
+    base = attn(x)
+    with torch.no_grad():
+        attn.sink.fill_(30.0)
+    drained = attn(x)
+    assert drained.norm() < 1e-3 * base.norm(), f"sink did not drain: {drained.norm():.3g}"
+    print("  sink      ok — high sink logit drains every head to ~0")
+
+    # K-as-V: there must be no value projection at all, so the KV cache really
+    # is half the size — not a W_value that is built and then ignored.
+    attn = get_attention("kv1", cfg).eval()
+    assert attn.W_value is None, "kv1 still builds W_value"
+    n_gqa = sum(p.numel() for p in get_attention("gqa", cfg).parameters())
+    n_kv1 = sum(p.numel() for p in attn.parameters())
+    assert n_kv1 == n_gqa - attn.W_key.weight.numel(), (n_gqa, n_kv1)
+    print(f"  kv1       ok — no W_value, {n_gqa - n_kv1:,} fewer params than gqa")
+
+    # Lightning: the per-head decay must bite. Heads must differ, and with the
+    # slope driven to +inf the state forgets everything before the current
+    # token, so perturbing the whole past must leave output t untouched.
+    attn = get_attention("lightning", cfg).eval()
+    assert attn.slope.unique().numel() == attn.n_heads, "heads share a decay"
+    with torch.no_grad():
+        attn.slope.fill_(1e3)
+    poked = x.clone()
+    poked[:, :-1] += 10.0
+    torch.testing.assert_close(attn(poked)[:, -1], attn(x)[:, -1], atol=1e-5, rtol=1e-5)
+    print("  lightning ok — per-head decay bites, infinite slope forgets the past")
 
     # Compressed attention: group arithmetic, the availability rule, and the
     # short-sequence case where no group has closed yet.
