@@ -30,6 +30,7 @@ independent — read the ones you need.
 | mHC hyper-connections | `--residual mhc` | `nano/models/qwen_next_nano.py` |
 | Per-layer embeddings | `--ple-dim 16` | `nano/models/qwen_next_nano.py` |
 | Multi-token prediction | `--mtp-weight 0.3` | `nano/models/qwen_next_nano.py` |
+| Parallel block (GPT-J/PaLM) | `--block parallel` | `nano/models/gpt_nano.py` |
 | Looped depth (Huginn/Ouro) | `--loops 4 --loop-bptt K` | `nano/models/looped_nano.py` |
 | Gemma 3/4 recipe (whole model) | `python -m nano.models.gemma_nano` | `nano/models/gemma_nano.py` |
 | MoE + shared expert | `num_experts` in config | `nano/models/deepseek_nano.py` |
@@ -485,6 +486,24 @@ transfer. And *one KV cache per iteration*: see § 6.
 Implemented in `nano/models/looped_nano.py` on qwen_nano's blocks. The adapter
 is initialised to `[I | I]`, so an iteration begins as `core(s + e)`. The exit
 gate is not implemented; `loops` is a fixed dial.
+
+### Parallel block
+**Papers:** GPT-J (EleutherAI, 2021); PaLM (Google, 2022), arXiv 2204.02311; Falcon (2023).
+
+**Problem.** A standard block is two serial steps: attention, then an FFN on
+attention's output. At large scale the serialisation, not the FLOPs, is what
+limits throughput.
+
+**Solution.** Feed both sublayers the same residual input and sum the outputs.
+This repo keeps separate learned norms for checkpoint compatibility:
+`x + attn(norm1(x)) + ffn(norm2(x))`. The FFN no longer depends on attention's
+output. A shared-norm variant can fuse the Q/K/V and FFN input projections
+into one wide matmul; this implementation neither fuses the projections nor
+executes the branches concurrently, so it does not guarantee a speedup. PaLM
+reports ~15% faster training at 540B with no measurable quality loss; at
+small scale there is a loss, because the FFN can no longer condition on what
+attention just retrieved in the same layer. Same parameter count either way,
+which is what the self-check pins.
 
 ### The Gemma recipe
 **Papers:** Gemma 2 (2024), arXiv 2408.00118; Gemma 3 (2025), arXiv 2503.19786;
