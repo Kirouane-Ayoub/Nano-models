@@ -1,0 +1,16 @@
+{
+  "_comment": "DeepSeek-V4-Flash's MoE recipe at nano scale: first layer hash-routed, sqrt(softplus) router scores, aux-loss-free balancing, clamped SwiGLU. V4's attention (CSA/HCA + mHC) lives in the zoo and the hybrid, not in this MLA-based file.",
+  "size": "nano",
+  "seed": 42,
+  "model": {
+    "hash_layers": 1,
+    "router_score": "sqrtsoftplus",
+    "balance_speed": 0.001,
+    "swiglu_limit": 10.0
+  },
+  "train": {
+    "num_epochs": 40,
+    "batch_size": 8,
+    "learning_rate": 0.0003
+  }
+}

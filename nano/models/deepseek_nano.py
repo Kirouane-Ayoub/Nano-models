@@ -295,16 +295,25 @@ class MultiHeadLatentAttention(nn.Module):
 
 
 class Expert(nn.Module):
-    """Single SwiGLU expert."""
+    """Single SwiGLU expert. `swiglu_limit` > 0 clamps the pre-activations
+    (gate from above, up on both sides) before the product — DeepSeek-V4's
+    guard against the rare huge activation that a routed expert, seeing only a
+    slice of the data, is more prone to than a dense FFN. Identity on ordinary
+    inputs, bounded on the outliers; V4 uses 10."""
 
-    def __init__(self, emb_dim, hidden_dim):
+    def __init__(self, emb_dim, hidden_dim, swiglu_limit=0.0):
         super().__init__()
+        self.limit = swiglu_limit
         self.gate_proj = nn.Linear(emb_dim, hidden_dim, bias=False)
         self.up_proj = nn.Linear(emb_dim, hidden_dim, bias=False)
         self.down_proj = nn.Linear(hidden_dim, emb_dim, bias=False)
 
     def forward(self, x):
-        return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
+        gate, up = self.gate_proj(x), self.up_proj(x)
+        if self.limit:
+            gate = gate.clamp(max=self.limit)
+            up = up.clamp(min=-self.limit, max=self.limit)
+        return self.down_proj(F.silu(gate) * up)
 
 
 class MoEFeedForward(nn.Module):
@@ -349,8 +358,22 @@ class MoEFeedForward(nn.Module):
         # Router: scores each expert for each token
         self.gate = nn.Linear(d, self.num_experts, bias=False)
 
-        # Routed experts
-        self.experts = nn.ModuleList([Expert(d, hidden) for _ in range(self.num_experts)])
+        # Routed experts (the shared expert stays a plain SwiGLU, as in V4)
+        limit = cfg.get("swiglu_limit", 0.0)
+        self.experts = nn.ModuleList([Expert(d, hidden, limit) for _ in range(self.num_experts)])
+
+        # Hash-routed bootstrap (DeepSeek-V4): expert *choice* comes from a
+        # frozen token_id → experts table; only the weights are learned. V4 does
+        # this in its first 3 MoE layers. The table here spreads every token's k
+        # experts evenly by construction (a fixed permutation, stride E/k);
+        # ponytail: DeepSeek builds theirs from token frequencies so that load,
+        # not just coverage, is balanced.
+        self.hash_routing = bool(cfg.get("hash_routing", False))
+        if self.hash_routing:
+            E, k = self.num_experts, self.num_experts_per_tok
+            perm = torch.randperm(E, generator=torch.Generator().manual_seed(0))
+            tid = torch.arange(cfg["vocab_size"]).unsqueeze(-1)
+            self.register_buffer("tid2eid", perm[(tid + torch.arange(k) * (E // k)) % E])
 
         # Shared expert (always active, DeepSeek V2/V3 feature)
         self.shared_expert = Expert(d, hidden) if cfg.get("shared_expert", False) else None
@@ -380,7 +403,16 @@ class MoEFeedForward(nn.Module):
         if self.router_score == "sigmoid":
             p = torch.sigmoid(picked)
             return p / p.sum(dim=-1, keepdim=True)
+        if self.router_score == "sqrtsoftplus":
+            # DeepSeek-V4: unbounded above unlike sigmoid, so a strongly preferred
+            # expert can keep pulling weight; sqrt tempers the growth.
+            p = torch.sqrt(F.softplus(picked))
+            return p / p.sum(dim=-1, keepdim=True)
         return torch.softmax(picked, dim=-1)
+
+    def hash_experts(self, token_ids):
+        """(B, T, k) expert ids from the frozen table — deterministic per token id."""
+        return self.tid2eid[token_ids]
 
     def expert_choice(self, affinities):
         """Expert-choice routing (Zhou et al., 2022): each expert takes its top
@@ -397,7 +429,7 @@ class MoEFeedForward(nn.Module):
         strongly the tokens after t want it, so routing leaks the future. Fine
         for an encoder, and the reason decoder LLMs kept token choice and fixed
         balance the DeepSeek-V3 way instead. The self-check asserts the leak.
-        Takes softmax/sigmoid affinities, not raw logits, and returns
+        Takes softmax/sigmoid/sqrtsoftplus affinities, not raw logits, and returns
         (E, capacity) token indices into the flattened sequence.
         """
         n_tokens = affinities.shape[0]
@@ -405,11 +437,15 @@ class MoEFeedForward(nn.Module):
         return torch.topk(affinities.t(), min(capacity, n_tokens), dim=-1).indices
 
     def _forward_expert_choice(self, x_flat, scores):
-        weights = (
-            torch.sigmoid(scores)
-            if self.router_score == "sigmoid"
-            else torch.softmax(scores, dim=-1)
-        )  # (N, E): the pair weight is the token's own affinity for the expert
+        # (N, E): each pair uses the token's affinity for that expert.
+        # Expert choice does not renormalise over a token's selected experts:
+        # a token can be selected by any number of experts, including none.
+        if self.router_score == "sigmoid":
+            weights = torch.sigmoid(scores)
+        elif self.router_score == "sqrtsoftplus":
+            weights = torch.sqrt(F.softplus(scores))
+        else:
+            weights = torch.softmax(scores, dim=-1)
         out_flat = torch.zeros_like(x_flat)
         for eid, idx in enumerate(self.expert_choice(weights)):
             expert_out = self.experts[eid](x_flat.index_select(0, idx))
@@ -418,13 +454,19 @@ class MoEFeedForward(nn.Module):
             )
         return out_flat
 
-    def forward(self, x):
+    def forward(self, x, token_ids=None):
         if self.down is not None:
             x = self.down(x)
         B, T, D = x.shape
 
         # Router scores
         scores = self.gate(x)  # (B, T, num_experts)
+        if self.hash_routing:
+            if token_ids is None:
+                raise ValueError("hash-routed MoE needs the token ids to pick experts")
+            topk_indices = self.hash_experts(token_ids)
+            topk_probs = self.gate_weights(torch.gather(scores, -1, topk_indices))
+            return self._dispatch(x, topk_indices, topk_probs)
         if self.router_choice == "expert":
             result = self._forward_expert_choice(x.reshape(B * T, D), scores.reshape(B * T, -1))
             result = result.reshape(B, T, D)
@@ -439,7 +481,11 @@ class MoEFeedForward(nn.Module):
 
         if self.training and self.balance_speed:
             self._update_bias(topk_indices)
+        return self._dispatch(x, topk_indices, topk_probs)
 
+    def _dispatch(self, x, topk_indices, topk_probs):
+        """Run each token through its chosen experts and combine."""
+        B, T, D = x.shape
         # Flatten for expert routing
         x_flat = x.reshape(B * T, D)
         out_flat = torch.zeros_like(x_flat)
@@ -489,16 +535,16 @@ class MoEFeedForward(nn.Module):
 
 
 class TransformerBlock(nn.Module):
-    def __init__(self, cfg):
+    def __init__(self, cfg, hash_routing=False):
         super().__init__()
         self.norm1 = RMSNorm(cfg["emb_dim"])
         self.attn = MultiHeadLatentAttention(cfg)
         self.norm2 = RMSNorm(cfg["emb_dim"])
-        self.ff = MoEFeedForward(cfg)
+        self.ff = MoEFeedForward({**cfg, "hash_routing": hash_routing})
 
-    def forward(self, x, cos, sin, use_cache=False):
+    def forward(self, x, cos, sin, use_cache=False, token_ids=None):
         x = x + self.attn(self.norm1(x), cos, sin, use_cache=use_cache)
-        x = x + self.ff(self.norm2(x))
+        x = x + self.ff(self.norm2(x), token_ids=token_ids)
         return x
 
 
@@ -513,7 +559,12 @@ class DeepSeekNano(nn.Module):
         self.cfg = cfg
         self.tok_emb = nn.Embedding(cfg["vocab_size"], cfg["emb_dim"])
         self.drop = nn.Dropout(cfg["drop_rate"])
-        self.blocks = nn.ModuleList([TransformerBlock(cfg) for _ in range(cfg["n_layers"])])
+        hash_layers = cfg.get("hash_layers", 0)  # DeepSeek-V4: 3 bootstrap layers
+        if not 0 <= hash_layers <= cfg["n_layers"]:
+            raise ValueError(f"hash_layers={hash_layers} must be in [0, {cfg['n_layers']}]")
+        self.blocks = nn.ModuleList(
+            [TransformerBlock(cfg, hash_routing=i < hash_layers) for i in range(cfg["n_layers"])]
+        )
         self.norm = RMSNorm(cfg["emb_dim"])
         self.head = nn.Linear(cfg["emb_dim"], cfg["vocab_size"], bias=False)
         self.head.weight = self.tok_emb.weight
@@ -536,7 +587,7 @@ class DeepSeekNano(nn.Module):
         B, T = idx.shape
         x = self.drop(self.tok_emb(idx))
         for block in self.blocks:
-            x = block(x, self.cos, self.sin, use_cache=use_cache)
+            x = block(x, self.cos, self.sin, use_cache=use_cache, token_ids=idx)
         x = self.norm(x)
         return self.head(x)
 
@@ -876,6 +927,53 @@ def self_check():
     torch.testing.assert_close(ranked._forward_expert_choice(tokens, shifted), expected)
     print("  expert_rank ok — selects by affinity, invariant to per-token logit shifts")
 
+    # SqrtSoftplus is monotonic per expert: both experts take token 0 here,
+    # unlike softmax above, which assigns expert 0 to token 1. Identity experts
+    # make both the assignment and the unnormalised combine weights observable.
+    ranked.router_score = "sqrtsoftplus"
+    sq_scores = scores.clone().requires_grad_()
+    sq_out = ranked._forward_expert_choice(tokens, sq_scores)
+    sq_expected = torch.zeros_like(tokens)
+    sq_expected[0] = tokens[0] * (F.softplus(scores[0]).sqrt().sum())
+    torch.testing.assert_close(sq_out, sq_expected)
+    assert not torch.allclose(sq_out, expected), "expert-choice sqrtsoftplus fell back to softmax"
+    sq_out.square().sum().backward()
+    assert torch.isfinite(sq_scores.grad).all()
+    assert (sq_scores.grad[0] != 0).all() and (sq_scores.grad[1] == 0).all()
+    print("  expert_sqrt ok — sqrtsoftplus controls token selection, combine weights and gradients")
+
+    # DeepSeek-V4 routing trio. Sqrt(Softplus) scoring: positive, normalised,
+    # differs from sigmoid on the same gate. Clamped SwiGLU: identical to plain
+    # SwiGLU on small inputs, bounded on large ones. Hash-routed bootstrap: the
+    # first N MoE layers pick experts from a frozen token_id → expert table, so
+    # the same token id always lands on the same experts, and the table is a
+    # buffer, not a parameter.
+    sq = MoEFeedForward({**base, "balance_speed": 0.0, "router_score": "sqrtsoftplus"})
+    sq.load_state_dict(full.state_dict())
+    with torch.no_grad():
+        picked = torch.gather(sq.gate(x), -1, torch.topk(sq.gate(x), 2, -1).indices)
+        w_sq = sq.gate_weights(picked)
+    torch.testing.assert_close(w_sq.sum(-1), torch.ones(B, T), atol=1e-6, rtol=0)
+    assert (w_sq > 0).all() and not torch.allclose(w_sq, full.gate_weights(picked), atol=1e-3)
+    e_plain, e_clamp = Expert(8, 16), Expert(8, 16, swiglu_limit=1.0)
+    e_clamp.load_state_dict(e_plain.state_dict())
+    small, large = torch.randn(4, 8) * 0.01, torch.randn(4, 8) * 50
+    torch.testing.assert_close(e_clamp(small), e_plain(small))
+    assert not torch.allclose(e_clamp(large), e_plain(large)), "swiglu_limit never clamps"
+    hashed = MoEFeedForward({**base, "balance_speed": 0.0, "hash_routing": True}).eval()
+    assert "tid2eid" in dict(hashed.named_buffers()) and "tid2eid" not in dict(hashed.named_parameters())
+    ids = torch.randint(0, base["vocab_size"], (B, T))
+    with torch.no_grad():
+        sel1 = hashed.hash_experts(ids)
+        sel2 = hashed.hash_experts(ids)
+        assert torch.equal(sel1, sel2) and sel1.shape == (B, T, base["num_experts_per_tok"])
+        same_tok = torch.full((1, 3), 7)
+        assert (hashed.hash_experts(same_tok) == hashed.hash_experts(same_tok)[:, :1]).all()
+        assert (hashed.hash_experts(torch.arange(base["vocab_size"])[None]).flatten().bincount(minlength=base["num_experts"]) > 0).all(), "hash table leaves an expert unused"
+        out_h = hashed(x, token_ids=ids)
+    assert out_h.shape == x.shape and torch.isfinite(out_h).all()
+    print("  v4 routing ok — sqrtsoftplus weights sum to 1, clamped SwiGLU bites only when large, hash table is a buffer covering every expert")
+
     # The balancing bias must steer selection without touching gate weights.
     moe = MoEFeedForward({**base, "balance_speed": 1e-3}).eval()
     with torch.no_grad():
@@ -964,8 +1062,22 @@ def main():
         "--router",
         type=str,
         default="softmax",
-        choices=["softmax", "sigmoid"],
-        help="Gate weights over the selected experts: softmax (V2) or normalised sigmoid (V3)",
+        choices=["softmax", "sigmoid", "sqrtsoftplus"],
+        help="Gate weights over the selected experts: softmax (V2), normalised sigmoid (V3) or sqrt(softplus) (V4)",
+    )
+    parser.add_argument(
+        "--hash-layers",
+        type=int,
+        default=0,
+        metavar="N",
+        help="First N MoE layers pick experts from a frozen token-id table (DeepSeek-V4 uses 3; 0 = off)",
+    )
+    parser.add_argument(
+        "--swiglu-limit",
+        type=float,
+        default=0.0,
+        metavar="C",
+        help="Clamp routed experts' gate/up pre-activations at ±C (DeepSeek-V4 uses 10; 0 = off)",
     )
     parser.add_argument(
         "--routing",
@@ -1021,12 +1133,16 @@ def main():
     cfg = MODEL_SIZES[size].copy()
     cfg["moe_latent_dim"] = args.moe_latent_dim
     cfg["router_score"] = args.router
+    cfg["hash_layers"] = args.hash_layers
+    cfg["swiglu_limit"] = args.swiglu_limit
     cfg["router_choice"] = args.routing
     cfg["balance_speed"] = args.balance_speed
     cfg.update(file_cfg.get("model", {}))
     ov(cfg, "moe_latent_dim", "--moe-latent-dim", args.moe_latent_dim)
     ov(cfg, "balance_speed", "--balance-speed", args.balance_speed)
     ov(cfg, "router_score", "--router", args.router)
+    ov(cfg, "hash_layers", "--hash-layers", args.hash_layers)
+    ov(cfg, "swiglu_limit", "--swiglu-limit", args.swiglu_limit)
     ov(cfg, "router_choice", "--routing", args.routing)
 
     resume_step = 0
