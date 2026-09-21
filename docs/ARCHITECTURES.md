@@ -22,6 +22,7 @@ independent — read the ones you need.
 | DSA, CSA, HCA, MoBA | `--attention dsa\|csa\|hca\|moba` | `nano/attention_zoo.py` |
 | Hybrid linear:full ratio | `--ratio N` | `nano/models/qwen_next_nano.py` |
 | Gated MLA in the hybrid (Kimi Linear) | `--attn mla`, `configs/kimi_like.json` | `nano/models/qwen_next_nano.py` |
+| DSA on the hybrid + IndexShare (MiniMax) | `--attn mla --dsa-top-k 64 --index-share 2` | `nano/models/qwen_next_nano.py` |
 | Local:global (SWA) layout | `--linear swa --ratio 5 --window 128` | `nano/models/qwen_next_nano.py` |
 | ShortConv | `--short-conv 4` | `nano/attention_zoo.py` |
 | KV sharing | `--kv-share N` | `nano/models/qwen_next_nano.py` |
@@ -197,6 +198,17 @@ over just those. O(L²) → O(kL), selected by content instead of position.
 from the language-modelling loss. It's trained separately against the dense
 attention distribution. Skip that and you have a fixed random sparsity pattern
 that trains without complaint.
+
+**In the hybrid, and IndexShare.** The indexer is its own module
+(`LightningIndexer` in the zoo), so the hybrid's gated MLA can carry one:
+`--attn mla --dsa-top-k K`. MiniMax's *IndexShare* (2026, arXiv 2606.13392)
+observes that the selection barely changes between neighbouring layers and
+trains one indexer per group of layers, reusing its top-k across the group —
+2.9× less indexer compute per token at 1M context. `--index-share N` does
+that: the first attention layer in each group owns the indexer and runs its
+objective; the others reuse the keep-mask it produced earlier in the same
+forward. The self-check asserts one indexer per group, identical selections
+within it, and exact cached decode.
 
 ### MoBA — Mixture of Block Attention
 **Paper:** Moonshot AI (Feb 2025), arXiv 2502.13189. Used in Kimi's long-context models.
@@ -695,6 +707,7 @@ directly whether it was doing its job.
 | **Trimmed cache that still holds the prefill** | Sliding-window caches were trimmed with a bare slice, `cache[:, :, -w:]`. The shape said w tokens; the storage still held the entire prefill, because a slice keeps its base tensor alive. Every shape and equivalence test passed. Only asserting on `untyped_storage().nbytes()` catches it, and `.clone()` on the slice fixes it. Same fix in the zoo's SWA, in `ShortConv`'s rolling window (which also grew without bound at kernel 1, because `u[..., -0:]` is the whole tensor), and in `gemma_nano`. |
 | **Expert choice is non-causal** | Expert-choice routing picks each expert's top tokens over the whole sequence, so which experts process token t depends on tokens after t. A decoder trained with it reads the future through its routing and the loss looks *better*, not broken. The MoE self-check asserts the leak exists, so nobody mistakes the flag for a free balancing fix. |
 | **fp32 buffers in a half-precision matmul** | `module.to(torch.float16)` casts parameters and buffers, but not tensors *computed* from them. Lightning's decay mask came from an fp32 `arange`, stayed fp32, and the `(QKᵀ ⊙ decay) @ V` matmul raised a dtype mismatch. Invisible under autocast, which the training path always uses; only explicit `.to(dtype)` inference hit it. Every zoo entry now passes an fp16/bf16 forward without autocast. |
+| **Stale aux loss on a module that did not run** | The DSA indexer loss is stashed on each MLA module and collected by a module scan. The MTP block's MLA sets one during training and does not run in an eval forward, so the scan handed back last step's loss and `generate()` received a tuple instead of logits. Every self-check passed; it died on the first mid-training sample. Fix: clear the stashes at the start of every forward, and a check that trains with MTP then evals without it. |
 | **Init RNG shifts** | Comparing "same model with and without component X" is invalid if X adds modules: it changes how much RNG the weight init consumes, so every weight differs. Detach the component from one model instead. |
 
 ---
