@@ -547,8 +547,9 @@ class SlidingWindowAttention(nn.Module):
             # trimming first left those rows with nothing but future keys, so
             # they came back NaN — while every later decode step still matched.
             if self.cache_k.shape[2] > self.window_size:
-                self.cache_k = self.cache_k[:, :, -self.window_size :]
-                self.cache_v = self.cache_v[:, :, -self.window_size :]
+                # .clone(): a bare slice keeps the whole prefill allocation alive.
+                self.cache_k = self.cache_k[:, :, -self.window_size :].clone()
+                self.cache_v = self.cache_v[:, :, -self.window_size :].clone()
         else:
             k, v = k_new, v_new
 
@@ -1332,6 +1333,20 @@ def _self_test():
     drained = attn(x) - attn.out_proj.bias  # swa's out_proj has a bias, gqa's does not
     assert drained.norm() < 1e-3 * base.norm(), "swa sink did not drain"
     print("  swa+sink  ok — sink survives window trimming, drains at high logit")
+
+    # The trimmed window must release the prefill's memory, not just report a
+    # smaller shape: a slice keeps its base alive, so check bytes, not sizes.
+    attn = get_attention("swa", {**cfg, "window_size": 4}).eval()
+    attn.reset_cache()
+    with torch.no_grad():
+        attn(x, use_cache=True)  # 40-token prefill, window 4
+    for name, cache in (("K", attn.cache_k), ("V", attn.cache_v)):
+        expected_bytes = B * attn.n_heads * 4 * attn.head_dim * cache.element_size()
+        held_bytes = cache.untyped_storage().nbytes()
+        assert cache.shape[2] == 4 and held_bytes == expected_bytes, (
+            f"{name} cache should hold {expected_bytes} bytes, but storage holds {held_bytes}"
+        )
+    print("  swa store ok — trimmed cache holds 4 tokens of memory, not the 40-token prefill")
 
     # Scalable softmax: logits scaled by s·log(n), n = keys visible to that row.
     # With s = 1/log(T) the last row's factor is exactly 1, so it must equal gqa
