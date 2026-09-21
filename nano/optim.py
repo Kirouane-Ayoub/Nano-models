@@ -112,6 +112,12 @@ def _is_block_matrix(name, p):
 
     GR packs independent per-branch RMSNorm gains into a 2-D tensor; its
     shape does not make it a matrix projection suitable for Muon.
+
+    The rule is by *name*, and that is load-bearing: a 2-D per-channel scale
+    must be called `gain` (or contain `emb`/`head`/`table`) to stay on AdamW.
+    Shape cannot tell a (4, 64) gain from a (4, 64) projection. If you add a
+    component with a 2-D norm scale under another name, extend this list or
+    Muon will orthogonalise it.
     """
     return (p.ndim == 2 and name.rsplit(".", 1)[-1] != "gain"
             and not any(k in name for k in ("emb", "head", "table")))

@@ -331,8 +331,8 @@ repo the entire difference from the parent class is the shape of one tensor.
 
 ### Lightning Attention
 **Paper:** TransNormerLLM (OpenNLPLab, 2023), arXiv 2307.14995; Lightning
-Attention-2 (2024), arXiv 2401.04658; shipped in MiniMax-01 (2025) and Ling 2.5
-(2026).
+Attention-2 (2024), arXiv 2401.04658; shipped in MiniMax-01 (2025) and the Ling 2.5/2.6
+family (2026; the *Ling and Ring 2.6* report is arXiv 2606.15079).
 
 **Problem.** Linear attention needs a way to forget, and needs to be trainable
 in parallel. Learned gates (DeltaNet) solve forgetting but make the recurrence
@@ -391,7 +391,8 @@ window attention should replace it, which makes it a good experiment rather
 than a settled answer.
 
 ### Hybrid attention (the 3:1 layout)
-**Papers:** Qwen3-Next, Qwen3.5 (Alibaba); Kimi Linear (Moonshot); Ling 2.5;
+**Papers:** Qwen3-Next, Qwen3.5 (Alibaba); Kimi Linear (Moonshot); Ling 2.5/2.6
+(report arXiv 2606.15079);
 Nemotron 3 (NVIDIA), arXiv 2604.12374.
 
 **Problem.** Pure linear attention loses too much recall. Pure softmax
