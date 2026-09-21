@@ -251,7 +251,12 @@ and then attend with ordinary gated GQA over the **uncompressed** K/V of those
 positions. Qwen keeps 512 blocks, 2,048 tokens, per query at 1M context. The
 indexer runs on a 4× shorter sequence than DSA's; the attention sees real
 keys, unlike CSA's pooled entries. Qwen3.8-Flash-Next puts one QSA layer after
-every three Gated DeltaNet layers.
+every three Gated DeltaNet layers — and, per the report, swaps QSA in at
+*continued-pretraining* time: the model is first trained with plain full
+attention in those slots, then the indexer is added and training continues.
+Reproducing it means training dense first. The same report introduces a
+"Gated Residual": four residual branches read through an elementwise gate, a
+cousin of mHC (§ 5) that is not in this repo.
 
 **Watch.** As with MoBA, the own-block rule is what keeps every row non-empty;
 the self-test pins k=0 to exactly the current partial block, k=1 to one extra
