@@ -46,6 +46,7 @@ Usage:
     python -m nano.models.qwen_next_nano --ratio 1 --kv-share 1           # last attn layer reuses K/V (Gemma 4)
     python -m nano.models.qwen_next_nano --posenc nope                    # drop RoPE
     python -m nano.models.qwen_next_nano --norm sandwich                  # post-norm too (Gemma)
+    python -m nano.models.qwen_next_nano --engram-dim 16                  # hashed n-gram memory (DeepSeek)
     python -m nano.models.qwen_next_nano --logit-softcap 30               # bound the LM head (Gemma 2)
     python -m nano.models.qwen_next_nano --posenc prope --rope-fraction 0.5  # partial RoPE (Gemma 4)
     python -m nano.models.qwen_next_nano --linear swa --ratio 5 --window 128  # Gemma 4 local:global layout
@@ -407,6 +408,88 @@ class PerLayerEmbeddings(nn.Module):
 
 
 # ──────────────────────────────────────────────
+# Engram — conditional memory via hashed n-gram lookup
+# ──────────────────────────────────────────────
+
+
+class Engram(nn.Module):
+    """Static-pattern memory next to the transformer (DeepSeek, Jan 2026,
+    arXiv 2601.07372).
+
+    Attention and MoE both spend compute to *recompute* things that never
+    change: "New York" is followed by a small set of tokens every time, and the
+    model rediscovers that from scratch at every position. Engram stores such
+    patterns in a table instead. At position t, the last n tokens (n = 2, 3) are
+    hashed into a row of a fixed-size embedding table; the rows are concatenated,
+    projected to the hidden size, gated, and added to the residual stream. O(1)
+    per token, no attention over the past, pure memory — like PLE, the table
+    can live in slow storage. DeepSeek found ~20-25% of a sparse parameter
+    budget is best spent here, the rest on MoE.
+
+    Hashing: `(t_0·a_0 ^ t_1·a_1 ^ …) mod rows` with odd multipliers per head,
+    `rows` prime so collisions spread. Two heads per n-gram halve the damage of
+    any one collision. Positions with too little history hash a sentinel id.
+
+    Causal by construction — the n-gram ends at t — but only if the *history*
+    is right under cached decode: the module keeps the last n-1 token ids, and
+    the self-check decodes one token at a time to prove it.
+
+    ponytail: the gate is a per-channel sigmoid of the normed residual, not the
+    paper's attention-style query·key scalar; same job, fewer moving parts. The
+    output projection is zero-initialised so the model starts exactly as if
+    Engram were absent.
+    """
+
+    def __init__(self, cfg):
+        super().__init__()
+        d = cfg["emb_dim"]
+        self.ngrams = tuple(cfg.get("engram_ngrams", (2, 3)))
+        self.heads = cfg.get("engram_heads", 2)
+        self.rows = cfg.get("engram_rows", 4099)  # prime
+        self.dim = cfg["engram_dim"]
+        self.sentinel = cfg["vocab_size"]  # an id no real token has
+        self.tables = nn.ModuleList(
+            nn.Embedding(self.rows, self.dim) for _ in range(len(self.ngrams) * self.heads)
+        )
+        # Odd multipliers, one per (n-gram position, head). Fixed, not learned.
+        g = torch.Generator().manual_seed(0)
+        mult = torch.randint(1, 2**20, (max(self.ngrams), self.heads), generator=g) * 2 + 1
+        # The row mapping is part of the learned memory's meaning. Persist it
+        # so HF's meta-device loading restores the same hash function.
+        self.register_buffer("mult", mult)
+        self.norm = RMSNorm(d)
+        self.gate = nn.Linear(d, d, bias=False)
+        self.proj = nn.Linear(len(self.tables) * self.dim, d, bias=False)
+        nn.init.zeros_(self.proj.weight)
+        self.register_buffer("hist", None, persistent=False)  # last n-1 ids under cache
+
+    def forward(self, x, idx, use_cache=False):
+        B, T = idx.shape
+        n_max = max(self.ngrams)
+        hist = self.hist if (use_cache and self.hist is not None) else idx.new_full((B, n_max - 1), self.sentinel)
+        ids = torch.cat([hist, idx], dim=1)  # (B, T + n_max - 1)
+        if use_cache:
+            self.hist = ids[:, -(n_max - 1) :]
+        # shifted[k][b, t] is the token k steps before position t
+        shifted = [ids[:, n_max - 1 - k : n_max - 1 - k + T] for k in range(n_max)]
+
+        looked = []
+        t = 0
+        for n in self.ngrams:
+            for h in range(self.heads):
+                code = shifted[0] * self.mult[0, h]
+                for k in range(1, n):
+                    code = code ^ (shifted[k] * self.mult[k, h])
+                looked.append(self.tables[t](code % self.rows))
+                t += 1
+        mem = self.proj(torch.cat(looked, dim=-1))
+        return mem * torch.sigmoid(self.gate(self.norm(x)))
+
+    def reset_cache(self):
+        self.hist = None
+
+
+# ──────────────────────────────────────────────
 # Multi-Token Prediction
 # ──────────────────────────────────────────────
 
@@ -485,6 +568,16 @@ class QwenNextNano(nn.Module):
         self.head.weight = self.tok_emb.weight  # weight tying
 
         self.ple = PerLayerEmbeddings(cfg, cfg["n_layers"]) if cfg.get("ple_dim", 0) else None
+        self.engram = Engram(cfg) if cfg.get("engram_dim", 0) else None
+        self.engram_layer = cfg.get("engram_layer", 1)  # early, where DeepSeek puts it
+        if self.engram is not None and (
+            not isinstance(self.engram_layer, int)
+            or not 0 <= self.engram_layer < cfg["n_layers"]
+        ):
+            raise ValueError(
+                f"engram_layer={self.engram_layer} must be a zero-based index "
+                f"in [0, {cfg['n_layers'] - 1}]"
+            )
 
         self.mtp_weight = cfg.get("mtp_weight", 0.0)
         self.logit_softcap = cfg.get("logit_softcap", 0.0)  # 0 = off; Gemma 2 uses 30
@@ -498,6 +591,13 @@ class QwenNextNano(nn.Module):
         self.apply(self._init_weights)
 
     def _init_weights(self, module):
+        engram = getattr(self, "engram", None)
+        if engram is not None and module is engram.proj:
+            # Engram starts as an exact no-op. Lives here, not in Engram.__init__,
+            # because apply() runs after construction and would overwrite it —
+            # the same trap looped_nano's adapter documents.
+            nn.init.zeros_(module.weight)
+            return
         if isinstance(module, nn.Linear):
             nn.init.normal_(module.weight, mean=0.0, std=0.02)
             if module.bias is not None:
@@ -515,20 +615,23 @@ class QwenNextNano(nn.Module):
         for i, block in enumerate(self.blocks):
             x = block(x, self.cos, self.sin, use_cache=use_cache)
             if ple is not None:
-                sig = self.ple.layer_signal(ple, i)
-                # With hyper-connections the signal goes into stream 0, the one
-                # the blocks actually read from at init.
-                x = x + (
-                    F.pad(sig.unsqueeze(2), (0, 0, 0, self.mhc_streams - 1))
-                    if self.mhc_streams
-                    else sig
-                )
+                x = x + self._into_stream0(self.ple.layer_signal(ple, i))
+            if self.engram is not None and i == self.engram_layer:
+                h = x[:, :, 0] if self.mhc_streams else x
+                x = x + self._into_stream0(self.engram(h, idx, use_cache=use_cache))
         if self.mhc_streams:
             x = x.sum(dim=2)
         logits = self._logits(x)
         if targets is None or self.mtp is None:
             return logits
         return logits, self._mtp_loss(x, targets)
+
+    def _into_stream0(self, sig):
+        """With hyper-connections a (B, T, d) signal goes into stream 0, the one
+        the blocks actually read from at init. Without them it is just added."""
+        if self.mhc_streams:
+            return F.pad(sig.unsqueeze(2), (0, 0, 0, self.mhc_streams - 1))
+        return sig
 
     def _logits(self, x):
         """Final norm, LM head, and the optional Gemma 2 softcap: c·tanh(z/c)
@@ -555,6 +658,8 @@ class QwenNextNano(nn.Module):
     def reset_kv_cache(self):
         for block in self.blocks:
             block.attn.reset_cache()
+        if self.engram is not None:
+            self.engram.reset_cache()
 
     def count_params(self):
         return sum(p.numel() for p in self.parameters())
@@ -786,6 +891,46 @@ def self_check():
     print(
         f"  ple       ok — {stored:,} stored params, {ple.ple.dim}d per layer, "
         f"zero-init so it starts as a no-op"
+    )
+
+    # Engram (DeepSeek, 2026): hashed suffix n-grams look up embedding rows that
+    # are gated and added to the residual after an early layer. Zero-init
+    # projection → exact no-op at init; must bite once it is non-zero; must keep
+    # a token-history buffer so cached decode still sees the n-gram; the memory
+    # must be causal on its own; the hash must actually spread across rows.
+    cfg_en, en = build(engram_dim=8)
+    for invalid_layer in (-1, cfg_en["n_layers"], 0.5):
+        try:
+            build(engram_dim=8, engram_layer=invalid_layer)
+        except ValueError as error:
+            assert "engram_layer" in str(error)
+        else:
+            raise AssertionError(f"invalid Engram layer accepted: {invalid_layer}")
+    probe = torch.randint(0, cfg_en["vocab_size"], (2, 12))
+    on = en(probe)
+    mod, en.engram = en.engram, None
+    off = en(probe)
+    en.engram = mod
+    torch.testing.assert_close(on, off, atol=1e-6, rtol=1e-6)
+    with torch.no_grad():
+        en.engram.proj.weight.normal_(std=0.1)
+    assert not torch.allclose(en(probe), off), "engram never becomes active"
+    check_incremental(en, cfg_en["vocab_size"])
+    h = torch.randn(2, 12, cfg_en["emb_dim"])
+    sig = en.engram(h, probe)
+    poked = probe.clone()
+    poked[:, 6] = (poked[:, 6] + 1) % cfg_en["vocab_size"]
+    torch.testing.assert_close(en.engram(h, poked)[:, :6], sig[:, :6])
+    assert not torch.allclose(en.engram(h, poked)[:, 6:], sig[:, 6:]), "n-gram at t ignores token t"
+    en.engram(h, probe).sum().backward()
+    touched = int((en.engram.tables[0].weight.grad.abs().sum(-1) > 0).sum())
+    assert touched >= 12, f"hash collapsed: only {touched} rows touched by 24 tokens"
+    cfg_eh, en_hc = build(engram_dim=8, residual="mhc", mhc_streams=2)
+    check_incremental(en_hc, cfg_eh["vocab_size"])
+    stored = sum(p.numel() for p in en.engram.parameters())
+    print(
+        f"  engram    ok — {stored:,} params, {touched} rows touched by 24 tokens, zero-init no-op, "
+        f"causal, decode exact, works under mHC"
     )
 
     # MTP: same logits with or without it, an extra finite loss, and gradients
@@ -1041,6 +1186,20 @@ def main():
         help="Parallel residual streams for --residual mhc (DeepSeek V4 uses 4)",
     )
     parser.add_argument(
+        "--engram-dim",
+        type=int,
+        default=0,
+        metavar="D",
+        help="Engram conditional memory: hashed n-gram table rows of D dims (DeepSeek 2026; 0 = off)",
+    )
+    parser.add_argument(
+        "--engram-layer",
+        type=int,
+        default=1,
+        metavar="L",
+        help="Zero-based block index after which Engram is added (default 1, the second block)",
+    )
+    parser.add_argument(
         "--ple-dim",
         type=int,
         default=0,
@@ -1113,6 +1272,8 @@ def main():
         "residual": args.residual,
         "mhc_streams": args.mhc_streams,
         "ple_dim": args.ple_dim,
+        "engram_dim": args.engram_dim,
+        "engram_layer": args.engram_layer,
     }
     cfg.update(file_cfg.get("model", {}))
     for key, flag, value in (
@@ -1129,6 +1290,8 @@ def main():
         ("residual", "--residual", args.residual),
         ("mhc_streams", "--mhc-streams", args.mhc_streams),
         ("ple_dim", "--ple-dim", args.ple_dim),
+        ("engram_dim", "--engram-dim", args.engram_dim),
+        ("engram_layer", "--engram-layer", args.engram_layer),
     ):
         ov(cfg, key, flag, value)
 
@@ -1176,6 +1339,7 @@ def main():
         f"residual={cfg['residual']}"
         + (f" x{model.mhc_streams} streams" if model.mhc_streams else "")
         + (f", ple={cfg['ple_dim']}d" if model.ple is not None else "")
+        + (f", engram={cfg['engram_dim']}d after block {model.engram_layer}" if model.engram is not None else "")
     )
 
     model = train(
