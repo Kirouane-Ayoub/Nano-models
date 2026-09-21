@@ -11,7 +11,8 @@ not something to install.
 
 ```
 nano/
-  attention_zoo.py   ten interchangeable attention variants
+  attention_zoo.py   interchangeable attention and state-space mixers
+  components.py      mHC, PLE, Engram, Mixture-of-Depths — the hybrid's swappable parts
   config.py          config loading, precedence, run snapshots, ROOT
   models/            one readable file per architecture
 configs/             worked example configs
@@ -26,8 +27,9 @@ Two jobs, deliberately kept apart:
 - **Reading.** `nano/models/gpt_nano.py`, `nano/models/qwen_nano.py`, `nano/models/deepseek_nano.py`,
   `nano/models/gemma_nano.py`, `nano/models/mamba_nano.py`,
   `nano/models/qwen_next_nano.py` each teach one architecture end to end.
-- **Experimenting.** `nano/attention_zoo.py` plus the component flags on
-  `nano/models/qwen_next_nano.py` let you swap pieces without touching the teaching files.
+- **Experimenting.** `nano/attention_zoo.py` and `nano/components.py`, driven by the
+  component flags on `nano/models/qwen_next_nano.py`, let you swap pieces without touching
+  the teaching files. The hybrid file holds the *layout*; the mechanisms live in the two modules.
 
 Do not merge those two jobs. A generic framework that can express every model
 is exactly what makes this kind of repo unreadable.
