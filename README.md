@@ -330,6 +330,7 @@ That's it — no shared base class, no framework. Each file should still read to
 nano-models/
 ├── nano/
 │   ├── attention_zoo.py    # mha, gqa, gated, mla, swa, deltanet, kda, dsa, csa, hca
+│   ├── components.py       # mHC, PLE, Engram, Mixture-of-Depths (used by qwen_next_nano)
 │   ├── config.py           # config files, precedence, run snapshots
 │   └── models/
 │       ├── gpt_nano.py         # GPT-2 style
