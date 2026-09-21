@@ -25,9 +25,10 @@ For the same components in publication order, see [TIMELINE.md](./TIMELINE.md).
 | Gated MLA in the hybrid (Kimi Linear) | `--attn mla`, `configs/kimi_like.json` | `nano/models/qwen_next_nano.py` |
 | Gated QSA in the hybrid (Qwen3.8-Flash-Next) | `--attn qsa --qsa-top-k K`, `configs/qwen_flash_next.json` | `nano/models/qwen_next_nano.py` |
 | DSA on the hybrid + IndexShare (MiniMax) | `--attn mla --dsa-top-k 64 --index-share 2` | `nano/models/qwen_next_nano.py` |
+| Hierarchical indexer (DeepSeek-V4.1 CSA2) | `--index-modes full,reindex,reuse --candidate-top-k K` | `nano/models/qwen_next_nano.py` |
 | Local:global (SWA) layout | `--linear swa --ratio 5 --window 128` | `nano/models/qwen_next_nano.py` |
 | ShortConv | `--short-conv 4` | `nano/attention_zoo.py` |
-| KV sharing | `--kv-share N` | `nano/models/qwen_next_nano.py` |
+| KV sharing | `--kv-share N`, or `--ratio 0 --kv-sources=-,-,0,1` (nano V4.1 encoder-decoder) | `nano/models/qwen_next_nano.py` |
 | Sandwich norm | `--norm sandwich` | `nano/models/qwen_next_nano.py` |
 | Final logit softcap | `--logit-softcap 30` | `nano/models/qwen_next_nano.py` |
 | NoPE | `--posenc nope` | `nano/models/qwen_nano.py` |
@@ -212,6 +213,26 @@ that: the first attention layer in each group owns the indexer and runs its
 objective; the others reuse the keep-mask it produced earlier in the same
 forward. The self-check asserts one indexer per group, identical selections
 within it, and exact cached decode.
+
+**Hierarchical indexer (DeepSeek-V4.1, CSA2).** IndexShare's two roles become
+three. A `full` layer indexes every key, keeps its top-k, and also emits a
+wider *candidate pool* (V4.1: 2,048 blocks). A `reindex` layer has its own
+indexer and selects only inside the nearest earlier pool. A `reuse` layer takes the full layer's
+selection outright. V4.1 runs its 20 decoder layers this way off pools from a
+few encoder layers. `--index-modes full,reindex,reuse,...` with
+`--candidate-top-k`; the self-check asserts the reindex keep lies inside the
+pool, the reuse keep is the same object, and decode stays exact.
+
+The implementation here computes indexer scores for every key, then masks
+out keys outside the pool. It demonstrates hierarchical selection without
+reducing indexer compute; pool-bounded scoring would require gathering the
+candidates before computing their scores. Attention is also dense-then-masked.
+This runnable nano example has four attention layers and keeps 8 keys from a
+32-key pool, so sparse selection is exercised within its 128-token context:
+
+```bash
+python -m nano.models.qwen_next_nano --ratio 0 --attn mla --dsa-top-k 8 --candidate-top-k 32 --index-modes full,reindex,reuse,reuse
+```
 
 ### MoBA — Mixture of Block Attention
 **Paper:** Moonshot AI (Feb 2025), arXiv 2502.13189. Used in Kimi's long-context models.
@@ -654,6 +675,15 @@ demonstrated.
 **Solution.** Later layers skip their K/V projections entirely and reuse an
 earlier layer's. They still compute their own queries, so they can attend
 differently. ~50% cache reduction — 2.7 GB at 128k context for Gemma 4 E2B.
+
+**Encoder-decoder KV (DeepSeek-V4.1).** Push the idea to its limit and the
+model splits in two: a stack of layers that compute K/V, and a stack that
+only reads them. V4.1-Flash is 20 causal encoder layers followed by 20 decoder
+layers whose K/V come from encoder layers 2, 8, 14 and 20. `--kv-sources`
+names, for each attention layer, the earlier layer it reads from, so both
+Gemma 4's "last N borrow" and V4.1's layout are one list. A source must be
+earlier and own its K/V; `configs/deepseek_v41_ced.json` is the layout at nano
+scale.
 
 ### Looped depth — depth-recurrent transformers
 **Papers:** *Universal Transformers* (Dehghani et al., 2018); Huginn, arXiv
