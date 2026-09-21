@@ -47,6 +47,7 @@ Usage:
     python -m nano.models.qwen_next_nano --posenc nope                    # drop RoPE
     python -m nano.models.qwen_next_nano --norm sandwich                  # post-norm too (Gemma)
     python -m nano.models.qwen_next_nano --engram-dim 16                  # hashed n-gram memory (DeepSeek)
+    python -m nano.models.qwen_next_nano --mod-capacity 0.5               # Mixture-of-Depths on odd blocks
     python -m nano.models.qwen_next_nano --logit-softcap 30               # bound the LM head (Gemma 2)
     python -m nano.models.qwen_next_nano --posenc prope --rope-fraction 0.5  # partial RoPE (Gemma 4)
     python -m nano.models.qwen_next_nano --linear swa --ratio 5 --window 128  # Gemma 4 local:global layout
@@ -496,6 +497,61 @@ class Engram(nn.Module):
 
 
 # ──────────────────────────────────────────────
+# Mixture-of-Depths — route tokens past whole blocks
+# ──────────────────────────────────────────────
+
+
+class DepthRouter(nn.Module):
+    """Decides which tokens a block processes (Raposo et al., 2024, arXiv 2404.02258).
+
+    MoE routes tokens between experts; MoD routes them between *doing the block
+    and skipping it*. A scalar router scores every token, the top `capacity`
+    fraction go through the block (output scaled by their score, so the router
+    gets gradient), the rest ride the residual unchanged. Half the tokens at
+    half the layers is the paper's setting; FLOPs drop accordingly and quality
+    holds, because most tokens do not need most layers.
+
+    The catch is the top-k: it ranks tokens *across the sequence*, so whether
+    token t is processed depends on tokens after it. Fine for training, fatal
+    for autoregressive decode. The paper's answer, kept here, is a second
+    scalar head — the predictor — trained with a BCE loss to imitate the top-k
+    decision from the token alone. Training routes by top-k and trains the
+    predictor; eval routes by the predictor and is causal. The self-check
+    asserts the causality in eval mode and the exact capacity in train mode;
+    the train-check asserts the predictor actually learns to agree.
+
+    ponytail: skipped tokens are *masked*, not gathered — the block still runs
+    on them and they still serve as keys, only the residual update is dropped.
+    That demonstrates the routing, not the FLOP saving, same trade as DSA and
+    CSA. The paper drops skipped tokens from attention entirely.
+    """
+
+    def __init__(self, d, capacity):
+        super().__init__()
+        self.capacity = capacity
+        self.router = nn.Linear(d, 1, bias=False)
+        self.predictor = nn.Linear(d, 1, bias=False)
+        self.aux = None
+        self.last_routed = None  # (B, T) bool, for inspection and tests
+
+    def gate(self, h):
+        """(B, T, 1) multiplier for the block's update: score for routed tokens, 0 otherwise."""
+        score = torch.sigmoid(self.router(h)).squeeze(-1)  # (B, T)
+        # Detached input: the predictor must not steer the representation it reads.
+        logit = self.predictor(h.detach()).squeeze(-1)
+        if self.training:
+            k = max(1, round(self.capacity * h.shape[1]))
+            routed = torch.zeros_like(score, dtype=torch.bool)
+            routed.scatter_(1, score.topk(k, dim=1).indices, True)
+            self.aux = F.binary_cross_entropy_with_logits(logit, routed.float())
+        else:
+            routed = logit > 0
+            self.aux = None
+        self.last_routed = routed
+        return (score * routed).unsqueeze(-1)
+
+
+# ──────────────────────────────────────────────
 # Multi-Token Prediction
 # ──────────────────────────────────────────────
 
@@ -575,6 +631,18 @@ class QwenNextNano(nn.Module):
 
         self.ple = PerLayerEmbeddings(cfg, cfg["n_layers"]) if cfg.get("ple_dim", 0) else None
         self.engram = Engram(cfg) if cfg.get("engram_dim", 0) else None
+        # Mixture-of-Depths on every other block (the paper's layout).
+        self.mod = (
+            nn.ModuleDict(
+                {
+                    str(i): DepthRouter(cfg["emb_dim"], cfg["mod_capacity"])
+                    for i in range(cfg["n_layers"])
+                    if i % 2 == 1
+                }
+            )
+            if cfg.get("mod_capacity", 0)
+            else None
+        )
         layer = cfg.get("engram_layer", 1)  # early, where DeepSeek puts it
         if self.engram is not None:
             # A JSON config can hand us 1.0; coerce like looped_nano does with
@@ -620,7 +688,15 @@ class QwenNextNano(nn.Module):
             x = F.pad(x.unsqueeze(2), (0, 0, 0, self.mhc_streams - 1))
         ple = self.ple.lookup(idx) if self.ple is not None else None
         for i, block in enumerate(self.blocks):
-            x = block(x, self.cos, self.sin, use_cache=use_cache)
+            router = self.mod[str(i)] if self.mod is not None and str(i) in self.mod else None
+            if router is None:
+                x = block(x, self.cos, self.sin, use_cache=use_cache)
+            else:
+                g = router.gate(x[:, :, 0] if self.mhc_streams else x)
+                if self.mhc_streams:
+                    g = g.unsqueeze(-1)
+                # x + g·(block(x) − x): the block for routed tokens, identity otherwise
+                x = x + g * (block(x, self.cos, self.sin, use_cache=use_cache) - x)
             if ple is not None:
                 x = x + self._into_stream0(self.ple.layer_signal(ple, i))
             if self.engram is not None and i == self.engram_layer:
@@ -629,9 +705,10 @@ class QwenNextNano(nn.Module):
         if self.mhc_streams:
             x = x.sum(dim=2)
         logits = self._logits(x)
-        if targets is None or self.mtp is None:
-            return logits
-        return logits, self._mtp_loss(x, targets)
+        aux = [r.aux for r in (self.mod.values() if self.mod is not None else ()) if r.aux is not None]
+        if targets is not None and self.mtp is not None:
+            aux.append(self._mtp_loss(x, targets))
+        return (logits, sum(aux)) if aux else logits
 
     def _into_stream0(self, sig):
         """With hyper-connections a (B, T, d) signal goes into stream 0, the one
@@ -942,6 +1019,48 @@ def self_check():
         f"causal, decode exact, works under mHC"
     )
 
+    # Mixture-of-Depths: every other block routes only a `mod_capacity` fraction
+    # of tokens through itself. Training picks the top-k router scores over the
+    # sequence — non-causal, as in the paper — and trains a per-token predictor
+    # to imitate that choice; eval routes by the predictor, so decode is causal.
+    cfg_md, mod = build(mod_capacity=0.5)
+    probe = torch.randint(0, cfg_md["vocab_size"], (2, 12))
+    assert sorted(int(i) for i in mod.mod) == [1, 3], "MoD should route every other block"
+    mod.train()
+    out = mod(probe)
+    assert isinstance(out, tuple), "training forward must return the predictor's aux loss"
+    _, aux = out
+    assert torch.isfinite(aux) and aux.requires_grad, "MoD aux loss is not trainable"
+    k = round(0.5 * probe.shape[1])
+    for router in mod.mod.values():
+        assert (router.last_routed.sum(1) == k).all(), f"train routing is not exactly {k} tokens"
+    mod.eval()
+    on = mod(probe)
+    assert not isinstance(on, tuple), "eval forward should be plain logits"
+    routers, mod.mod = mod.mod, None
+    off = mod(probe)
+    mod.mod = routers
+    assert not torch.allclose(on, off), "MoD is a no-op"
+    a, b = probe.clone(), probe.clone()
+    b[:, 6] = (b[:, 6] + 1) % cfg_md["vocab_size"]
+    torch.testing.assert_close(mod(a)[:, :6], mod(b)[:, :6])  # causal in eval
+    check_incremental(mod, cfg_md["vocab_size"])
+    cfg_mh, mod_hc = build(mod_capacity=0.5, residual="mhc", mhc_streams=2)
+    check_incremental(mod_hc, cfg_mh["vocab_size"])
+    # With MTP on as well, both aux terms must reach the returned loss.
+    _, both = build(mod_capacity=0.5, mtp_weight=0.3)
+    both.train()
+    tgt = torch.roll(probe, -1, 1)
+    _, aux_both = both(probe, targets=tgt)
+    routers_part = sum(r.aux for r in both.mod.values())
+    mtp_head, both.mtp = both.mtp, None
+    _, aux_routers_only = both(probe, targets=tgt)  # same weights, same top-k → same router aux
+    both.mtp = mtp_head
+    torch.testing.assert_close(aux_routers_only, routers_part, atol=1e-6, rtol=1e-6)
+    assert aux_both > aux_routers_only, "MTP loss did not reach the combined aux"
+    print(f"  mod       ok — blocks {sorted(int(i) for i in mod.mod)} routed, train top-{k}/{probe.shape[1]} exact, "
+          f"eval causal by predictor, decode exact, works under mHC")
+
     # MTP: same logits with or without it, an extra finite loss, and gradients
     # that actually reach the MTP block.
     mtp_cfg = {
@@ -1016,6 +1135,31 @@ def train_check():
             if step == 0:
                 yield model, x, y  # hand back for gradient inspection
         yield model, x, y
+
+    # MoD: after training, the causal predictor must agree with the top-k routing
+    # it was trained to imitate. Checked on the first routed block, whose input
+    # is identical in train and eval mode. A predictor that never learned would
+    # route ~half the tokens at random and the LM loss would look fine.
+    cfg_md = {
+        **MODEL_SIZES["nano"],
+        "vocab_size": V,
+        "drop_rate": 0.0,
+        "linear_attn": "deltanet",
+        "hybrid_ratio": 3,
+        "mod_capacity": 0.5,
+        "mhc_streams": 0,
+    }
+    *_, (model, x, y) = overfit(cfg_md)
+    with torch.no_grad():
+        model.train()
+        model(x)
+        top_k = model.mod["1"].last_routed.clone()
+        model.eval()
+        model(x)
+        by_predictor = model.mod["1"].last_routed
+    agree = (top_k == by_predictor).float().mean().item()
+    assert agree > 0.75, f"predictor agrees with top-k on only {agree:.0%} of tokens"
+    print(f"  mod ok — causal predictor matches top-k routing on {agree:.0%} of tokens")
 
     # MTP: after overfitting, the main head must predict t+1 and the MTP head
     # t+2. An off-by-one in the shift trains just as happily and is invisible
@@ -1131,6 +1275,13 @@ def main():
         type=int,
         default=3,
         help="Linear layers per attention layer (3 = Qwen3-Next/Kimi Linear)",
+    )
+    parser.add_argument(
+        "--mod-capacity",
+        type=float,
+        default=0.0,
+        metavar="F",
+        help="Mixture-of-Depths: fraction of tokens each odd block processes (paper: 0.5; 0 = off)",
     )
     parser.add_argument(
         "--mtp-weight",
@@ -1272,6 +1423,7 @@ def main():
         "window_size": args.window,
         "hybrid_ratio": args.ratio,
         "mtp_weight": args.mtp_weight,
+        "mod_capacity": args.mod_capacity,
         "short_conv": args.short_conv,
         "kv_share": args.kv_share,
         "pos_enc": args.posenc,
@@ -1290,6 +1442,7 @@ def main():
         ("window_size", "--window", args.window),
         ("hybrid_ratio", "--ratio", args.ratio),
         ("mtp_weight", "--mtp-weight", args.mtp_weight),
+        ("mod_capacity", "--mod-capacity", args.mod_capacity),
         ("short_conv", "--short-conv", args.short_conv),
         ("kv_share", "--kv-share", args.kv_share),
         ("pos_enc", "--posenc", args.posenc),
@@ -1349,6 +1502,7 @@ def main():
         + (f" x{model.mhc_streams} streams" if model.mhc_streams else "")
         + (f", ple={cfg['ple_dim']}d" if model.ple is not None else "")
         + (f", engram={cfg['engram_dim']}d after block {model.engram_layer}" if model.engram is not None else "")
+        + (f", mod={cfg['mod_capacity']} on blocks {sorted(int(i) for i in model.mod)}" if model.mod is not None else "")
     )
 
     model = train(
