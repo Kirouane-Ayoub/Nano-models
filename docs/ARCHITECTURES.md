@@ -19,7 +19,7 @@ independent — read the ones you need.
 | Gated DeltaNet, KDA | `--attention deltanet\|kda`, `--linear` | `nano/attention_zoo.py` |
 | Lightning Attention | `--attention lightning` | `nano/attention_zoo.py` |
 | Mamba-2 (+ Mamba-3 flags) | `--attention mamba2`, `--linear mamba2`, `mamba_trapezoidal`, `mamba_complex` | `nano/attention_zoo.py` |
-| DSA, CSA, HCA | `--attention dsa\|csa\|hca` | `nano/attention_zoo.py` |
+| DSA, CSA, HCA, MoBA | `--attention dsa\|csa\|hca\|moba` | `nano/attention_zoo.py` |
 | Hybrid linear:full ratio | `--ratio N` | `nano/models/qwen_next_nano.py` |
 | Local:global (SWA) layout | `--linear swa --ratio 5 --window 128` | `nano/models/qwen_next_nano.py` |
 | ShortConv | `--short-conv 4` | `nano/attention_zoo.py` |
@@ -190,6 +190,27 @@ over just those. O(L²) → O(kL), selected by content instead of position.
 from the language-modelling loss. It's trained separately against the dense
 attention distribution. Skip that and you have a fixed random sparsity pattern
 that trains without complaint.
+
+### MoBA — Mixture of Block Attention
+**Paper:** Moonshot AI (Feb 2025), arXiv 2502.13189. Used in Kimi's long-context models.
+
+**Problem.** DSA selects tokens by content, but needs a separately trained
+indexer to do it, and that indexer can drift from the attention it feeds.
+
+**Solution.** Route at block granularity with a summary that needs no
+training: cut the keys into blocks, score each closed block by the query's
+dot product with the block's *mean key*, keep the top-k, and always include
+the query's own block. Attention then runs over just those keys. It is MoE
+applied to the key axis — blocks are the experts, the mean key is the router —
+which is where the name comes from. Coarser than DSA, but nothing to train and
+nothing to go stale.
+
+**The trap.** Forget the own-block rule and a query whose top-k picks are all
+in the future has an entirely masked row: softmax of all −∞ is NaN.
+`torch.testing.assert_close` rejects NaNs by default, even when both outputs
+contain them. The self-test also checks the routing rule directly: k=0 still
+leaves exactly the current block visible. Smaller blocks exercise sparse
+routing under cached decoding and future-token perturbations.
 
 ### CSA / HCA — Compressed Attention
 **Paper:** DeepSeek-V4 (DeepSeek, 2026), arXiv 2606.19348.
@@ -639,7 +660,7 @@ directly whether it was doing its job.
 | **Accelerator built for its device** | Every main called `accelerator().device` before the training settings were known. The singleton was created with `mixed_precision="no"`, and the bf16 and grad-accumulation settings `train()` passed afterwards were dropped — every GPU/MPS run logged `Precision: no` and `--grad-accum` changed the log line but not the optimizer. Now `current_device()` reads the device off `PartialState`, and asking the singleton for different settings raises. |
 | **Looped KV cache** | A weight-shared core applied *r* times needs *r* KV caches. With one, iteration 3 of the current token attends to iteration 1's keys of earlier tokens; prefill and one-token decode then disagree by ~1e-1 while training is unaffected. `looped_nano` keeps a cache slot per iteration, and its self-check asserts the incremental test *fails* when the slots are shared. |
 | **SWA cache trimmed before attending** | The sliding-window cache was cut to the window *before* the attention step. A cached prefill longer than the window then gave its early queries nothing but future keys: all-masked rows, softmax of −∞, NaN. Every decode step after the prefill still matched the full forward exactly, so the zoo test passed. It surfaced only when SWA went into the hybrid model, where the NaN prefill output is the next layer's input. The zoo test now compares the prefill output too. |
-| **Trimmed cache that still holds the prefill** | Sliding-window caches were trimmed with a bare slice, `cache[:, :, -w:]`. The shape said w tokens; the storage still held the entire prefill, because a slice keeps its base tensor alive. Every shape and equivalence test passed. Only asserting on `untyped_storage().nbytes()` catches it, and `.clone()` on the slice fixes it. Same fix in the zoo's SWA and in `gemma_nano`. |
+| **Trimmed cache that still holds the prefill** | Sliding-window caches were trimmed with a bare slice, `cache[:, :, -w:]`. The shape said w tokens; the storage still held the entire prefill, because a slice keeps its base tensor alive. Every shape and equivalence test passed. Only asserting on `untyped_storage().nbytes()` catches it, and `.clone()` on the slice fixes it. Same fix in the zoo's SWA, in `ShortConv`'s rolling window (which also grew without bound at kernel 1, because `u[..., -0:]` is the whole tensor), and in `gemma_nano`. |
 | **Expert choice is non-causal** | Expert-choice routing picks each expert's top tokens over the whole sequence, so which experts process token t depends on tokens after t. A decoder trained with it reads the future through its routing and the loss looks *better*, not broken. The MoE self-check asserts the leak exists, so nobody mistakes the flag for a free balancing fix. |
 | **fp32 buffers in a half-precision matmul** | `module.to(torch.float16)` casts parameters and buffers, but not tensors *computed* from them. Lightning's decay mask came from an fp32 `arange`, stayed fp32, and the `(QKᵀ ⊙ decay) @ V` matmul raised a dtype mismatch. Invisible under autocast, which the training path always uses; only explicit `.to(dtype)` inference hit it. Every zoo entry now passes an fp16/bf16 forward without autocast. |
 | **Init RNG shifts** | Comparing "same model with and without component X" is invalid if X adds modules: it changes how much RNG the weight init consumes, so every weight differs. Detach the component from one model instead. |
